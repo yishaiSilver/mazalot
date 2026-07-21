@@ -54,11 +54,52 @@ pub extern "C" fn render_custom(
     );
 }
 
-/// Read a type's default parameter (0=contrast,1=freq,2=specular,3=shininess),
+/// Read a type's default value for parameter `which` (see planet_core::param),
 /// so the sliders can snap to sensible per-type starting values.
 #[no_mangle]
 pub extern "C" fn param(type_idx: u32, which: u32) -> f32 {
     planet_core::param(type_idx as usize, which)
+}
+
+/// Number of tunable parameters (length of the array `render_params` expects).
+#[no_mangle]
+pub extern "C" fn num_params() -> u32 {
+    planet_core::NUM_PARAMS as u32
+}
+
+/// Render with params + global style: `palette` (0 natural, 1 game boy, 2 ice,
+/// 3 sunset), `dither` (0..1), `moons` (0/1).
+#[no_mangle]
+pub extern "C" fn render_styled(
+    ptr: *mut u8,
+    size: u32,
+    type_idx: u32,
+    seed: u32,
+    angle: f32,
+    params_ptr: *const f32,
+    palette: u32,
+    dither: f32,
+    moons: u32,
+) {
+    let out = unsafe { slice::from_raw_parts_mut(ptr, (size * size * 4) as usize) };
+    let params = unsafe { slice::from_raw_parts(params_ptr, planet_core::NUM_PARAMS) };
+    planet_core::render_rgba_styled(size, type_idx as usize, seed, angle, params, palette, dither, moons, out);
+}
+
+/// Render with a full slider-parameter override array. `params_ptr` points at
+/// `num_params()` f32 values in wasm memory (written by JS each frame).
+#[no_mangle]
+pub extern "C" fn render_params(
+    ptr: *mut u8,
+    size: u32,
+    type_idx: u32,
+    seed: u32,
+    angle: f32,
+    params_ptr: *const f32,
+) {
+    let out = unsafe { slice::from_raw_parts_mut(ptr, (size * size * 4) as usize) };
+    let params = unsafe { slice::from_raw_parts(params_ptr, planet_core::NUM_PARAMS) };
+    planet_core::render_rgba_params(size, type_idx as usize, seed, angle, params, out);
 }
 
 /// Number of planet types (for the JS "random type" picker).

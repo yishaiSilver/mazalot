@@ -1,29 +1,51 @@
 # mazalot
 
-Procedural, seed-driven art generation in Rust — with **zero art assets**.
-Everything (planets, characters) is generated from math, so a single seed always
-rebuilds the exact same result. The core algorithm compiles to both a native
-generator and a ~32 KB WebAssembly module from **one shared codebase**.
+Procedural, seed-driven pixel-art planets in Rust — **zero art assets**. Every
+planet is generated from math per pixel, so a single seed always rebuilds the
+exact same world. The core algorithm compiles to both a native GIF/PNG generator
+and a ~42 KB WebAssembly module from **one shared codebase**.
 
-## What's inside
+There's also a companion paper-doll **character** compositor.
+
+## Crate layout
+
+This is a Cargo workspace. All planet logic lives in one place.
 
 | Crate | What it is |
 |-------|------------|
-| `core/` (`planet-core`) | The single source of truth: 3D value-noise + Worley, the 26-type planet table, sphere shading, rings, specular glare. Pure math, zero dependencies. Outputs raw RGBA bytes. |
-| `src/` (`sprite-compositor`) | Native generator. Turns core's frames into spinning **GIFs**, a contact-sheet **PNG**, and a combined all-types GIF (via the `image` crate). Also a paper-doll **character** compositor. |
-| `web/` (`planet-web`) | Rust → WASM (raw cdylib, no wasm-bindgen). A browser page renders a **live rotating random planet** on a canvas with tuning sliders. |
+| `core/` (`planet-core`) | The single source of truth: 3D value-noise + Worley, the 26-type planet table, sphere shading, weather, and the pixel-art output stage. **Pure math, zero dependencies.** Emits raw RGBA bytes. |
+| `src/` (`sprite-compositor`) | Native generator. Wraps core's frames into spinning **GIFs**, a contact-sheet **PNG**, and a combined all-types GIF (via the `image` crate). Also the character compositor. |
+| `web/` (`planet-web`) | Rust → WASM (raw cdylib, **no wasm-bindgen**). A browser page renders a live rotating planet on a canvas with full tuning controls. |
 
-### Planets
-26 types across 5 base algorithms (terrestrial, cratered gas/ice giants,
-emissive lava/fungal, cloud-shrouded), plus **rings** and per-material
-**specular glare**. The "3D" is per-pixel: treat the disc as a sphere's front
-hemisphere, rotate the surface point around Y, sample 3D noise there, shade
-against a fixed light. A full 360° spin loops seamlessly.
+## The planet system
 
-### Characters
-A paper-doll compositor: tiny hand-authored parts drawn in R/G/B placeholder
-markers, recolored per-layer via seeded color maps and composited — a small
-part library × recolor × layers = effectively unlimited unique characters.
+**26 types** across **5 base algorithms** — terrestrial (terran, ocean,
+archipelago, desert, swamp, iron, ice, savanna, gaia, tundra, alpine, obsidian,
+chrome), cratered (barren, moon), banded gas/ice/storm/ringed giants, emissive
+(lava, molten sea, radioactive, fungal, crystal), and cloud-shrouded (toxic,
+storm shroud) — plus **rings**, **orbiting moons**, and material-aware
+**specular glare**.
+
+### Fake 3D
+For each pixel of the disc, treat it as the front hemisphere of a unit sphere,
+rotate the surface point around Y by the spin angle, and sample **3D noise**
+there. Shade with a fixed light (Lambert + Blinn-Phong specular scaled by local
+albedo) and an atmosphere rim. Sampling in 3D means no seams and no pole
+stretching, and a full 360° spin loops seamlessly.
+
+### Animated weather (loop-safe)
+- **Clouds** — domain-warped wispy fronts that drift and billow; cast soft shadows.
+- **Gas-giant bands** — counter-rotating zonal jets + domain warp (fluid, not a sine wobble).
+- **Great spot** — a drifting spiral cyclone with a calm eye.
+- **Lightning** — small, irregular, randomized-color flashes on storm worlds.
+- **Aurorae** — shimmering polar curtains, hue palette-cycled green→cyan→violet.
+- **Storm cells** — bounded hurricane swirls in the cloud layer.
+- **Molten flow** — palette-cycled glow that flows across lava/emissive worlds.
+
+### Pixel-art output
+- **Ordered (Bayer) dithering** — kills ramp banding, dithers the terminator, stays crisp under spin.
+- **Limited palettes** — swap any planet into a duotone: `Natural`, `Game Boy`, `Ice`, `Sunset`.
+- **Crisp dark rim** — a 1-px outline on every disc (and every moon) for sprite readability.
 
 ## Running it
 
@@ -31,9 +53,10 @@ part library × recolor × layers = effectively unlimited unique characters.
 ```bash
 cargo run --release --bin planet            # planets
 cargo run --release --bin sprite-compositor # characters
+cargo run --release --bin bench             # feature-cost benchmark
 ```
 
-**Web — live rotating random planet:**
+**Web — live, interactive planet:**
 ```bash
 cargo build -p planet-web --target wasm32-unknown-unknown --release
 cp target/wasm32-unknown-unknown/release/planet_web.wasm web/planet.wasm
@@ -41,8 +64,37 @@ cd web && python3 -m http.server 8000       # open http://localhost:8000/
 ```
 (Requires the wasm target: `rustup target add wasm32-unknown-unknown`.)
 
+### Web controls
+Type · Seed · Resolution · Spin, then live sliders for every parameter
+(contrast, frequency, ice caps, specular, shininess, glare↔albedo, clouds,
+storm cells, aurora, lightning, great spot, bands, turbulence) plus a **Look**
+section — palette swap, dither, orbiting-moons toggle, and a CRT/scanline toggle.
+Sliders snap to each type's defaults on selection.
+
+## Performance
+
+Rendering is **per-pixel procedural**: every frame recomputes noise for every
+pixel. A sprite is a `memcpy`; a planet is thousands of times more expensive.
+Measured natively (WASM in-browser runs ~2–3× slower):
+
+| @ 64px | per frame | vs a sprite |
+|---|---|---|
+| sprite blit (`memcpy`) | ~0.0003 ms | 1× |
+| planet, no weather (iron) | 0.67 ms | ~3,200× |
+| planet, full weather (terran) | 1.98 ms | ~9,400× |
+| lava (emissive) | 0.79 ms | ~3,800× |
+
+**The weather is the cost** — domain warp on clouds/bands roughly triples the
+base planet. **The pixel-art pipeline is nearly free:** dithering, moons, and
+palette swaps together add **< 0.05 ms** (a few percent).
+
+Implications:
+- **One planet live** (the web demo): comfortable — ~2 ms native, ~5–7 ms in WASM at 64 px, well under a 60 fps budget. Tightens above ~200 px.
+- **Many planets / a galaxy map**: don't render live. **Bake the ~30 spin frames once, then blit** (that ~0.0003 ms) — procedural variety at sprite-cheap playback.
+- **Cheaper weather:** dropping domain warp (back to plain fBm) roughly halves the weather cost.
+
 ## Adding a planet type
 
 Add one row to `TYPES` in `core/src/lib.rs` — palette, thresholds, flags. Both
-the native GIFs and the web demo pick it up automatically; there's only one copy
+the native GIFs and the web demo pick it up automatically; there is only one copy
 of the algorithm.

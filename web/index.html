@@ -8,15 +8,15 @@
   :root { color-scheme: dark; }
   html, body {
     margin: 0; min-height: 100%;
-    background: radial-gradient(circle at 50% 20%, #12131f 0%, #06060c 70%);
+    background: radial-gradient(circle at 50% 18%, #12131f 0%, #06060c 70%);
     color: #d7dae6;
     font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
   }
-  .app { max-width: 860px; margin: 0 auto; padding: 28px 20px 48px;
+  .app { max-width: 880px; margin: 0 auto; padding: 28px 20px 48px;
          display: flex; flex-wrap: wrap; gap: 28px; align-items: flex-start; justify-content: center; }
   h1 { font-size: 14px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase;
        color: #7f86a3; margin: 0 0 14px; }
-  .left { text-align: center; }
+  .left { text-align: center; position: sticky; top: 20px; }
   .stage {
     width: 360px; height: 360px; max-width: 82vw; max-height: 82vw;
     border-radius: 14px; background: #05060b;
@@ -25,40 +25,48 @@
   }
   .name { font-size: 20px; font-weight: 700; color: #eef1f8; text-transform: capitalize; margin-top: 16px; }
   .sub { font-size: 12px; color: #6b7290; letter-spacing: .04em; }
-  .gen {
-    margin-top: 14px; padding: 11px 22px; font: inherit; font-weight: 600;
+  .gen { margin-top: 14px; padding: 11px 22px; font: inherit; font-weight: 600;
     color: #06060c; background: linear-gradient(180deg, #eef1f8, #c7cde0);
-    border: 0; border-radius: 999px; cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.4);
-  }
+    border: 0; border-radius: 999px; cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
   .gen:active { transform: translateY(1px); }
 
-  .panel { width: 320px; background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.06);
-           border-radius: 14px; padding: 18px 18px 20px; }
-  .panel h2 { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: #7f86a3;
-              margin: 0 0 14px; }
-  .ctl { margin: 0 0 14px; }
-  .ctl label { display: flex; justify-content: space-between; font-size: 12px; color: #9aa0bb; margin-bottom: 5px; }
+  .panel { width: 340px; background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.06);
+           border-radius: 14px; padding: 16px 18px 20px; }
+  .panel h2 { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: #7f86a3; margin: 0 0 12px; }
+  .grp { font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: #565d78;
+         margin: 16px 0 8px; border-top: 1px solid rgba(255,255,255,.06); padding-top: 12px; }
+  .ctl { margin: 0 0 11px; }
+  .ctl label { display: flex; justify-content: space-between; font-size: 12px; color: #9aa0bb; margin-bottom: 4px; }
   .ctl label b { color: #eef1f8; font-variant-numeric: tabular-nums; font-weight: 600; }
   input[type=range] { width: 100%; accent-color: #8fb7ff; cursor: pointer; }
-  select, input[type=number] {
-    width: 100%; box-sizing: border-box; padding: 8px 10px; font: inherit; font-size: 13px;
-    color: #eef1f8; background: #0e0f18; border: 1px solid rgba(255,255,255,.1); border-radius: 8px;
-  }
-  .rowflex { display: flex; gap: 8px; }
-  .rowflex input { flex: 1; }
+  select, input[type=number] { width: 100%; box-sizing: border-box; padding: 8px 10px; font: inherit; font-size: 13px;
+    color: #eef1f8; background: #0e0f18; border: 1px solid rgba(255,255,255,.1); border-radius: 8px; }
+  .rowflex { display: flex; gap: 8px; } .rowflex input { flex: 1; }
   .mini { padding: 8px 12px; font: inherit; color: #d7dae6; background: #171826;
-          border: 1px solid rgba(255,255,255,.1); border-radius: 8px; cursor: pointer; }
+    border: 1px solid rgba(255,255,255,.1); border-radius: 8px; cursor: pointer; }
   .mini:active { transform: translateY(1px); }
-  .reset { width: 100%; margin-top: 4px; }
+  .reset { width: 100%; margin-top: 12px; }
   .foot { width: 100%; text-align: center; font-size: 11px; color: #4d536b; letter-spacing: .05em; }
   .foot code { color: #6b7290; }
+  .stage-wrap { position: relative; display: inline-block; }
+  .crt { position: absolute; inset: 0; border-radius: 14px; pointer-events: none; opacity: 0;
+    transition: opacity .2s; mix-blend-mode: multiply;
+    background:
+      repeating-linear-gradient(0deg, rgba(0,0,0,.32) 0, rgba(0,0,0,.32) 1px, transparent 2px, transparent 3px),
+      radial-gradient(circle at 50% 50%, transparent 55%, rgba(0,0,0,.5) 100%); }
+  .crt.on { opacity: 1; }
+  .chk { justify-content: flex-start !important; gap: 8px; cursor: pointer; color: #cfd4e6 !important; }
+  .chk input { accent-color: #8fb7ff; }
 </style>
 </head>
 <body>
 <div class="app">
   <div class="left">
     <h1>Procedural Planet</h1>
-    <canvas class="stage" id="stage" width="360" height="360"></canvas>
+    <div class="stage-wrap">
+      <canvas class="stage" id="stage" width="360" height="360"></canvas>
+      <div class="crt" id="crtfx"></div>
+    </div>
     <div class="name" id="name">loading…</div>
     <div class="sub" id="sub">Rust → WebAssembly · live sphere shading</div>
     <button class="gen" id="gen">✦ Generate random</button>
@@ -66,41 +74,28 @@
 
   <div class="panel">
     <h2>Controls</h2>
-    <div class="ctl">
-      <label>Type</label>
-      <select id="type"></select>
+    <div class="ctl"><label>Type</label><select id="type"></select></div>
+    <div class="ctl"><label>Seed</label>
+      <div class="rowflex"><input type="number" id="seed" min="0" value="1" /><button class="mini" id="rndseed" title="random seed">🎲</button></div>
     </div>
-    <div class="ctl">
-      <label>Seed</label>
-      <div class="rowflex">
-        <input type="number" id="seed" min="0" value="1" />
-        <button class="mini" id="rndseed" title="random seed">🎲</button>
-      </div>
+    <div class="ctl"><label>Resolution <b id="resV">64</b></label><input type="range" id="res" min="40" max="240" step="8" value="64" /></div>
+    <div class="ctl"><label>Spin speed <b id="spnV">0.012</b></label><input type="range" id="spn" min="0" max="0.05" step="0.002" value="0.012" /></div>
+
+    <div class="grp">Look</div>
+    <div class="ctl"><label>Palette</label>
+      <select id="palette">
+        <option value="0">Natural</option>
+        <option value="1">Game Boy</option>
+        <option value="2">Ice duotone</option>
+        <option value="3">Sunset</option>
+      </select>
     </div>
-    <div class="ctl">
-      <label>Resolution <b id="resV">64</b></label>
-      <input type="range" id="res" min="40" max="240" step="8" value="64" />
-    </div>
-    <div class="ctl">
-      <label>Contrast <b id="conV">–</b></label>
-      <input type="range" id="con" min="0.6" max="3.2" step="0.05" value="1.8" />
-    </div>
-    <div class="ctl">
-      <label>Frequency <b id="frqV">–</b></label>
-      <input type="range" id="frq" min="1" max="6" step="0.1" value="2.2" />
-    </div>
-    <div class="ctl">
-      <label>Specular (glare) <b id="spcV">–</b></label>
-      <input type="range" id="spc" min="0" max="1" step="0.02" value="0" />
-    </div>
-    <div class="ctl">
-      <label>Shininess <b id="shnV">–</b></label>
-      <input type="range" id="shn" min="2" max="40" step="1" value="24" />
-    </div>
-    <div class="ctl">
-      <label>Spin speed <b id="spnV">0.012</b></label>
-      <input type="range" id="spn" min="0" max="0.05" step="0.002" value="0.012" />
-    </div>
+    <div class="ctl"><label>Dither <b id="dthV">0.70</b></label><input type="range" id="dth" min="0" max="1" step="0.05" value="0.7" /></div>
+    <div class="ctl"><label class="chk"><input type="checkbox" id="moons" checked /> Orbiting moons</label></div>
+    <div class="ctl"><label class="chk"><input type="checkbox" id="crt" /> CRT / scanlines</label></div>
+
+    <div id="sliders"></div>
+
     <button class="mini reset" id="reset">↺ reset params to type defaults</button>
   </div>
 
@@ -108,12 +103,29 @@
 </div>
 
 <script type="module">
-// Planet type names, SAME ORDER as the Rust TYPES table.
 const NAMES = [
   "terran","ocean","archipelago","desert","swamp","iron","ice","barren",
   "gas giant","ice giant","lava","fungal","savanna","gaia","tundra","alpine",
   "obsidian","chrome","moon","storm giant","ringed giant","molten sea",
   "radioactive","crystal","toxic","storm shroud",
+];
+
+// Slider defs in DISPLAY order; `pi` = parameter index into the wasm params array
+// (MUST match planet_core::param). `g` starts a new group header.
+const PARAMS = [
+  { g:"Terrain", pi:0,  label:"Contrast",      min:0.6, max:3.2, step:0.05, fix:2 },
+  {             pi:1,  label:"Frequency",     min:1,   max:6,   step:0.1,  fix:1 },
+  {             pi:5,  label:"Ice caps",      min:0,   max:1,   step:0.02, fix:2 },
+  { g:"Surface", pi:2,  label:"Specular glare",min:0,   max:1,   step:0.02, fix:2 },
+  {             pi:3,  label:"Shininess",     min:2,   max:40,  step:1,    fix:0 },
+  {             pi:12, label:"Glare ↔ albedo",min:0,   max:1,   step:0.05, fix:2 },
+  { g:"Weather", pi:4,  label:"Clouds",        min:0,   max:1,   step:0.02, fix:2 },
+  {             pi:9,  label:"Storm cells",   min:0,   max:1,   step:0.02, fix:2 },
+  {             pi:8,  label:"Aurora",        min:0,   max:1.5, step:0.02, fix:2 },
+  {             pi:7,  label:"Lightning",     min:0,   max:1.5, step:0.02, fix:2 },
+  {             pi:6,  label:"Great spot",    min:0,   max:1.5, step:0.02, fix:2 },
+  { g:"Gas giant bands", pi:10, label:"Bands", min:3,  max:14,  step:0.5,  fix:1 },
+  {             pi:11, label:"Turbulence",    min:0,   max:1.5, step:0.02, fix:2 },
 ];
 
 const $ = id => document.getElementById(id);
@@ -123,60 +135,60 @@ sctx.imageSmoothingEnabled = false;
 const off = document.createElement("canvas");
 const octx = off.getContext("2d");
 
-let wasm, bufPtr, bufLen, imgData;
-let NATIVE = 64;
-let typeIdx = 0, seed = 1, angle = 0;
-let spin = 0.012;
+let wasm, bufPtr, bufLen, imgData, paramsPtr, NUM;
+let NATIVE = 64, typeIdx = 0, seed = 1, angle = 0, spin = 0.012;
+const sliders = {}; // pi -> { input, val }
 
-// slider elements
-const el = {
-  type: $("type"), seed: $("seed"),
-  res: $("res"), con: $("con"), frq: $("frq"), spc: $("spc"), shn: $("shn"), spn: $("spn"),
-  resV: $("resV"), conV: $("conV"), frqV: $("frqV"), spcV: $("spcV"), shnV: $("shnV"), spnV: $("spnV"),
-};
-
-function setResolution(n) {
-  NATIVE = n;
-  off.width = off.height = n;
-  imgData = octx.createImageData(n, n);
-  if (bufPtr) wasm.dealloc(bufPtr, bufLen);
-  bufLen = n * n * 4;
-  bufPtr = wasm.alloc(bufLen);
-  el.resV.textContent = n;
+function buildSliders() {
+  const host = $("sliders");
+  for (const p of PARAMS) {
+    if (p.g) { const h = document.createElement("div"); h.className = "grp"; h.textContent = p.g; host.appendChild(h); }
+    const wrap = document.createElement("div"); wrap.className = "ctl";
+    const lab = document.createElement("label");
+    const val = document.createElement("b");
+    lab.textContent = p.label + " "; lab.appendChild(val);
+    const inp = document.createElement("input");
+    inp.type = "range"; inp.min = p.min; inp.max = p.max; inp.step = p.step;
+    inp.addEventListener("input", () => val.textContent = parseFloat(inp.value).toFixed(p.fix));
+    wrap.appendChild(lab); wrap.appendChild(inp); host.appendChild(wrap);
+    sliders[p.pi] = { input: inp, val, fix: p.fix };
+  }
 }
 
-// snap the param sliders to a type's built-in defaults (read from wasm)
+function setResolution(n) {
+  NATIVE = n; off.width = off.height = n; imgData = octx.createImageData(n, n);
+  if (bufPtr) wasm.dealloc(bufPtr, bufLen);
+  bufLen = n * n * 4; bufPtr = wasm.alloc(bufLen); $("resV").textContent = n;
+}
+
 function loadTypeDefaults(t) {
-  const con = wasm.param(t, 0), frq = wasm.param(t, 1), spc = wasm.param(t, 2), shn = wasm.param(t, 3);
-  el.con.value = con; el.frq.value = frq; el.spc.value = spc; el.shn.value = shn;
-  el.conV.textContent = con.toFixed(2);
-  el.frqV.textContent = frq.toFixed(1);
-  el.spcV.textContent = spc.toFixed(2);
-  el.shnV.textContent = shn.toFixed(0);
+  for (const p of PARAMS) {
+    const v = wasm.param(t, p.pi);
+    sliders[p.pi].input.value = v;
+    sliders[p.pi].val.textContent = v.toFixed(p.fix);
+  }
 }
 
 function setType(t) {
-  typeIdx = t;
-  el.type.value = String(t);
+  typeIdx = t; $("type").value = String(t);
   $("name").textContent = NAMES[t] ?? `type ${t}`;
   $("sub").textContent = `seed ${seed} · type ${t}`;
   loadTypeDefaults(t);
 }
 
 function randomize() {
-  seed = (Math.random() * 0xffffff) >>> 0;
-  el.seed.value = seed;
+  seed = (Math.random() * 0xffffff) >>> 0; $("seed").value = seed;
   setType(Math.floor(Math.random() * NAMES.length));
 }
 
 function frame() {
   angle += spin;
-  wasm.render_custom(
-    bufPtr, NATIVE, typeIdx, seed, angle,
-    parseFloat(el.con.value), parseFloat(el.frq.value),
-    parseFloat(el.spc.value), parseFloat(el.shn.value),
-  );
-  // re-view memory each frame (buffer can detach if wasm memory grows)
+  const pv = new Float32Array(wasm.memory.buffer, paramsPtr, NUM);
+  for (const p of PARAMS) pv[p.pi] = parseFloat(sliders[p.pi].input.value);
+  const palette = parseInt($("palette").value);
+  const dither = parseFloat($("dth").value);
+  const moons = $("moons").checked ? 1 : 0;
+  wasm.render_styled(bufPtr, NATIVE, typeIdx, seed, angle, paramsPtr, palette, dither, moons);
   const view = new Uint8Array(wasm.memory.buffer, bufPtr, bufLen);
   imgData.data.set(view);
   octx.putImageData(imgData, 0, 0);
@@ -187,40 +199,32 @@ function frame() {
 
 async function main() {
   const res = await fetch("./planet.wasm?v=" + Date.now(), { cache: "no-store" });
-  const bytes = await res.arrayBuffer();
-  const { instance } = await WebAssembly.instantiate(bytes, {});
+  const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
   wasm = instance.exports;
 
   const n = wasm.type_count();
   if (n !== NAMES.length) $("sub").textContent = `warning: wasm has ${n} types, JS lists ${NAMES.length}`;
+  NUM = wasm.num_params();
 
-  // build type dropdown
-  NAMES.forEach((name, i) => {
-    const o = document.createElement("option");
-    o.value = String(i); o.textContent = name;
-    el.type.appendChild(o);
-  });
+  NAMES.forEach((name, i) => { const o = document.createElement("option"); o.value = String(i); o.textContent = name; $("type").appendChild(o); });
+  buildSliders();
 
+  paramsPtr = wasm.alloc(NUM * 4); // stable buffer, allocated before pixel buffer
   setResolution(64);
   randomize();
 
-  // wiring
-  el.type.addEventListener("change", () => setType(parseInt(el.type.value)));
-  el.seed.addEventListener("input", () => { seed = (parseInt(el.seed.value) || 0) >>> 0; $("sub").textContent = `seed ${seed} · type ${typeIdx}`; });
-  $("rndseed").addEventListener("click", () => { seed = (Math.random() * 0xffffff) >>> 0; el.seed.value = seed; });
+  $("type").addEventListener("change", () => setType(parseInt($("type").value)));
+  $("seed").addEventListener("input", () => { seed = (parseInt($("seed").value) || 0) >>> 0; $("sub").textContent = `seed ${seed} · type ${typeIdx}`; });
+  $("rndseed").addEventListener("click", () => { seed = (Math.random() * 0xffffff) >>> 0; $("seed").value = seed; });
   $("gen").addEventListener("click", randomize);
   $("reset").addEventListener("click", () => loadTypeDefaults(typeIdx));
-
-  el.res.addEventListener("input", () => setResolution(parseInt(el.res.value)));
-  el.con.addEventListener("input", () => el.conV.textContent = parseFloat(el.con.value).toFixed(2));
-  el.frq.addEventListener("input", () => el.frqV.textContent = parseFloat(el.frq.value).toFixed(1));
-  el.spc.addEventListener("input", () => el.spcV.textContent = parseFloat(el.spc.value).toFixed(2));
-  el.shn.addEventListener("input", () => el.shnV.textContent = parseFloat(el.shn.value).toFixed(0));
-  el.spn.addEventListener("input", () => { spin = parseFloat(el.spn.value); el.spnV.textContent = spin.toFixed(3); });
+  $("res").addEventListener("input", () => setResolution(parseInt($("res").value)));
+  $("spn").addEventListener("input", () => { spin = parseFloat($("spn").value); $("spnV").textContent = spin.toFixed(3); });
+  $("dth").addEventListener("input", () => $("dthV").textContent = parseFloat($("dth").value).toFixed(2));
+  $("crt").addEventListener("change", () => $("crtfx").classList.toggle("on", $("crt").checked));
 
   requestAnimationFrame(frame);
 }
-
 main().catch(e => { $("name").textContent = "failed to load wasm"; $("sub").textContent = String(e); });
 </script>
 </body>
