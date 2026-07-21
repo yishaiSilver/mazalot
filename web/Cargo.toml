@@ -1,0 +1,14 @@
+[package]
+name = "planet-web"
+version = "0.1.0"
+edition = "2021"
+
+# WASM glue only. All planet logic comes from the shared `planet-core` crate.
+# This is a member of the parent workspace (see ../Cargo.toml), so the release
+# profile is inherited from the workspace root.
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+planet-core = { path = "../core" }

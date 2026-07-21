@@ -1,0 +1,10 @@
+# Rust build artifacts
+/target
+/core/target
+/web/target
+
+# Generated planet/character output (GIFs, PNGs)
+/out
+
+# OS cruft
+.DS_Store
