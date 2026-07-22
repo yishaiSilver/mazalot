@@ -32,7 +32,7 @@ pub extern "C" fn dealloc(ptr: *mut u8, len: usize) {
 #[no_mangle]
 pub extern "C" fn render(ptr: *mut u8, size: u32, type_idx: u32, seed: u32, angle: f32) {
     let out = unsafe { slice::from_raw_parts_mut(ptr, (size * size * 4) as usize) };
-    planet_core::render_rgba(size, type_idx as usize, seed, angle, out);
+    crate::render_rgba(size, type_idx as usize, seed, angle, out);
 }
 
 /// Render a planet with slider-overridden parameters.
@@ -49,22 +49,22 @@ pub extern "C" fn render_custom(
     shininess: f32,
 ) {
     let out = unsafe { slice::from_raw_parts_mut(ptr, (size * size * 4) as usize) };
-    planet_core::render_rgba_custom(
+    crate::render_rgba_custom(
         size, type_idx as usize, seed, angle, contrast, freq, specular, shininess, out,
     );
 }
 
-/// Read a type's default value for parameter `which` (see planet_core::param),
+/// Read a type's default value for parameter `which` (see crate::param),
 /// so the sliders can snap to sensible per-type starting values.
 #[no_mangle]
 pub extern "C" fn param(type_idx: u32, which: u32) -> f32 {
-    planet_core::param(type_idx as usize, which)
+    crate::param(type_idx as usize, which)
 }
 
 /// Number of tunable parameters (length of the array `render_params` expects).
 #[no_mangle]
 pub extern "C" fn num_params() -> u32 {
-    planet_core::NUM_PARAMS as u32
+    crate::NUM_PARAMS as u32
 }
 
 /// Render with params + global style: `palette` (0 natural, 1 game boy, 2 ice,
@@ -82,8 +82,8 @@ pub extern "C" fn render_styled(
     moons: u32,
 ) {
     let out = unsafe { slice::from_raw_parts_mut(ptr, (size * size * 4) as usize) };
-    let params = unsafe { slice::from_raw_parts(params_ptr, planet_core::NUM_PARAMS) };
-    planet_core::render_rgba_styled(size, type_idx as usize, seed, angle, params, palette, dither, moons, out);
+    let params = unsafe { slice::from_raw_parts(params_ptr, crate::NUM_PARAMS) };
+    crate::render_rgba_styled(size, type_idx as usize, seed, angle, params, palette, dither, moons, out);
 }
 
 /// Render with a full slider-parameter override array. `params_ptr` points at
@@ -98,12 +98,12 @@ pub extern "C" fn render_params(
     params_ptr: *const f32,
 ) {
     let out = unsafe { slice::from_raw_parts_mut(ptr, (size * size * 4) as usize) };
-    let params = unsafe { slice::from_raw_parts(params_ptr, planet_core::NUM_PARAMS) };
-    planet_core::render_rgba_params(size, type_idx as usize, seed, angle, params, out);
+    let params = unsafe { slice::from_raw_parts(params_ptr, crate::NUM_PARAMS) };
+    crate::render_rgba_params(size, type_idx as usize, seed, angle, params, out);
 }
 
 /// Number of planet types (for the JS "random type" picker).
 #[no_mangle]
 pub extern "C" fn type_count() -> u32 {
-    planet_core::type_count() as u32
+    crate::type_count() as u32
 }

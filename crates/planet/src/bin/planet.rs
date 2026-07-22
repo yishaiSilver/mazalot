@@ -6,7 +6,7 @@
 
 use image::codecs::gif::{GifEncoder, Repeat};
 use image::{imageops, Delay, Frame, Rgba, RgbaImage};
-use planet_core::{render_rgba, type_count, type_name};
+use planet::{render_rgba, type_count, type_name};
 use std::f32::consts::TAU;
 use std::fs::File;
 

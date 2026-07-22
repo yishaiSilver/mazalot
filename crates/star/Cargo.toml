@@ -1,0 +1,26 @@
+[package]
+name = "star"
+version = "0.1.0"
+edition = "2021"
+
+# Same three-face shape as `planet` and `bird`:
+#   • lib.rs   — pure per-pixel star-render math (rlib + cdylib)
+#   • wasm.rs  — C-ABI wrapper over the lib, wasm32 only
+#   • bin/*    — native GIF/PNG generator (the `native` feature)
+# Fully self-contained: carries its own noise/color/dither primitives so it
+# shares no code with `planet` — only third-party deps and the workspace manifest.
+# The pure render path uses NO deps, so the wasm build stays tiny.
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "gif"], optional = true }
+
+[features]
+default = ["native"]
+native = ["dep:image"]
+
+[[bin]]
+name = "sun"
+required-features = ["native"]

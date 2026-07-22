@@ -838,3 +838,7 @@ fn render_ct(size: u32, ct: &PType, seed: u32, angle: f32, style: &Style, out: &
         }
     }
 }
+
+// Browser (wasm) C-ABI glue — excluded from native builds. See wasm.rs.
+#[cfg(target_arch = "wasm32")]
+mod wasm;

@@ -1,0 +1,31 @@
+[package]
+name = "planet"
+version = "0.1.0"
+edition = "2021"
+
+# One crate, three faces:
+#   • lib.rs   — pure per-pixel render math (rlib for the bins, cdylib for wasm)
+#   • wasm.rs  — a thin C-ABI wrapper over the lib, compiled only for wasm32
+#   • bin/*    — native GIF/PNG generators (need `image`+`rand`, the `native` feature)
+# The pure render path uses NO deps, so the wasm build (`--no-default-features`)
+# stays tiny and can never pull in `image`/`rand`.
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "gif"], optional = true }
+rand = { version = "0.8", optional = true }
+rand_chacha = { version = "0.3", optional = true }
+
+[features]
+default = ["native"]
+native = ["dep:image", "dep:rand", "dep:rand_chacha"]
+
+[[bin]]
+name = "planet"
+required-features = ["native"]
+
+[[bin]]
+name = "bench"
+required-features = ["native"]

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Procedural Planet — Rust · WASM</title>
+<title>Procedural Star — Rust · WASM</title>
 <style>
   :root { color-scheme: dark; }
   html, body {
@@ -19,14 +19,14 @@
   .left { text-align: center; position: sticky; top: 20px; }
   .stage {
     width: 360px; height: 360px; max-width: 82vw; max-height: 82vw;
-    border-radius: 14px; background: #05060b;
+    border-radius: 14px; background: #000;
     box-shadow: 0 10px 40px rgba(0,0,0,.6), inset 0 0 0 1px rgba(255,255,255,.05);
     display: block; image-rendering: pixelated;
   }
   .name { font-size: 20px; font-weight: 700; color: #eef1f8; text-transform: capitalize; margin-top: 16px; }
   .sub { font-size: 12px; color: #6b7290; letter-spacing: .04em; }
   .gen { margin-top: 14px; padding: 11px 22px; font: inherit; font-weight: 600;
-    color: #06060c; background: linear-gradient(180deg, #eef1f8, #c7cde0);
+    color: #06060c; background: linear-gradient(180deg, #ffe8b0, #f4b74a);
     border: 0; border-radius: 999px; cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
   .gen:active { transform: translateY(1px); }
 
@@ -38,7 +38,7 @@
   .ctl { margin: 0 0 11px; }
   .ctl label { display: flex; justify-content: space-between; font-size: 12px; color: #9aa0bb; margin-bottom: 4px; }
   .ctl label b { color: #eef1f8; font-variant-numeric: tabular-nums; font-weight: 600; }
-  input[type=range] { width: 100%; accent-color: #8fb7ff; cursor: pointer; }
+  input[type=range] { width: 100%; accent-color: #f4b74a; cursor: pointer; }
   select, input[type=number] { width: 100%; box-sizing: border-box; padding: 8px 10px; font: inherit; font-size: 13px;
     color: #eef1f8; background: #0e0f18; border: 1px solid rgba(255,255,255,.1); border-radius: 8px; }
   .rowflex { display: flex; gap: 8px; } .rowflex input { flex: 1; }
@@ -56,19 +56,19 @@
       radial-gradient(circle at 50% 50%, transparent 55%, rgba(0,0,0,.5) 100%); }
   .crt.on { opacity: 1; }
   .chk { justify-content: flex-start !important; gap: 8px; cursor: pointer; color: #cfd4e6 !important; }
-  .chk input { accent-color: #8fb7ff; }
+  .chk input { accent-color: #f4b74a; }
 </style>
 </head>
 <body>
 <div class="app">
   <div class="left">
-    <h1>Procedural Planet</h1>
+    <h1>Procedural Star</h1>
     <div class="stage-wrap">
       <canvas class="stage" id="stage" width="360" height="360"></canvas>
       <div class="crt" id="crtfx"></div>
     </div>
     <div class="name" id="name">loading…</div>
-    <div class="sub" id="sub">Rust → WebAssembly · live sphere shading</div>
+    <div class="sub" id="sub">Rust → WebAssembly · live boiling photosphere</div>
     <button class="gen" id="gen">✦ Generate random</button>
   </div>
 
@@ -78,54 +78,38 @@
     <div class="ctl"><label>Seed</label>
       <div class="rowflex"><input type="number" id="seed" min="0" value="1" /><button class="mini" id="rndseed" title="random seed">🎲</button></div>
     </div>
-    <div class="ctl"><label>Resolution <b id="resV">64</b></label><input type="range" id="res" min="40" max="240" step="8" value="64" /></div>
-    <div class="ctl"><label>Spin speed <b id="spnV">0.012</b></label><input type="range" id="spn" min="0" max="0.05" step="0.002" value="0.012" /></div>
-
-    <div class="grp">Look</div>
-    <div class="ctl"><label>Palette</label>
-      <select id="palette">
-        <option value="0">Natural</option>
-        <option value="1">Game Boy</option>
-        <option value="2">Ice duotone</option>
-        <option value="3">Sunset</option>
-      </select>
-    </div>
-    <div class="ctl"><label>Dither <b id="dthV">0.70</b></label><input type="range" id="dth" min="0" max="1" step="0.05" value="0.7" /></div>
-    <div class="ctl"><label class="chk"><input type="checkbox" id="moons" checked /> Orbiting moons</label></div>
-    <div class="ctl"><label class="chk"><input type="checkbox" id="crt" /> CRT / scanlines</label></div>
+    <div class="ctl"><label>Resolution <b id="resV">80</b></label><input type="range" id="res" min="48" max="240" step="8" value="80" /></div>
+    <div class="ctl"><label>Boil speed <b id="spdV">0.030</b></label><input type="range" id="spd" min="0" max="0.10" step="0.002" value="0.03" /></div>
+    <div class="ctl"><label>Rotation <b id="rotV">0.00</b></label><input type="range" id="rot" min="0" max="1" step="0.05" value="0" /></div>
 
     <div id="sliders"></div>
+
+    <div class="grp">Look</div>
+    <div class="ctl"><label>Dither <b id="dthV">0.70</b></label><input type="range" id="dth" min="0" max="1" step="0.05" value="0.7" /></div>
+    <div class="ctl"><label class="chk"><input type="checkbox" id="crt" /> CRT / scanlines</label></div>
 
     <button class="mini reset" id="reset">↺ reset params to type defaults</button>
   </div>
 
-  <div class="foot">rendered live in <code>planet.wasm</code> — same code as the native generator</div>
+  <div class="foot">rendered live in <code>star.wasm</code> — same code as the native generator</div>
 </div>
 
 <script type="module">
 const NAMES = [
-  "terran","ocean","archipelago","desert","swamp","iron","ice","barren",
-  "gas giant","ice giant","lava","fungal","savanna","gaia","tundra","alpine",
-  "obsidian","chrome","moon","storm giant","ringed giant","molten sea",
-  "radioactive","crystal","toxic","storm shroud",
+  "blue giant","white star","yellow dwarf","orange dwarf",
+  "red giant","red dwarf","white dwarf","sol",
 ];
 
 // Slider defs in DISPLAY order; `pi` = parameter index into the wasm params array
-// (MUST match planet_core::param). `g` starts a new group header.
+// (MUST match star::param). `g` starts a new group header.
 const PARAMS = [
-  { g:"Terrain", pi:0,  label:"Contrast",      min:0.6, max:3.2, step:0.05, fix:2 },
-  {             pi:1,  label:"Frequency",     min:1,   max:6,   step:0.1,  fix:1 },
-  {             pi:5,  label:"Ice caps",      min:0,   max:1,   step:0.02, fix:2 },
-  { g:"Surface", pi:2,  label:"Specular glare",min:0,   max:1,   step:0.02, fix:2 },
-  {             pi:3,  label:"Shininess",     min:2,   max:40,  step:1,    fix:0 },
-  {             pi:12, label:"Glare ↔ albedo",min:0,   max:1,   step:0.05, fix:2 },
-  { g:"Weather", pi:4,  label:"Clouds",        min:0,   max:1,   step:0.02, fix:2 },
-  {             pi:9,  label:"Storm cells",   min:0,   max:1,   step:0.02, fix:2 },
-  {             pi:8,  label:"Aurora",        min:0,   max:1.5, step:0.02, fix:2 },
-  {             pi:7,  label:"Lightning",     min:0,   max:1.5, step:0.02, fix:2 },
-  {             pi:6,  label:"Great spot",    min:0,   max:1.5, step:0.02, fix:2 },
-  { g:"Gas giant bands", pi:10, label:"Bands", min:3,  max:14,  step:0.5,  fix:1 },
-  {             pi:11, label:"Turbulence",    min:0,   max:1.5, step:0.02, fix:2 },
+  { g:"Surface", pi:0, label:"Granulation",  min:3,   max:12,  step:0.5,  fix:1 },
+  {              pi:1, label:"Turbulence",   min:0,   max:1.5, step:0.05, fix:2 },
+  {              pi:2, label:"Sunspots",     min:0,   max:1,   step:0.05, fix:2 },
+  { g:"Corona & flares", pi:3, label:"Prominences", min:0, max:1.5, step:0.05, fix:2 },
+  {              pi:4, label:"Flares (spikes)", min:0, max:1.5, step:0.05, fix:2 },
+  {              pi:5, label:"Corona reach", min:0.4, max:2,   step:0.05, fix:2 },
+  {              pi:6, label:"Fur density",  min:0.5, max:2,   step:0.05, fix:2 },
 ];
 
 const $ = id => document.getElementById(id);
@@ -136,7 +120,7 @@ const off = document.createElement("canvas");
 const octx = off.getContext("2d");
 
 let wasm, bufPtr, bufLen, imgData, paramsPtr, NUM;
-let NATIVE = 64, typeIdx = 0, seed = 1, angle = 0, spin = 0.012;
+let NATIVE = 80, typeIdx = 0, seed = 1, angle = 0, speed = 0.03, spin = 0;
 const sliders = {}; // pi -> { input, val }
 
 function buildSliders() {
@@ -182,13 +166,11 @@ function randomize() {
 }
 
 function frame() {
-  angle += spin;
+  angle += speed;
   const pv = new Float32Array(wasm.memory.buffer, paramsPtr, NUM);
   for (const p of PARAMS) pv[p.pi] = parseFloat(sliders[p.pi].input.value);
-  const palette = parseInt($("palette").value);
   const dither = parseFloat($("dth").value);
-  const moons = $("moons").checked ? 1 : 0;
-  wasm.render_styled(bufPtr, NATIVE, typeIdx, seed, angle, paramsPtr, palette, dither, moons);
+  wasm.render_params(bufPtr, NATIVE, typeIdx, seed, angle, paramsPtr, dither, spin);
   const view = new Uint8Array(wasm.memory.buffer, bufPtr, bufLen);
   imgData.data.set(view);
   octx.putImageData(imgData, 0, 0);
@@ -198,7 +180,7 @@ function frame() {
 }
 
 async function main() {
-  const res = await fetch("./planet.wasm?v=" + Date.now(), { cache: "no-store" });
+  const res = await fetch("./star.wasm?v=" + Date.now(), { cache: "no-store" });
   const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
   wasm = instance.exports;
 
@@ -210,7 +192,7 @@ async function main() {
   buildSliders();
 
   paramsPtr = wasm.alloc(NUM * 4); // stable buffer, allocated before pixel buffer
-  setResolution(64);
+  setResolution(80);
   randomize();
 
   $("type").addEventListener("change", () => setType(parseInt($("type").value)));
@@ -219,7 +201,8 @@ async function main() {
   $("gen").addEventListener("click", randomize);
   $("reset").addEventListener("click", () => loadTypeDefaults(typeIdx));
   $("res").addEventListener("input", () => setResolution(parseInt($("res").value)));
-  $("spn").addEventListener("input", () => { spin = parseFloat($("spn").value); $("spnV").textContent = spin.toFixed(3); });
+  $("spd").addEventListener("input", () => { speed = parseFloat($("spd").value); $("spdV").textContent = speed.toFixed(3); });
+  $("rot").addEventListener("input", () => { spin = parseFloat($("rot").value); $("rotV").textContent = spin.toFixed(2); });
   $("dth").addEventListener("input", () => $("dthV").textContent = parseFloat($("dth").value).toFixed(2));
   $("crt").addEventListener("change", () => $("crtfx").classList.toggle("on", $("crt").checked));
 

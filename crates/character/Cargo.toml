@@ -1,0 +1,13 @@
+[package]
+name = "character"
+version = "0.1.0"
+edition = "2021"
+
+# Paper-doll character compositor: layered pixel "parts" + placeholder-color
+# recoloring, composed from a seeded RNG. Native-only (no wasm target), so its
+# deps are unconditional. Independent of both planet and bird.
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "gif"] }
+rand = "0.8"
+rand_chacha = "0.3"

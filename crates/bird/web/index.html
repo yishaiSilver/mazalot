@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Procedural Aliens — Rust · WASM</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; min-height: 100%;
+    background: radial-gradient(circle at 50% 18%, #12131f 0%, #06060c 70%);
+    color: #d7dae6; font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  .app { max-width: 820px; margin: 0 auto; padding: 28px 20px 48px;
+    display: flex; flex-wrap: wrap; gap: 28px; align-items: flex-start; justify-content: center; }
+  h1 { font-size: 14px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: #7f86a3; margin: 0 0 14px; }
+  .left { text-align: center; position: sticky; top: 20px; }
+  .stage { width: 360px; height: 360px; max-width: 82vw; max-height: 82vw;
+    border-radius: 14px; background: #05060b;
+    box-shadow: 0 10px 40px rgba(0,0,0,.6), inset 0 0 0 1px rgba(255,255,255,.05);
+    display: block; image-rendering: pixelated; }
+  .sub { font-size: 12px; color: #6b7290; letter-spacing: .04em; margin-top: 12px; }
+  .gen { margin-top: 14px; padding: 11px 22px; font: inherit; font-weight: 600;
+    color: #06060c; background: linear-gradient(180deg, #eef1f8, #c7cde0);
+    border: 0; border-radius: 999px; cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
+  .gen:active { transform: translateY(1px); }
+  .panel { width: 320px; background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.06);
+    border-radius: 14px; padding: 16px 18px 20px; }
+  .panel h2 { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: #7f86a3; margin: 0 0 12px; }
+  .ctl { margin: 0 0 13px; }
+  .ctl label { display: flex; justify-content: space-between; font-size: 12px; color: #9aa0bb; margin-bottom: 4px; }
+  .ctl label b { color: #eef1f8; font-variant-numeric: tabular-nums; font-weight: 600; }
+  input[type=range] { width: 100%; accent-color: #8fb7ff; cursor: pointer; }
+  input[type=number] { width: 100%; box-sizing: border-box; padding: 8px 10px; font: inherit; font-size: 13px;
+    color: #eef1f8; background: #0e0f18; border: 1px solid rgba(255,255,255,.1); border-radius: 8px; }
+  .rowflex { display: flex; gap: 8px; } .rowflex input { flex: 1; }
+  .mini { padding: 8px 12px; font: inherit; color: #d7dae6; background: #171826;
+    border: 1px solid rgba(255,255,255,.1); border-radius: 8px; cursor: pointer; }
+  .mini:active { transform: translateY(1px); }
+  .foot { width: 100%; text-align: center; font-size: 11px; color: #4d536b; letter-spacing: .05em; }
+  .foot code { color: #6b7290; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="left">
+    <h1>Procedural Aliens</h1>
+    <canvas class="stage" id="stage" width="360" height="360"></canvas>
+    <div class="sub" id="sub">Rust → WebAssembly · live idle animation</div>
+    <button class="gen" id="gen">✦ Generate random</button>
+  </div>
+  <div class="panel">
+    <h2>Controls</h2>
+    <div class="ctl"><label>Seed</label>
+      <div class="rowflex"><input type="number" id="seed" min="0" value="9001" /><button class="mini" id="rndseed" title="random seed">🎲</button></div>
+    </div>
+    <div class="ctl"><label>Idle energy <b id="enV">0.50</b></label><input type="range" id="en" min="0" max="1.5" step="0.05" value="0.5" /></div>
+    <div class="ctl"><label>Loop speed <b id="spV">0.020</b></label><input type="range" id="sp" min="0" max="0.06" step="0.002" value="0.02" /></div>
+    <div class="ctl"><label>Resolution <b id="resV">120</b></label><input type="range" id="res" min="30" max="300" step="30" value="120" /></div>
+  </div>
+  <div class="foot">rendered live in <code>bird.wasm</code> — same code as the native generator · <span id="fps">–</span> fps</div>
+</div>
+
+<script type="module">
+const $ = id => document.getElementById(id);
+const stage = $("stage"); const sctx = stage.getContext("2d"); sctx.imageSmoothingEnabled = false;
+const off = document.createElement("canvas"); const octx = off.getContext("2d");
+
+let wasm, bufPtr, bufLen, imgData, SIZE = 120;
+let seed = 9001, phase = 0, speed = 0.02, energy = 0.5;
+let lastRaf = 0, ema = 0, lastFps = 0;
+
+function setSize(n) {
+  SIZE = n; off.width = off.height = n; imgData = octx.createImageData(n, n);
+  if (bufPtr) wasm.dealloc(bufPtr, bufLen);
+  bufLen = n * n * 4; bufPtr = wasm.alloc(bufLen); $("resV").textContent = n;
+}
+
+function frame(ts) {
+  if (lastRaf) { const f = 1000 / (ts - lastRaf); ema = ema ? ema * 0.9 + f * 0.1 : f; }
+  lastRaf = ts;
+  phase = (phase + speed) % 1.0;
+  wasm.render(bufPtr, SIZE, seed >>> 0, phase, energy);
+  imgData.data.set(new Uint8Array(wasm.memory.buffer, bufPtr, bufLen));
+  octx.putImageData(imgData, 0, 0);
+  sctx.clearRect(0, 0, stage.width, stage.height);
+  sctx.drawImage(off, 0, 0, stage.width, stage.height);
+  if (ts - lastFps > 200) { $("fps").textContent = ema.toFixed(0); lastFps = ts; }
+  requestAnimationFrame(frame);
+}
+
+async function main() {
+  const res = await fetch("./bird.wasm?v=" + Date.now(), { cache: "no-store" });
+  const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
+  wasm = instance.exports;
+  setSize(120);
+
+  $("seed").addEventListener("input", () => { seed = parseInt($("seed").value) || 0; });
+  $("rndseed").addEventListener("click", () => { seed = (Math.random() * 0xffffff) >>> 0; $("seed").value = seed; });
+  $("gen").addEventListener("click", () => { seed = (Math.random() * 0xffffff) >>> 0; $("seed").value = seed; });
+  $("en").addEventListener("input", () => { energy = parseFloat($("en").value); $("enV").textContent = energy.toFixed(2); });
+  $("sp").addEventListener("input", () => { speed = parseFloat($("sp").value); $("spV").textContent = speed.toFixed(3); });
+  $("res").addEventListener("input", () => setSize(parseInt($("res").value)));
+
+  requestAnimationFrame(frame);
+}
+main().catch(e => { $("sub").textContent = "failed to load wasm: " + e; });
+</script>
+</body>
+</html>

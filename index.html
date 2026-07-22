@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sprite-compositor — procedural pixel-art demos</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0; min-height: 100%;
+    background: radial-gradient(circle at 50% 14%, #12131f 0%, #06060c 72%);
+    color: #d7dae6;
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  .app { max-width: 880px; margin: 0 auto; padding: 56px 20px 64px; }
+  header { text-align: center; margin-bottom: 44px; }
+  h1 { font-size: 13px; font-weight: 600; letter-spacing: .18em; text-transform: uppercase;
+       color: #7f86a3; margin: 0 0 10px; }
+  header p { margin: 0 auto; max-width: 540px; font-size: 14px; color: #9aa0bb; }
+  header code { color: #cfd4e6; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; }
+  a.card {
+    display: block; text-decoration: none; color: inherit;
+    background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.07);
+    border-radius: 16px; padding: 18px; transition: transform .12s, border-color .12s, background .12s;
+  }
+  a.card:hover { transform: translateY(-3px); border-color: rgba(143,183,255,.4); background: rgba(255,255,255,.05); }
+  a.card:active { transform: translateY(-1px); }
+  .thumb {
+    width: 100%; aspect-ratio: 1 / 1; border-radius: 12px; background: #05060b;
+    box-shadow: 0 8px 30px rgba(0,0,0,.55), inset 0 0 0 1px rgba(255,255,255,.05);
+    display: block; image-rendering: pixelated;
+  }
+  .name { font-size: 19px; font-weight: 700; color: #eef1f8; text-transform: capitalize; margin: 16px 0 2px; }
+  .sub { font-size: 12px; color: #6b7290; letter-spacing: .04em; }
+  .go { margin-top: 12px; font-size: 12px; font-weight: 600; letter-spacing: .06em;
+        color: #8fb7ff; text-transform: uppercase; }
+  .foot { text-align: center; margin-top: 44px; font-size: 11px; color: #4d536b; letter-spacing: .05em; }
+  .foot code { color: #6b7290; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>sprite-compositor</h1>
+    <p>Procedural pixel-art generators in Rust — <strong>zero art assets</strong>, everything is math.
+       Each demo below renders live in the browser from the same <code>.wasm</code> as its native generator.</p>
+  </header>
+
+  <div class="grid" id="grid"></div>
+
+  <div class="foot">seed-driven · rendered per-pixel in WebAssembly · run <code>python3 -m http.server</code> from the repo root</div>
+</div>
+
+<script>
+// Each demo lives in crates/<crate>/web/. We draw a live thumbnail by loading
+// the same wasm the full page uses (raw C-ABI: alloc/dealloc + a render fn).
+const DEMOS = [
+  { name: "Planet", crate: "planet", sub: "26 rotating world types", wasm: "planet.wasm",
+    render: (m, ex, ptr, size) => {
+      // render(ptr, size, type_idx, seed, angle)
+      ex.render(ptr, size, (Math.random()*26)|0, (Math.random()*1e9)|0, 0.7);
+    } },
+  { name: "Star", crate: "star", sub: "suns & stellar types", wasm: "star.wasm",
+    render: (m, ex, ptr, size) => {
+      ex.render(ptr, size, (Math.random()*6)|0, (Math.random()*1e9)|0, 0.0);
+    } },
+  { name: "Aliens", crate: "bird", sub: "hybrid avian creatures", wasm: "bird.wasm",
+    render: (m, ex, ptr, size) => {
+      // render(ptr, size, seed, phase, energy)
+      ex.render(ptr, size, (Math.random()*1e9)|0, 0.0, 0.6);
+    } },
+];
+
+const grid = document.getElementById("grid");
+
+for (const d of DEMOS) {
+  const href = `crates/${d.crate}/web/index.html`;
+  const card = document.createElement("a");
+  card.className = "card";
+  card.href = href;
+  card.innerHTML =
+    `<canvas class="thumb" width="128" height="128"></canvas>
+     <div class="name">${d.name}</div>
+     <div class="sub">${d.sub}</div>
+     <div class="go">Open demo →</div>`;
+  grid.appendChild(card);
+  drawThumb(card.querySelector("canvas"), d).catch(() => {
+    // If wasm isn't built/served yet, leave the empty stage — the link still works.
+  });
+}
+
+async function drawThumb(canvas, d) {
+  const size = canvas.width; // square
+  const url = `crates/${d.crate}/web/${d.wasm}`;
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`no wasm at ${url}`);
+  const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
+  const ex = instance.exports;
+  const bytes = size * size * 4;
+  const ptr = ex.alloc(bytes);
+  d.render(ex.memory, ex, ptr, size);
+  const view = new Uint8ClampedArray(ex.memory.buffer, ptr, bytes).slice();
+  ex.dealloc(ptr, bytes);
+  canvas.getContext("2d").putImageData(new ImageData(view, size, size), 0, 0);
+}
+</script>
+</body>
+</html>

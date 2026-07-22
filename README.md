@@ -5,17 +5,31 @@ planet is generated from math per pixel, so a single seed always rebuilds the
 exact same world. The core algorithm compiles to both a native GIF/PNG generator
 and a ~42 KB WebAssembly module from **one shared codebase**.
 
-There's also a companion paper-doll **character** compositor.
+There's also a companion **star** generator (a sibling of the planet renderer),
+a paper-doll **character** compositor, and a fully separate **creature**
+generator (alien + earth birds) — see below.
 
 ## Crate layout
 
-This is a Cargo workspace. All planet logic lives in one place.
+This is a Cargo workspace with **two disjoint halves that share no code** — only
+the third-party deps (`image`, `rand`) and this manifest. Planets never touch the
+bird crates; birds never touch the planet crates.
+
+**Planets:**
 
 | Crate | What it is |
 |-------|------------|
-| `core/` (`planet-core`) | The single source of truth: 3D value-noise + Worley, the 26-type planet table, sphere shading, weather, and the pixel-art output stage. **Pure math, zero dependencies.** Emits raw RGBA bytes. |
-| `src/` (`sprite-compositor`) | Native generator. Wraps core's frames into spinning **GIFs**, a contact-sheet **PNG**, and a combined all-types GIF (via the `image` crate). Also the character compositor. |
+| `core/` (`planet-core`) | The single source of truth: 3D value-noise + Worley, the 26-type planet table, sphere shading, weather, and the pixel-art output stage. **Pure math, zero dependencies.** Emits raw RGBA bytes. Also holds the **star** renderer (`sun` module), which reuses the same noise + dither helpers. |
+| `src/` (`sprite-compositor`) | Native generators. Wraps core's frames into spinning **GIFs**, a contact-sheet **PNG**, and a combined all-types GIF (via the `image` crate): `--bin planet`, `--bin sun`. Also the character compositor. |
 | `web/` (`planet-web`) | Rust → WASM (raw cdylib, **no wasm-bindgen**). A browser page renders a live rotating planet on a canvas with full tuning controls. |
+
+**Birds (fully disjoint from planets):**
+
+| Crate | What it is |
+|-------|------------|
+| `bird-core/` (`bird-core`) | Procedural alien/bird creature generation — structural randomness (body plans, features, palettes), not just recolor. **Pure, zero dependencies.** |
+| `bird/` (`bird`) | Native generators. `--bin alien` (hybrid alien "genus" families, animated) and `--bin bird` (naturalistic earth birds). |
+| `bird-web/` (`bird-web`) | Rust → WASM (raw cdylib, no wasm-bindgen). Renders a live creature on a canvas. |
 
 ## The planet system
 
@@ -47,13 +61,35 @@ stretching, and a full 360° spin loops seamlessly.
 - **Limited palettes** — swap any planet into a duotone: `Natural`, `Game Boy`, `Ice`, `Sunset`.
 - **Crisp dark rim** — a 1-px outline on every disc (and every moon) for sprite readability.
 
+## The star system
+
+A star is the **inverse of a planet**: self-luminous, so there is *no* day/night
+terminator and no external light — the whole disc glows. The `sun` module reuses
+`planet-core`'s noise, color, and Bayer-dither helpers and adds star-specific
+shading:
+
+- **Granulation** — Worley convection cells (bright centres, dark inter-granular lanes) plus a warped-fbm mottle, boiling over time (loop-safe).
+- **Sunspots** — low-frequency umbrae that drift slowly across the surface.
+- **Limb darkening** — the edge dims and tints cooler (`mu = nz`), which is what gives the flat disc its spherical read.
+- **Corona** — a soft halo with shimmering radial streamers past the limb.
+- **Prominences** — jagged filaments erupting from evenly-spaced limb lobes, each firing on its own seamless pulse; flare stars add rare violent spikes.
+- **Sparkle motes** — twinkling points in the halo.
+
+**8 types** across the temperature spectrum — `blue_giant`, `white_star`,
+`yellow_dwarf`, `orange_dwarf`, `red_giant`, `red_dwarf`, `white_dwarf` — plus an
+exotic teal `sol` (a nod to *rebels-in-the-sky*). Add a star type = add one row
+to `STYPES` in `core/src/sun.rs`.
+
 ## Running it
 
 **Native — generate GIFs + PNG into `out/`:**
 ```bash
 cargo run --release --bin planet            # planets
+cargo run --release --bin sun               # stars
 cargo run --release --bin sprite-compositor # characters
 cargo run --release --bin bench             # feature-cost benchmark
+cargo run --release -p bird --bin alien     # alien creatures  (disjoint half)
+cargo run --release -p bird --bin bird      # earth birds       (disjoint half)
 ```
 
 **Web — live, interactive planet:**
@@ -62,7 +98,23 @@ cargo build -p planet-web --target wasm32-unknown-unknown --release
 cp target/wasm32-unknown-unknown/release/planet_web.wasm web/planet.wasm
 cd web && python3 -m http.server 8000       # open http://localhost:8000/
 ```
-(Requires the wasm target: `rustup target add wasm32-unknown-unknown`.)
+
+**Web — live, interactive star:**
+```bash
+cargo build -p star --target wasm32-unknown-unknown --release --no-default-features
+cp target/wasm32-unknown-unknown/release/star.wasm crates/star/web/star.wasm
+cd crates/star/web && python3 -m http.server 8000   # open http://localhost:8000/
+```
+
+**Web — live creature (the bird half):**
+```bash
+cargo build -p bird-web --target wasm32-unknown-unknown --release
+cp target/wasm32-unknown-unknown/release/bird_web.wasm bird-web/bird.wasm
+cd bird-web && python3 -m http.server 8000  # open http://localhost:8000/
+```
+(All require the wasm target: `rustup target add wasm32-unknown-unknown`. The
+`--no-default-features` flag drops the native-only `image`/`rand` deps so the
+wasm build stays tiny.)
 
 ### Web controls
 Type · Seed · Resolution · Spin, then live sliders for every parameter

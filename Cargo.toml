@@ -1,19 +1,16 @@
-[package]
-name = "sprite-compositor"
-version = "0.1.0"
-edition = "2021"
-
-# Native generator (character compositor + planet GIF/PNG generator).
-# Shares all planet logic with the web build via the `planet-core` crate.
-
-[dependencies]
-image = { version = "0.25", default-features = false, features = ["png", "gif"] }
-rand = "0.8"
-rand_chacha = "0.3"
-planet-core = { path = "core" }
-
+# Virtual workspace — no root package. Each crate under crates/ is one
+# self-contained "type": a pure-math lib + a wasm C-ABI face + native bins,
+# gated so the wasm build stays dependency-free.
+#
+#   crates/planet    — procedural planets (bins: planet, bench) + wasm
+#   crates/star      — procedural stars/suns (bin: sun) + wasm
+#   crates/bird      — alien/earth-bird creatures (bins: alien, bird) + wasm
+#   crates/character — paper-doll character compositor (native only)
+#
+# The "type" crates share no code — only third-party deps and this manifest.
 [workspace]
-members = ["core", "web"]
+resolver = "2"
+members = ["crates/planet", "crates/star", "crates/bird", "crates/character"]
 
 [profile.release]
 opt-level = 3

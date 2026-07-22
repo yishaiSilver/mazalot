@@ -15,6 +15,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "bird"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "rand",
+ "rand_chacha",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -37,6 +46,15 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "character"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "rand",
+ "rand_chacha",
+]
 
 [[package]]
 name = "color_quant"
@@ -110,9 +128,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.187"
+version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7743783ea728ef5c31194c6590797eed286449b4a4e87d626d8a51f0a94e732"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "miniz_oxide"
@@ -144,14 +162,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "planet-core"
-version = "0.1.0"
-
-[[package]]
-name = "planet-web"
+name = "planet"
 version = "0.1.0"
 dependencies = [
- "planet-core",
+ "image",
+ "rand",
+ "rand_chacha",
 ]
 
 [[package]]
@@ -237,13 +253,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
-name = "sprite-compositor"
+name = "star"
 version = "0.1.0"
 dependencies = [
  "image",
- "planet-core",
- "rand",
- "rand_chacha",
 ]
 
 [[package]]

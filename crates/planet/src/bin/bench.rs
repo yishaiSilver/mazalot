@@ -1,5 +1,5 @@
 //! Feature-cost benchmark for the current renderer.
-use planet_core::{param, render_rgba_styled, type_count, type_name, NUM_PARAMS};
+use planet::{param, render_rgba_styled, type_count, type_name, NUM_PARAMS};
 use std::time::Instant;
 
 fn idx(n: &str) -> usize {

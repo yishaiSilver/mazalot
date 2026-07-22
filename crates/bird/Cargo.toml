@@ -1,0 +1,30 @@
+[package]
+name = "bird"
+version = "0.1.0"
+edition = "2021"
+
+# Same three-face shape as `planet`:
+#   • lib.rs   — pure creature-generation math (rlib + cdylib)
+#   • wasm.rs  — C-ABI wrapper over the lib, wasm32 only
+#   • bin/*    — native sprite-sheet / GIF generators (the `native` feature)
+# Fully disjoint from `planet` — shares no code, only third-party deps.
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "gif"], optional = true }
+rand = { version = "0.8", optional = true }
+rand_chacha = { version = "0.3", optional = true }
+
+[features]
+default = ["native"]
+native = ["dep:image", "dep:rand", "dep:rand_chacha"]
+
+[[bin]]
+name = "alien"
+required-features = ["native"]
+
+[[bin]]
+name = "bird"
+required-features = ["native"]
