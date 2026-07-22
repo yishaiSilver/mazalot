@@ -536,6 +536,197 @@ fn spark(ix: u32, iy: u32, r: f32, angle: f32, seed: u32) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
+// Alternative look "patterns"
+//
+// The realistic granulated sun above reads more like a mottled marble than a
+// burning star. These patterns are deliberately-stylised alternatives, each a
+// self-contained per-pixel body+corona look that reuses the same palettes
+// (`SType`) and noise toolkit. All are loop-seamless over a 2π `angle`. Select
+// one via [`StarPattern`] and [`render_pattern`].
+// ---------------------------------------------------------------------------
+
+/// A star rendering style. `Realistic` is the original granulated sun; the rest
+/// are the stylised alternatives generated for evaluation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StarPattern {
+    /// Original: Worley granulation, sunspots, spiky corona, embers.
+    Realistic,
+    /// Deep-Fold / "rebels-in-the-sky" look: chunky flat color bands, boiling
+    /// blobs, an undulating flat outer ring, ordered dither only at band edges.
+    PixelBands,
+    /// Domain-warped fBm: flowing lava veins / liquid plasma, cosine palette,
+    /// soft coronal streaks.
+    Plasma,
+    /// Cel-shaded toon: 3 flat bands, thick dark outline rim, hard flame collar.
+    CelToon,
+    /// Rotating pinwheel wedges on the disc + triangular sunburst rays.
+    Sunburst,
+}
+
+impl StarPattern {
+    /// All patterns in menu order (Realistic first as the reference).
+    pub const ALL: [StarPattern; 5] = [
+        StarPattern::Realistic,
+        StarPattern::PixelBands,
+        StarPattern::Plasma,
+        StarPattern::CelToon,
+        StarPattern::Sunburst,
+    ];
+    /// Short lowercase name, for filenames / labels.
+    pub fn name(self) -> &'static str {
+        match self {
+            StarPattern::Realistic => "realistic",
+            StarPattern::PixelBands => "pixelbands",
+            StarPattern::Plasma => "plasma",
+            StarPattern::CelToon => "celtoon",
+            StarPattern::Sunburst => "sunburst",
+        }
+    }
+}
+
+/// Quantize `t` in [0,1] to `n` flat bands, returning the band's [0,1] level.
+fn quant(t: f32, n: f32) -> f32 {
+    ((t.max(0.0).min(0.9999) * n).floor() / (n - 1.0)).min(1.0)
+}
+
+/// A closed 2-vector "time circle" of radius `r` for seamless 5D-noise looping.
+fn tcircle(angle: f32, r: f32) -> (f32, f32) {
+    (angle.cos() * r, angle.sin() * r)
+}
+
+/// PixelBands: chunky flat photosphere bands over a boiling blob field, plus an
+/// undulating flat outer ring. Ordered dither is folded into the quantisation so
+/// it only appears at band boundaries — the Deep-Fold pixel-star signature.
+fn px_bands(ct: &SType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32, bx: f32) -> Rgb {
+    let (tc, ts) = tcircle(angle, 1.15);
+    let (px, py, pz) = (sx + ofs[0], sy + ofs[1], sz + ofs[2]);
+    let f = ct.gran_freq * 0.42;
+    // Big boiling blobs decide the temperature band.
+    let blob = fbm5([px * f, py * f, pz * f, tc, ts], 4);
+    // A sparse darker "spot" field knocks a few blobs down a band.
+    let spot = smoothstep(0.62, 0.40, fbm5([px * f * 0.6 + 3.1, py * f * 0.6, pz * f * 0.6, tc, ts], 3));
+    let t = clamp01(blob * 1.15 - 0.28 * spot * ct.spots);
+    // Fold the Bayer value into the field before quantizing => dithered edges.
+    let bands = 4.0;
+    let level = quant(t + bx * 0.9 / bands, bands);
+    ramp3(ct.cool, ct.mid, ct.hot, level)
+}
+
+/// PixelBands outer ring: one flat bright band hugging the limb, its thickness
+/// undulating with angle+time. Returns emissive RGB (black inside/outside).
+fn px_ring(ct: &SType, nx: f32, ny: f32, r: f32, angle: f32, bx: f32) -> Rgb {
+    let edge = r - 1.0;
+    if edge <= 0.0 || edge > 0.5 {
+        return [0.0, 0.0, 0.0];
+    }
+    let theta = ny.atan2(nx);
+    // Integer angular + temporal frequencies keep it seamless.
+    let w = 0.10
+        + 0.05 * (theta * 5.0 + angle * 2.0).sin()
+        + 0.04 * (theta * 11.0 - angle * 3.0).sin();
+    let w = (w * ct.corona_size).max(0.02);
+    // Hard band with a dithered outer pixel.
+    if edge < w + bx * 0.05 {
+        return mix(ct.hot, ct.flare, smoothstep(0.0, w, edge));
+    }
+    [0.0, 0.0, 0.0]
+}
+
+/// Plasma: 2-step domain-warped fBm on the sphere point, evolving on the time
+/// circle. Ridged veins go white-hot; body colour comes from an IQ cosine
+/// palette biased toward the type's cool→hot range.
+fn plasma_body(ct: &SType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32) -> Rgb {
+    let (tc, ts) = tcircle(angle, 1.35);
+    let (px, py, pz) = (sx + ofs[0], sy + ofs[1], sz + ofs[2]);
+    let f = ct.gran_freq * 0.5;
+    // First warp.
+    let wx = fbm5([px * f, py * f, pz * f, tc, ts], 3) - 0.5;
+    let wy = fbm5([px * f + 4.7, py * f + 2.3, pz * f + 8.1, tc, ts], 3) - 0.5;
+    let wz = fbm5([px * f + 1.9, py * f + 6.4, pz * f + 3.3, tc, ts], 3) - 0.5;
+    let warp = ct.turb * 1.6;
+    let (qx, qy, qz) = (px * f + warp * wx, py * f + warp * wy, pz * f + warp * wz);
+    // Scalar field + ridged veins.
+    let field = fbm5([qx, qy, qz, tc, ts], 4);
+    let ridged = 1.0 - (2.0 * fbm5([qx * 1.7 + 9.0, qy * 1.7, qz * 1.7, tc, ts] , 3) - 1.0).abs();
+    let vein = smoothstep(0.72, 0.98, ridged);
+    let mut col = ramp3(ct.cool, ct.mid, ct.hot, clamp01(field * 1.2));
+    col = mix(col, [1.0, 1.0, 1.0], vein * 0.85);
+    col
+}
+
+/// CelToon body: limb-shaded value quantised to 3 flat bands. Returns the flat
+/// colour; the rim outline is applied by the caller.
+fn cel_body(ct: &SType, sx: f32, sy: f32, sz: f32, mu: f32, ofs: [f32; 3], angle: f32) -> Rgb {
+    let (tc, ts) = tcircle(angle, 1.0);
+    let (px, py, pz) = (sx + ofs[0], sy + ofs[1], sz + ofs[2]);
+    let n = fbm5([px * ct.gran_freq * 0.35, py * ct.gran_freq * 0.35, pz * ct.gran_freq * 0.35, tc, ts], 3);
+    // Brighter toward the facing centre (mu) with a little noise wobble.
+    let t = clamp01(0.35 + 0.75 * mu + 0.35 * (n - 0.5));
+    let level = quant(t, 3.0);
+    ramp3(ct.cool, ct.mid, ct.hot, level)
+}
+
+/// Sunburst body: a rotating pinwheel — angular wedges alternate between two
+/// flat bands, spun by `angle`; a bright hot core sits at the centre.
+fn sunburst_body(ct: &SType, nx: f32, ny: f32, mu: f32, angle: f32) -> Rgb {
+    let theta = ny.atan2(nx);
+    let spokes = 10.0;
+    // Hard alternating wedges that rotate (integer temporal freq => seamless).
+    let wedge = if (theta * spokes + angle * 2.0).sin() > 0.0 { 1.0 } else { 0.0 };
+    let base = mix(ct.mid, ct.hot, wedge * 0.8);
+    // Hot core disc.
+    let core = smoothstep(0.55, 0.25, 1.0 - mu); // mu high near centre
+    mix(base, ct.hot, core * 0.7)
+}
+
+/// Sunburst rays: crisp triangular spokes past the limb, rotating with `angle`.
+fn sunburst_rays(ct: &SType, nx: f32, ny: f32, r: f32, angle: f32) -> Rgb {
+    let edge = r - 1.0;
+    let reach = 0.42 * ct.corona_size;
+    if edge <= 0.0 || edge > reach {
+        return [0.0, 0.0, 0.0];
+    }
+    let theta = ny.atan2(nx);
+    let spokes = 10.0;
+    // Triangular spoke: bright at each spoke centre, tapering to the gaps and
+    // outward. Sharpened sine gives the crisp cartoon wedge.
+    let s = (theta * spokes + angle * 2.0).sin();
+    let ang = smoothstep(0.55, 0.98, s);
+    let radial = smoothstep(reach, 0.0, edge);
+    let g = ang * radial;
+    if g <= 1e-3 {
+        return [0.0, 0.0, 0.0];
+    }
+    let col = mix(ct.hot, ct.flare, edge / reach);
+    [col[0] * g, col[1] * g, col[2] * g]
+}
+
+/// CelToon flame collar: a hard-edged flickering flame ring, quantised to two
+/// flame colours, hugging the limb.
+fn cel_collar(ct: &SType, nx: f32, ny: f32, r: f32, angle: f32) -> Rgb {
+    let edge = r - 1.0;
+    let reach = 0.34 * ct.corona_size;
+    if edge <= 0.0 || edge > reach {
+        return [0.0, 0.0, 0.0];
+    }
+    let theta = ny.atan2(nx);
+    // Wavy flame tongues: sum of a couple of integer harmonics.
+    let tongue = 0.5
+        + 0.28 * (theta * 7.0 + angle * 2.0).sin()
+        + 0.18 * (theta * 13.0 - angle * 3.0).sin();
+    let h = reach * clamp01(tongue);
+    if edge > h {
+        return [0.0, 0.0, 0.0];
+    }
+    // Two flat flame bands: hot inner, flare-tint outer.
+    if edge < h * 0.5 {
+        ct.hot
+    } else {
+        ct.flare
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Render
 // ---------------------------------------------------------------------------
 
@@ -543,6 +734,89 @@ fn spark(ix: u32, iy: u32, r: f32, angle: f32, seed: u32) -> f32 {
 /// `angle` is the animation phase in radians; a full 2π loop is seamless.
 pub fn render_rgba(size: u32, type_idx: usize, seed: u32, angle: f32, out: &mut [u8]) {
     render_ct(size, &STYPES[type_idx % STYPES.len()], seed, angle, SPIN_TURNS, &Style::natural(), out);
+}
+
+/// Render one star frame in a chosen [`StarPattern`]. Same contract as
+/// [`render_rgba`]; `Realistic` delegates to the original path.
+pub fn render_pattern(size: u32, type_idx: usize, seed: u32, angle: f32, pattern: StarPattern, out: &mut [u8]) {
+    let ct = &STYPES[type_idx % STYPES.len()];
+    if pattern == StarPattern::Realistic {
+        return render_ct(size, ct, seed, angle, SPIN_TURNS, &Style::natural(), out);
+    }
+    render_pat(size, ct, seed, angle, pattern, &Style::natural(), out);
+}
+
+/// Shared per-pixel loop for the stylised patterns.
+fn render_pat(size: u32, ct: &SType, seed: u32, angle: f32, pattern: StarPattern, style: &Style, out: &mut [u8]) {
+    let (cx, cy) = (size as f32 / 2.0, size as f32 / 2.0);
+    let ofs = seed_offsets(seed);
+    // Sunburst gets a modest spin baked into its wedge/ray phase already; give
+    // the body a slow rigid roll so the surface blobs also drift for the others.
+    let spin = match pattern {
+        StarPattern::Sunburst => 0.0,
+        _ => 1.0,
+    };
+    let (sina, cosa) = (angle * spin).sin_cos();
+    let rad = size as f32 * 0.235 * ct.radius_scale;
+
+    for iy in 0..size {
+        for ix in 0..size {
+            let nx = (ix as f32 + 0.5 - cx) / rad;
+            let ny = (cy - (iy as f32 + 0.5)) / rad;
+            let d2 = nx * nx + ny * ny;
+            let r = d2.sqrt();
+            let bx = bayer(ix, iy);
+
+            let mut o = [0.0f32, 0.0, 0.0];
+            if d2 <= 1.0 {
+                let nz = (1.0 - d2).sqrt();
+                let sx = nx * cosa + nz * sina;
+                let sy = ny;
+                let sz = -nx * sina + nz * cosa;
+                let mu = nz;
+                o = match pattern {
+                    StarPattern::PixelBands => px_bands(ct, sx, sy, sz, ofs, angle, bx),
+                    StarPattern::Plasma => {
+                        let c = plasma_body(ct, sx, sy, sz, ofs, angle);
+                        // Gentle limb darkening keeps the sphere read.
+                        let limb = 0.72 + 0.28 * mu.powf(0.5);
+                        [c[0] * limb, c[1] * limb, c[2] * limb]
+                    }
+                    StarPattern::CelToon => {
+                        let c = cel_body(ct, sx, sy, sz, mu, ofs, angle);
+                        // Thick dark outline rim.
+                        let rim = smoothstep(0.82, 0.97, r);
+                        mix(c, ct.spot_col, rim)
+                    }
+                    StarPattern::Sunburst => sunburst_body(ct, nx, ny, mu, angle),
+                    StarPattern::Realistic => unreachable!(),
+                };
+            }
+
+            // Per-pattern corona / outer decoration.
+            let c = match pattern {
+                StarPattern::PixelBands => px_ring(ct, nx, ny, r, angle, bx),
+                StarPattern::Plasma => corona(ct, nx, ny, r, angle, seed),
+                StarPattern::CelToon => cel_collar(ct, nx, ny, r, angle),
+                StarPattern::Sunburst => sunburst_rays(ct, nx, ny, r, angle),
+                StarPattern::Realistic => [0.0, 0.0, 0.0],
+            };
+            o = [clamp01(o[0] + c[0]), clamp01(o[1] + c[1]), clamp01(o[2] + c[2])];
+
+            // Plasma keeps the natural dither; the hard-edged patterns want much
+            // less so bands stay crisp.
+            let ps = match pattern {
+                StarPattern::Plasma => style.dither,
+                _ => 0.25,
+            };
+            let px = finalize(o, bx, &Style { dither: ps });
+            let idx = ((iy * size + ix) * 4) as usize;
+            out[idx] = (clamp01(px[0]) * 255.0) as u8;
+            out[idx + 1] = (clamp01(px[1]) * 255.0) as u8;
+            out[idx + 2] = (clamp01(px[2]) * 255.0) as u8;
+            out[idx + 3] = 255;
+        }
+    }
 }
 
 /// Number of tunable parameters exposed to the web sliders (see [`param`]).

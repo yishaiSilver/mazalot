@@ -24,3 +24,7 @@ native = ["dep:image"]
 [[bin]]
 name = "sun"
 required-features = ["native"]
+
+[[bin]]
+name = "styles"
+required-features = ["native"]
