@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>Procedural Solar System — Rust · WASM</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #05050b;
+    color: #d7dae6; font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  #stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block;
+    cursor: grab; touch-action: none; background: #05050b; }
+  #stage.drag { cursor: grabbing; }
+
+  .hud { position: fixed; pointer-events: none; z-index: 5;
+    text-shadow: 0 1px 3px rgba(0,0,0,.9); }
+  .topleft { top: 18px; left: 20px; }
+  .topleft h1 { margin: 0; font-size: 12px; font-weight: 600; letter-spacing: .16em;
+    text-transform: uppercase; color: #8790ad; }
+  .viewing { margin-top: 8px; font-size: 22px; font-weight: 700; color: #eef1f8; text-transform: capitalize;
+    min-height: 28px; }
+  .viewing small { display: block; font-size: 12px; font-weight: 500; letter-spacing: .04em;
+    color: #7b83a2; text-transform: none; margin-top: 2px; }
+  .hint { position: fixed; top: 18px; right: 20px; z-index: 5; pointer-events: none;
+    font-size: 12px; color: #6b7290; text-align: right; text-shadow: 0 1px 3px rgba(0,0,0,.9); letter-spacing: .03em; }
+  .hint b { color: #aeb4cd; font-weight: 600; }
+
+  .bar { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 6;
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: center;
+    padding: 10px 12px; border-radius: 14px; max-width: calc(100vw - 24px);
+    background: rgba(14,15,24,.82); border: 1px solid rgba(255,255,255,.08);
+    box-shadow: 0 10px 40px rgba(0,0,0,.6); backdrop-filter: blur(8px); }
+  .bar .seg { display: flex; align-items: center; gap: 6px; }
+  .bar label { font-size: 11px; color: #8790ad; letter-spacing: .04em; }
+  input[type=number] { width: 92px; padding: 7px 9px; font: inherit; font-size: 13px; color: #eef1f8;
+    background: #0e0f18; border: 1px solid rgba(255,255,255,.12); border-radius: 8px; }
+  input[type=range] { width: 120px; accent-color: #f4b74a; cursor: pointer; }
+  button { padding: 8px 13px; font: inherit; font-size: 13px; color: #d7dae6; background: #1a1c2b;
+    border: 1px solid rgba(255,255,255,.12); border-radius: 8px; cursor: pointer; white-space: nowrap; }
+  button:hover { background: #23263a; }
+  button:active { transform: translateY(1px); }
+  button.primary { color: #06060c; font-weight: 700; border: 0;
+    background: linear-gradient(180deg, #ffe8b0, #f4b74a); }
+  .divider { width: 1px; align-self: stretch; background: rgba(255,255,255,.1); margin: 0 2px; }
+  .val { font-variant-numeric: tabular-nums; color: #eef1f8; font-size: 12px; min-width: 30px; text-align: right; }
+  .err { position: fixed; inset: 0; display: none; place-items: center; text-align: center;
+    color: #ff9a9a; padding: 40px; z-index: 10; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+
+<div class="hud topleft">
+  <h1>Procedural Solar System</h1>
+  <div class="viewing" id="viewing">loading…<small id="sysinfo">Rust → WebAssembly</small></div>
+</div>
+<div class="hint">
+  <b>drag</b> to pan · <b>scroll</b> to zoom<br><b>click a planet</b> to follow it
+</div>
+
+<div class="bar">
+  <div class="seg">
+    <label>Seed</label>
+    <input type="number" id="seed" min="0" value="7" />
+    <button id="dice" title="random seed">🎲</button>
+  </div>
+  <button class="primary" id="gen">✦ Generate</button>
+  <div class="divider"></div>
+  <div class="seg">
+    <label>Speed</label>
+    <input type="range" id="speed" min="0" max="4" step="0.1" value="1" />
+    <span class="val" id="speedV">1.0×</span>
+  </div>
+  <div class="divider"></div>
+  <button id="fit">⤢ Reset view</button>
+</div>
+
+<div class="err" id="err"></div>
+
+<script type="module">
+// Names must stay index-aligned with the Rust tables (PKINDS / SUNS).
+const PLANET_NAMES = ["terran","ocean","jungle","desert","barren","lava","ice","gas giant","ice giant","ringed giant"];
+const SUN_NAMES = ["yellow dwarf","orange dwarf","red giant","white star","blue giant"];
+
+const $ = id => document.getElementById(id);
+const canvas = $("stage");
+const ctx = canvas.getContext("2d", { alpha: false });
+ctx.imageSmoothingEnabled = false;
+const off = document.createElement("canvas");
+const octx = off.getContext("2d");
+
+let wasm, sys = 0, bufPtr = 0, bufLen = 0, posPtr = 0, imgData;
+let W = 0, H = 0;                       // internal render resolution (px)
+let cam = { x: 0, y: 0, zoom: 1 };
+let time = 0, speed = 1, seed = 7;
+let follow = -1;                        // planet index the camera tracks, or -1
+let planetKinds = [], sunKind = 0, nPlanets = 0;
+let last = performance.now();
+
+// Cap the internal resolution for perf; the canvas CSS-scales to fill.
+const MAX_PX = 1280;
+
+function resize() {
+  const cssW = window.innerWidth, cssH = window.innerHeight;
+  const scale = Math.min(1, MAX_PX / Math.max(cssW, cssH));
+  W = Math.max(2, Math.round(cssW * scale));
+  H = Math.max(2, Math.round(cssH * scale));
+  canvas.width = W; canvas.height = H;
+  canvas.style.width = cssW + "px"; canvas.style.height = cssH + "px";
+  off.width = W; off.height = H;
+  imgData = octx.createImageData(W, H);
+  if (bufPtr) wasm.dealloc(bufPtr, bufLen);
+  bufLen = W * H * 4; bufPtr = wasm.alloc(bufLen);
+}
+
+function fitView() {
+  const ext = wasm.system_extent(sys);
+  const z = Math.min(W * 0.5 * 0.9 / ext, H * 0.5 * 0.9 / (ext * 0.55));
+  cam = { x: 0, y: 0, zoom: z };
+  follow = -1;
+}
+
+function generate(s) {
+  if (sys) wasm.system_free(sys);
+  seed = s >>> 0;
+  sys = wasm.system_new(seed);
+  nPlanets = wasm.planet_count(sys);
+  sunKind = wasm.sun_kind_of(sys);
+  planetKinds = [];
+  for (let i = 0; i < nPlanets; i++) planetKinds.push(wasm.planet_kind_at(sys, i));
+  time = 0;
+  fitView();
+  $("seed").value = seed;
+  $("sysinfo").textContent = `${SUN_NAMES[sunKind] ?? "star"} · ${nPlanets} planets · seed ${seed}`;
+}
+
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  time += dt * speed;
+
+  // Camera follows a clicked planet as it sweeps around its orbit.
+  if (follow >= 0 && follow < nPlanets) {
+    wasm.planet_pos(sys, follow, time, posPtr);
+    const p = new Float32Array(wasm.memory.buffer, posPtr, 2);
+    cam.x = p[0]; cam.y = p[1];
+  }
+
+  wasm.render(sys, bufPtr, W, H, cam.x, cam.y, cam.zoom, time);
+  const view = new Uint8Array(wasm.memory.buffer, bufPtr, bufLen);
+  imgData.data.set(view);
+  octx.putImageData(imgData, 0, 0);
+  ctx.drawImage(off, 0, 0, canvas.width, canvas.height);
+
+  // HUD: what's under the crosshair (viewport centre)?
+  const near = follow >= 0 ? follow : wasm.nearest_center(sys, W, H, cam.x, cam.y, cam.zoom, time);
+  const v = $("viewing");
+  const kind = near >= 0 ? (PLANET_NAMES[planetKinds[near]] ?? "planet") : (SUN_NAMES[sunKind] ?? "the star");
+  v.firstChild.textContent = (follow >= 0 ? "◎ following " : "") + kind + " ";
+  requestAnimationFrame(frame);
+}
+
+// ---- interaction: drag to pan, wheel to zoom, click to follow -------------
+let dragging = false, moved = false, lx = 0, ly = 0;
+const rscale = () => W / canvas.getBoundingClientRect().width; // CSS→render px
+
+canvas.addEventListener("pointerdown", e => {
+  dragging = true; moved = false; lx = e.clientX; ly = e.clientY;
+  canvas.classList.add("drag"); canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragging) return;
+  const dx = e.clientX - lx, dy = e.clientY - ly; lx = e.clientX; ly = e.clientY;
+  if (Math.abs(dx) + Math.abs(dy) > 2) moved = true;
+  const s = rscale() / cam.zoom;
+  cam.x -= dx * s; cam.y -= dy * s;
+  follow = -1;                    // grabbing the view releases any follow lock
+});
+function endDrag(e) { dragging = false; canvas.classList.remove("drag"); if (e && e.pointerId != null) { try { canvas.releasePointerCapture(e.pointerId); } catch {} } }
+canvas.addEventListener("pointerup", e => {
+  endDrag(e);
+  if (!moved) {                   // a click (not a drag): follow the body hit
+    const r = canvas.getBoundingClientRect(), sc = rscale();
+    const px = (e.clientX - r.left) * sc, py = (e.clientY - r.top) * sc;
+    // Temporarily aim the "nearest to a point" query by shifting the camera math:
+    // reuse nearest_center by pretending the click point is the centre.
+    const cx = cam.x + (px - W / 2) / cam.zoom, cy = cam.y + (py - H / 2) / cam.zoom;
+    const hit = wasm.nearest_center(sys, W, H, cx, cy, cam.zoom, time);
+    follow = hit; // -1 (empty space) simply releases
+  }
+});
+canvas.addEventListener("pointercancel", endDrag);
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  const r = canvas.getBoundingClientRect(), sc = rscale();
+  const px = (e.clientX - r.left) * sc, py = (e.clientY - r.top) * sc;
+  // World point under the cursor stays fixed as we zoom.
+  const wx = cam.x + (px - W / 2) / cam.zoom, wy = cam.y + (py - H / 2) / cam.zoom;
+  const factor = Math.exp(-e.deltaY * 0.0015);
+  cam.zoom = Math.min(6, Math.max(0.12, cam.zoom * factor));
+  if (follow < 0) { cam.x = wx - (px - W / 2) / cam.zoom; cam.y = wy - (py - H / 2) / cam.zoom; }
+}, { passive: false });
+
+// ---- controls --------------------------------------------------------------
+$("gen").addEventListener("click", () => generate((parseInt($("seed").value) || 0)));
+$("dice").addEventListener("click", () => { const s = (Math.random() * 0xffffff) >>> 0; $("seed").value = s; generate(s); });
+$("seed").addEventListener("change", () => generate((parseInt($("seed").value) || 0)));
+$("fit").addEventListener("click", fitView);
+$("speed").addEventListener("input", () => { speed = parseFloat($("speed").value); $("speedV").textContent = speed.toFixed(1) + "×"; });
+window.addEventListener("resize", () => { const z = cam.zoom, x = cam.x, y = cam.y; resize(); cam = { x, y, zoom: z }; });
+
+async function main() {
+  const res = await fetch("./solar.wasm?v=" + Date.now(), { cache: "no-store" });
+  const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
+  wasm = instance.exports;
+  posPtr = wasm.alloc(2 * 4); // stable little scratch buffer for planet_pos
+  resize();
+  generate(7);
+  requestAnimationFrame(frame);
+}
+main().catch(e => { $("err").style.display = "grid"; $("err").textContent = "failed to load solar.wasm — " + e; console.error(e); });
+</script>
+</body>
+</html>

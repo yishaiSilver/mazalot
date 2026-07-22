@@ -6,8 +6,9 @@ exact same world. The core algorithm compiles to both a native GIF/PNG generator
 and a ~42 KB WebAssembly module from **one shared codebase**.
 
 There's also a companion **star** generator (a sibling of the planet renderer),
-a paper-doll **character** compositor, and a fully separate **creature**
-generator (alien + earth birds) — see below.
+a draggable **solar-system** view that composes a star with orbiting planets, a
+paper-doll **character** compositor, and a fully separate **creature** generator
+(alien + earth birds) — see below.
 
 ## Crate layout
 
@@ -80,12 +81,44 @@ shading:
 exotic teal `sol` (a nod to *rebels-in-the-sky*). Add a star type = add one row
 to `STYPES` in `core/src/sun.rs`.
 
+## The solar system
+
+Where `planet` and `star` each render *one* body filling a square, `solar`
+(`crates/solar`) renders a **whole system** into an arbitrary rectangular
+viewport that you can **drag around** and **zoom into** — a central star with
+planets orbiting it, against a starfield. Same seed => the same system, forever.
+
+Like every other "type" crate it is **self-contained** (shares no code — it
+carries its own compact noise/color primitives and its own small *tile*
+renderers for a star and a planet, scaled to read at the tens-of-pixels size a
+system view needs). The new work is the layer on top:
+
+- **Orbital layout** — from a seed: a star (one of 5 archetypes), then 4–8
+  planets placed outward in bands, so rocky/lava worlds fall near the star and
+  gas/ice giants far out. Speeds are Keplerian-ish (inner planets sweep faster).
+- **Sun-lit phases** — each planet is lit from the star's *screen* direction, so
+  worlds show crescent → gibbous phases depending on where they are in orbit.
+- **Depth sorting** — planets are drawn back-to-front by orbital depth, so one on
+  the far side is occluded by the sun and one on the near side passes in front.
+- **Draggable camera** — a world→screen camera with pan + zoom-to-cursor; the
+  starfield parallax-scrolls so panning feels like moving through space.
+- **Click to follow** — click a planet and the camera locks on and tracks it
+  around its orbit; drag anywhere to release.
+
+Each frame: paint the parallax starfield → dot in each orbit path → render every
+body to a small RGBA tile and alpha-blend it in, depth-sorted. Bodies are small,
+so the whole scene stays cheap enough to render live *while you drag*.
+
+**Add a planet archetype** = add a row to `PKINDS`; **add a star** = add a row to
+`SUNS` — both in `crates/solar/src/lib.rs`.
+
 ## Running it
 
 **Native — generate GIFs + PNG into `out/`:**
 ```bash
 cargo run --release --bin planet            # planets
 cargo run --release --bin sun               # stars
+cargo run --release -p solar --bin solar    # solar systems (orbit + pan GIFs, posters)
 cargo run --release --bin sprite-compositor # characters
 cargo run --release --bin bench             # feature-cost benchmark
 cargo run --release -p bird --bin alien     # alien creatures  (disjoint half)
@@ -105,6 +138,15 @@ cargo build -p star --target wasm32-unknown-unknown --release --no-default-featu
 cp target/wasm32-unknown-unknown/release/star.wasm crates/star/web/star.wasm
 cd crates/star/web && python3 -m http.server 8000   # open http://localhost:8000/
 ```
+
+**Web — live, draggable solar system:**
+```bash
+cargo build -p solar --target wasm32-unknown-unknown --release --no-default-features
+cp target/wasm32-unknown-unknown/release/solar.wasm crates/solar/web/solar.wasm
+cd crates/solar/web && python3 -m http.server 8000   # open http://localhost:8000/
+```
+Drag to pan · scroll to zoom · click a planet to follow it. (`node verify.mjs`
+renders the system headlessly as a build check.)
 
 **Web — live creature (the bird half):**
 ```bash
