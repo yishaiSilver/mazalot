@@ -57,6 +57,10 @@
   .crt.on { opacity: 1; }
   .chk { justify-content: flex-start !important; gap: 8px; cursor: pointer; color: #cfd4e6 !important; }
   .chk input { accent-color: #8fb7ff; }
+  .metrics { margin: 16px auto 0; width: 320px; max-width: 82vw; box-sizing: border-box; text-align: left;
+    font: 11px/1.55 ui-monospace, Menlo, Consolas, monospace; color: #9aa0bb;
+    background: rgba(120,160,255,.05); border: 1px solid rgba(255,255,255,.07); border-radius: 10px;
+    padding: 11px 13px; white-space: pre; }
 </style>
 </head>
 <body>
@@ -70,6 +74,7 @@
     <div class="name" id="name">loading…</div>
     <div class="sub" id="sub">Rust → WebAssembly · live sphere shading</div>
     <button class="gen" id="gen">✦ Generate random</button>
+    <pre class="metrics" id="metrics">loading…</pre>
   </div>
 
   <div class="panel">
@@ -80,6 +85,11 @@
     </div>
     <div class="ctl"><label>Resolution <b id="resV">64</b></label><input type="range" id="res" min="40" max="240" step="8" value="64" /></div>
     <div class="ctl"><label>Spin speed <b id="spnV">0.012</b></label><input type="range" id="spn" min="0" max="0.05" step="0.002" value="0.012" /></div>
+
+    <div class="grp">Render</div>
+    <div class="ctl"><label class="chk"><input type="checkbox" id="baked" /> Bake spin loop → play cached frames</label></div>
+    <div class="ctl"><label>Max bake frames <b id="bkfV">300</b></label><input type="range" id="bkf" min="32" max="600" step="8" value="300" /></div>
+    <div class="ctl"><label class="chk"><input type="checkbox" id="bakemoons" /> Bake moons into loop (else live overlay)</label></div>
 
     <div class="grp">Look</div>
     <div class="ctl"><label>Palette</label>
@@ -134,10 +144,23 @@ const sctx = stage.getContext("2d");
 sctx.imageSmoothingEnabled = false;
 const off = document.createElement("canvas");
 const octx = off.getContext("2d");
+const moonOff = document.createElement("canvas"); // live moon-layer overlay
+const moctx = moonOff.getContext("2d");
 
-let wasm, bufPtr, bufLen, imgData, paramsPtr, NUM;
+const TAU = Math.PI * 2;
+let wasm, bufPtr, bufLen, imgData, moonImg, paramsPtr, NUM;
 let NATIVE = 64, typeIdx = 0, seed = 1, angle = 0, spin = 0.012;
 const sliders = {}; // pi -> { input, val }
+
+// Baking + metrics state. bakeCount is DERIVED from the motion (one frame per
+// displayed frame of a rotation), capped by maxBakeFrames for memory.
+let baked = false, bakeMoons = false, maxBakeFrames = 300, bakeCount = 48, bakedFrames = null;
+const idealFrames = () => Math.round(TAU / Math.max(spin, 1e-4)); // frames the display shows per rotation
+let bakeDirty = true, lastChange = 0, bakeTotalMs = 0, liveMsPerFrame = 0;
+let emaWork = 0, emaFps = 0, lastRaf = 0, lastMetric = 0;
+
+// Any content change invalidates the baked frames (debounced re-bake).
+function markDirty() { bakeDirty = true; lastChange = performance.now(); }
 
 function buildSliders() {
   const host = $("sliders");
@@ -149,16 +172,18 @@ function buildSliders() {
     lab.textContent = p.label + " "; lab.appendChild(val);
     const inp = document.createElement("input");
     inp.type = "range"; inp.min = p.min; inp.max = p.max; inp.step = p.step;
-    inp.addEventListener("input", () => val.textContent = parseFloat(inp.value).toFixed(p.fix));
+    inp.addEventListener("input", () => { val.textContent = parseFloat(inp.value).toFixed(p.fix); markDirty(); });
     wrap.appendChild(lab); wrap.appendChild(inp); host.appendChild(wrap);
     sliders[p.pi] = { input: inp, val, fix: p.fix };
   }
 }
 
 function setResolution(n) {
-  NATIVE = n; off.width = off.height = n; imgData = octx.createImageData(n, n);
+  NATIVE = n; off.width = off.height = n; moonOff.width = moonOff.height = n;
+  imgData = octx.createImageData(n, n); moonImg = octx.createImageData(n, n);
   if (bufPtr) wasm.dealloc(bufPtr, bufLen);
   bufLen = n * n * 4; bufPtr = wasm.alloc(bufLen); $("resV").textContent = n;
+  markDirty();
 }
 
 function loadTypeDefaults(t) {
@@ -167,6 +192,7 @@ function loadTypeDefaults(t) {
     sliders[p.pi].input.value = v;
     sliders[p.pi].val.textContent = v.toFixed(p.fix);
   }
+  markDirty();
 }
 
 function setType(t) {
@@ -181,20 +207,111 @@ function randomize() {
   setType(Math.floor(Math.random() * NAMES.length));
 }
 
-function frame() {
-  angle += spin;
+// Write current slider values into the wasm params buffer; return style args.
+function pushParams() {
   const pv = new Float32Array(wasm.memory.buffer, paramsPtr, NUM);
   for (const p of PARAMS) pv[p.pi] = parseFloat(sliders[p.pi].input.value);
-  const palette = parseInt($("palette").value);
-  const dither = parseFloat($("dth").value);
-  const moons = $("moons").checked ? 1 : 0;
-  wasm.render_styled(bufPtr, NATIVE, typeIdx, seed, angle, paramsPtr, palette, dither, moons);
+  return [parseInt($("palette").value), parseFloat($("dth").value), $("moons").checked ? 1 : 0];
+}
+
+// Render one frame at `a` and copy it out as a standalone ImageData (a "sprite").
+function renderToImageData(a) {
+  const [pal, dith, mn] = pushParams();
+  wasm.render_styled(bufPtr, NATIVE, typeIdx, seed, a, paramsPtr, pal, dith, mn);
   const view = new Uint8Array(wasm.memory.buffer, bufPtr, bufLen);
-  imgData.data.set(view);
-  octx.putImageData(imgData, 0, 0);
+  return new ImageData(new Uint8ClampedArray(view), NATIVE, NATIVE);
+}
+
+// Pre-render the whole rotation loop once (the BODY: surface + weather + rings,
+// moons only if they're being baked). Playback then just blits these.
+function bake() {
+  const start = performance.now();
+  // One baked frame per displayed frame of a rotation (2π/spin), capped for memory.
+  bakeCount = Math.max(24, Math.min(maxBakeFrames, idealFrames()));
+  const [pal, dith] = pushParams();
+  const mnBake = (bakeMoons && $("moons").checked) ? 1 : 0;
+  bakedFrames = new Array(bakeCount);
+  for (let i = 0; i < bakeCount; i++) {
+    wasm.render_styled(bufPtr, NATIVE, typeIdx, seed, TAU * i / bakeCount, paramsPtr, pal, dith, mnBake);
+    const view = new Uint8Array(wasm.memory.buffer, bufPtr, bufLen);
+    bakedFrames[i] = new ImageData(new Uint8ClampedArray(view), NATIVE, NATIVE);
+  }
+  bakeTotalMs = performance.now() - start;
+  liveMsPerFrame = bakeTotalMs / bakeCount;
+}
+
+function frame(ts) {
+  if (lastRaf) { const f = 1000 / (ts - lastRaf); emaFps = emaFps ? emaFps * 0.9 + f * 0.1 : f; }
+  lastRaf = ts;
+  angle += spin;
+
+  // Re-bake shortly after the last change (so dragging sliders doesn't thrash).
+  if (baked && bakeDirty && performance.now() - lastChange > 120) { bake(); bakeDirty = false; }
+
+  const t0 = performance.now(); // time only the per-frame draw work
+  if (baked) {
+    if (bakedFrames) {
+      const N = bakedFrames.length;
+      const phase = ((angle % TAU) + TAU) % TAU;
+      const fi = Math.floor(phase / TAU * N) % N;
+      octx.putImageData(bakedFrames[fi], 0, 0); // blit the baked body
+      // Moons orbit independently of the spin, so render them live and
+      // composite over the baked body (unless they were baked in).
+      if (!bakeMoons && $("moons").checked) {
+        wasm.render_moons(bufPtr, NATIVE, typeIdx, seed, angle, parseInt($("palette").value), parseFloat($("dth").value));
+        moonImg.data.set(new Uint8Array(wasm.memory.buffer, bufPtr, bufLen));
+        moctx.putImageData(moonImg, 0, 0);
+        octx.drawImage(moonOff, 0, 0); // alpha-composite the moon layer
+      }
+    }
+  } else {
+    const [pal, dith, mn] = pushParams();
+    wasm.render_styled(bufPtr, NATIVE, typeIdx, seed, angle, paramsPtr, pal, dith, mn);
+    imgData.data.set(new Uint8Array(wasm.memory.buffer, bufPtr, bufLen));
+    octx.putImageData(imgData, 0, 0);
+  }
   sctx.clearRect(0, 0, stage.width, stage.height);
   sctx.drawImage(off, 0, 0, stage.width, stage.height);
+  const work = performance.now() - t0;
+  emaWork = emaWork ? emaWork * 0.9 + work * 0.1 : work;
+
+  if (ts - lastMetric > 150) { updateMetrics(); lastMetric = ts; }
   requestAnimationFrame(frame);
+}
+
+function updateMetrics() {
+  const fps = emaFps.toFixed(0).padStart(4);
+  const work = emaWork.toFixed(3).padStart(6);
+  const line = "──────────────────────────";
+  let txt;
+  if (baked) {
+    const mem = (bakeCount * NATIVE * NATIVE * 4 / 1048576).toFixed(2);
+    const speed = liveMsPerFrame > 0 ? (liveMsPerFrame / Math.max(emaWork, 1e-4)).toFixed(0) : "–";
+    const moonMode = (!bakeMoons && $("moons").checked) ? "live overlay" : (bakeMoons ? "baked in" : "off");
+    txt =
+`mode        baked body + blit
+fps        ${fps}
+draw      ${work} ms / frame
+${line}
+baked       ${bakeCount}/${idealFrames()} frames  (${NATIVE}px)
+smoothness  ${bakeCount >= idealFrames() ? "1:1 (smooth)" : "capped (raise cap)"}
+moons       ${moonMode}
+bake cost   ${bakeTotalMs.toFixed(0)} ms  once
+live cost   ${liveMsPerFrame.toFixed(3)} ms / frame
+memory      ${mem} MB
+speedup     ${speed}× cheaper / frame`;
+  } else {
+    txt =
+`mode        live (full render)
+fps        ${fps}
+render    ${work} ms / frame
+${line}
+every frame recomputes
+every pixel in wasm.
+"Bake" caches the body
+loop; moons stay live.`;
+  }
+  $("metrics").textContent = txt;
 }
 
 async function main() {
@@ -214,14 +331,19 @@ async function main() {
   randomize();
 
   $("type").addEventListener("change", () => setType(parseInt($("type").value)));
-  $("seed").addEventListener("input", () => { seed = (parseInt($("seed").value) || 0) >>> 0; $("sub").textContent = `seed ${seed} · type ${typeIdx}`; });
-  $("rndseed").addEventListener("click", () => { seed = (Math.random() * 0xffffff) >>> 0; $("seed").value = seed; });
+  $("seed").addEventListener("input", () => { seed = (parseInt($("seed").value) || 0) >>> 0; $("sub").textContent = `seed ${seed} · type ${typeIdx}`; markDirty(); });
+  $("rndseed").addEventListener("click", () => { seed = (Math.random() * 0xffffff) >>> 0; $("seed").value = seed; markDirty(); });
   $("gen").addEventListener("click", randomize);
   $("reset").addEventListener("click", () => loadTypeDefaults(typeIdx));
   $("res").addEventListener("input", () => setResolution(parseInt($("res").value)));
-  $("spn").addEventListener("input", () => { spin = parseFloat($("spn").value); $("spnV").textContent = spin.toFixed(3); });
-  $("dth").addEventListener("input", () => $("dthV").textContent = parseFloat($("dth").value).toFixed(2));
+  $("spn").addEventListener("input", () => { spin = parseFloat($("spn").value); $("spnV").textContent = spin.toFixed(3); markDirty(); });
+  $("dth").addEventListener("input", () => { $("dthV").textContent = parseFloat($("dth").value).toFixed(2); markDirty(); });
+  $("palette").addEventListener("change", markDirty);
+  $("moons").addEventListener("change", markDirty);
   $("crt").addEventListener("change", () => $("crtfx").classList.toggle("on", $("crt").checked));
+  $("baked").addEventListener("change", () => { baked = $("baked").checked; markDirty(); });
+  $("bakemoons").addEventListener("change", () => { bakeMoons = $("bakemoons").checked; markDirty(); });
+  $("bkf").addEventListener("input", () => { maxBakeFrames = parseInt($("bkf").value); $("bkfV").textContent = maxBakeFrames; markDirty(); });
 
   requestAnimationFrame(frame);
 }
