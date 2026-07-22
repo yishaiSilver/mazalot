@@ -422,7 +422,8 @@ fn lightning_flash(sx: f32, sy: f32, angle: f32) -> (f32, Rgb) {
 
 fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32) -> (Rgb, f32) {
     let (px, py, pz) = (sx + ofs[0], sy + ofs[1], sz + ofs[2]);
-    let (mut col, mut emis) = match ct.base {
+    // Base surface only — aurora/lightning are applied later as the weather layer.
+    match ct.base {
         Base::Terrestrial => {
             let raw = fbm(px * ct.freq, py * ct.freq, pz * ct.freq, if ct.ridged { 5 } else { 6 });
             let n = if ct.ridged { 1.0 - (2.0 * raw - 1.0).abs() } else { raw };
@@ -480,28 +481,7 @@ fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32) -> 
             let band = 0.5 + 0.5 * (sy * ct.bands + (t - 0.5) * 6.0 * ct.turb).sin();
             (mix(ct.dark, ct.light, clamp01(band * 0.6 + t * 0.4)), 0.0)
         }
-    };
-
-    // Aurora — shimmering polar curtains, hue palette-cycled over time/latitude
-    // (green → cyan → violet). Glows on the night side via emis.
-    if ct.aurora > 0.0 {
-        let a = aurora_glow(sx, sy, sz, angle) * ct.aurora;
-        let ac = cycle3([0.25, 0.95, 0.45], [0.35, 0.85, 0.95], [0.65, 0.40, 1.0], sy * 1.4 + angle * 0.1);
-        col[0] = clamp01(col[0] + ac[0] * a);
-        col[1] = clamp01(col[1] + ac[1] * a);
-        col[2] = clamp01(col[2] + ac[2] * a);
-        emis = emis.max(a * 0.85);
     }
-    // Lightning — small randomized-color flashes in storm cover.
-    if ct.lightning > 0.0 {
-        let (mag, lc) = lightning_flash(sx, sy, angle);
-        let f = mag * ct.lightning;
-        col[0] = clamp01(col[0] + lc[0] * f);
-        col[1] = clamp01(col[1] + lc[1] * f);
-        col[2] = clamp01(col[2] + lc[2] * f);
-        emis = emis.max(f);
-    }
-    (col, emis)
 }
 
 fn star_bg(ix: u32, iy: u32, seed: u32) -> [u8; 4] {
@@ -544,7 +524,16 @@ pub fn param(type_idx: usize, which: u32) -> f32 {
 /// Render one planet frame as RGBA into `out` (must be >= size*size*4 bytes).
 /// `angle` is the rotation in radians; a full 2π loop is seamless.
 pub fn render_rgba(size: u32, type_idx: usize, seed: u32, angle: f32, out: &mut [u8]) {
-    render_ct(size, &TYPES[type_idx % TYPES.len()], seed, angle, &Style::natural(), out);
+    let style = Style::natural();
+    render_ct(size, &TYPES[type_idx % TYPES.len()], seed, angle, &style, true, style.moons, false, out);
+}
+
+/// Render ONLY the moon layer, transparent elsewhere — a live overlay to
+/// composite over a baked body (moons orbit independently of the spin, so
+/// baking them into the rotation loop is wrong).
+pub fn render_rgba_moons(size: u32, type_idx: usize, seed: u32, angle: f32, palette: u32, dither: f32, out: &mut [u8]) {
+    let style = Style { palette, dither, moons: true };
+    render_ct(size, &TYPES[type_idx % TYPES.len()], seed, angle, &style, false, true, true, out);
 }
 
 /// Same as [`render_rgba`] but with a few parameters overridden (web sliders).
@@ -565,7 +554,8 @@ pub fn render_rgba_custom(
     ct.freq = freq;
     ct.specular = specular;
     ct.shininess = shininess;
-    render_ct(size, &ct, seed, angle, &Style::natural(), out);
+    let style = Style::natural();
+    render_ct(size, &ct, seed, angle, &style, true, style.moons, false, out);
 }
 
 /// Render with a full parameter override array (`NUM_PARAMS` values, same order
@@ -605,7 +595,7 @@ pub fn render_rgba_styled(
         ct.spec_albedo = p[12];
     }
     let style = Style { palette, dither, moons: moons != 0 };
-    render_ct(size, &ct, seed, angle, &style, out);
+    render_ct(size, &ct, seed, angle, &style, true, style.moons, false, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -668,7 +658,11 @@ fn finalize(o: Rgb, bx: f32, style: &Style) -> Rgb {
     }
 }
 
-fn render_ct(size: u32, ct: &PType, seed: u32, angle: f32, style: &Style, out: &mut [u8]) {
+/// Render selected layers. `body` = surface + weather + rings (opaque);
+/// `moons_on` = the moon layer; `transparent` makes uncovered pixels alpha 0
+/// (for compositing a live overlay over a baked body).
+#[allow(clippy::too_many_arguments)]
+fn render_ct(size: u32, ct: &PType, seed: u32, angle: f32, style: &Style, body: bool, moons_on: bool, transparent: bool, out: &mut [u8]) {
     let (cx, cy) = (size as f32 / 2.0, size as f32 / 2.0);
     let ofs = seed_offsets(seed);
     let l = {
@@ -685,7 +679,7 @@ fn render_ct(size: u32, ct: &PType, seed: u32, angle: f32, style: &Style, out: &
     // Precompute orbiting moons (mx, my, radius, depth, seed).
     let mut moons: [(f32, f32, f32, f32, f32); 2] = [(0.0, 0.0, 0.0, 0.0, 0.0); 2];
     let mut nmoon = 0usize;
-    if style.moons {
+    if moons_on {
         let count = (hash3(seed as i32, 50, 1) * 2.6) as usize; // 0..2
         for k in 0..count.min(2) {
             let ks = k as i32 * 5;
@@ -708,7 +702,9 @@ fn render_ct(size: u32, ct: &PType, seed: u32, angle: f32, style: &Style, out: &
             let ny = (cy - (iy as f32 + 0.5)) / rad;
             let d2 = nx * nx + ny * ny;
 
-            let mut o;
+            let mut o = [0.0f32, 0.0, 0.0];
+            let mut cov = 0.0f32;
+            if body {
             if d2 <= 1.0 {
                 let nz = (1.0 - d2).sqrt();
                 let sx = nx * cosa + nz * sina;
@@ -781,6 +777,21 @@ fn render_ct(size: u32, ct: &PType, seed: u32, angle: f32, style: &Style, out: &
                     o[1] = clamp01(o[1] + ct.atmo[1] * rim);
                     o[2] = clamp01(o[2] + ct.atmo[2] * rim);
                 }
+                // Aurora + lightning — the weather that glows, applied post-shade.
+                if ct.aurora > 0.0 {
+                    let a = aurora_glow(sx, sy, sz, angle) * ct.aurora;
+                    let ac = cycle3([0.25, 0.95, 0.45], [0.35, 0.85, 0.95], [0.65, 0.40, 1.0], sy * 1.4 + angle * 0.1);
+                    o[0] = clamp01(o[0] + ac[0] * a);
+                    o[1] = clamp01(o[1] + ac[1] * a);
+                    o[2] = clamp01(o[2] + ac[2] * a);
+                }
+                if ct.lightning > 0.0 {
+                    let (mag, lc) = lightning_flash(sx, sy, angle);
+                    let f = mag * ct.lightning;
+                    o[0] = clamp01(o[0] + lc[0] * f);
+                    o[1] = clamp01(o[1] + lc[1] * f);
+                    o[2] = clamp01(o[2] + lc[2] * f);
+                }
             } else {
                 let s = star_bg(ix, iy, seed);
                 o = [s[0] as f32 / 255.0, s[1] as f32 / 255.0, s[2] as f32 / 255.0];
@@ -810,31 +821,37 @@ fn render_ct(size: u32, ct: &PType, seed: u32, angle: f32, style: &Style, out: &
                     o = [o[0] * 0.26, o[1] * 0.26, o[2] * 0.30];
                 }
             }
+            cov = 1.0;
+            } // end body layer
 
-            // Orbiting moons: front moons draw over everything (incl. the rim);
-            // back moons only where the planet disc doesn't occlude them.
-            for m in 0..nmoon {
-                let (mx, my, mr, depth, ms) = moons[m];
-                let ld2 = (nx - mx) * (nx - mx) + (ny - my) * (ny - my);
-                if ld2 < mr * mr && (depth > 0.0 || d2 > 1.0) {
-                    let (lnx, lny) = ((nx - mx) / mr, (ny - my) / mr);
-                    let lnz = (1.0 - lnx * lnx - lny * lny).max(0.0).sqrt();
-                    let mdiff = (lnx * l[0] + lny * l[1] + lnz * l[2]).max(0.0);
-                    // The moon's own dark edge, for sprite consistency.
-                    let mrim = 0.4 + 0.6 * smoothstep(0.0, 0.26, lnz);
-                    let msh = (0.12 + 0.9 * mdiff) * mrim;
-                    let t = fbm(lnx * 3.0 + ms * 9.0, lny * 3.0, ms * 5.0, 2);
-                    let base = mix([0.30, 0.29, 0.33], [0.60, 0.59, 0.62], smoothstep(0.4, 0.6, t));
-                    o = [base[0] * msh, base[1] * msh, base[2] * msh];
+            // Moons layer: front moons draw over everything (incl. the rim); back
+            // moons only where the planet disc doesn't occlude them. As its own
+            // layer it can be baked with the body or composited live over it.
+            if moons_on {
+                for m in 0..nmoon {
+                    let (mx, my, mr, depth, ms) = moons[m];
+                    let ld2 = (nx - mx) * (nx - mx) + (ny - my) * (ny - my);
+                    if ld2 < mr * mr && (depth > 0.0 || d2 > 1.0) {
+                        let (lnx, lny) = ((nx - mx) / mr, (ny - my) / mr);
+                        let lnz = (1.0 - lnx * lnx - lny * lny).max(0.0).sqrt();
+                        let mdiff = (lnx * l[0] + lny * l[1] + lnz * l[2]).max(0.0);
+                        let mrim = 0.4 + 0.6 * smoothstep(0.0, 0.26, lnz);
+                        let msh = (0.12 + 0.9 * mdiff) * mrim;
+                        let t = fbm(lnx * 3.0 + ms * 9.0, lny * 3.0, ms * 5.0, 2);
+                        let base = mix([0.30, 0.29, 0.33], [0.60, 0.59, 0.62], smoothstep(0.4, 0.6, t));
+                        o = [base[0] * msh, base[1] * msh, base[2] * msh];
+                        cov = 1.0;
+                    }
                 }
             }
 
             let px = finalize(o, bayer(ix, iy), style);
+            let alpha = if transparent { (clamp01(cov) * 255.0) as u8 } else { 255 };
             let idx = ((iy * size + ix) * 4) as usize;
             out[idx] = (clamp01(px[0]) * 255.0) as u8;
             out[idx + 1] = (clamp01(px[1]) * 255.0) as u8;
             out[idx + 2] = (clamp01(px[2]) * 255.0) as u8;
-            out[idx + 3] = 255;
+            out[idx + 3] = alpha;
         }
     }
 }

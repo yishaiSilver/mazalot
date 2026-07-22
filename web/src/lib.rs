@@ -67,6 +67,15 @@ pub extern "C" fn num_params() -> u32 {
     planet_core::NUM_PARAMS as u32
 }
 
+/// Render ONLY the orbiting moons, transparent elsewhere — a cheap live overlay
+/// to composite over a baked planet body (moons orbit independently of the spin,
+/// so they must not be baked into the rotation loop).
+#[no_mangle]
+pub extern "C" fn render_moons(ptr: *mut u8, size: u32, type_idx: u32, seed: u32, angle: f32, palette: u32, dither: f32) {
+    let out = unsafe { slice::from_raw_parts_mut(ptr, (size * size * 4) as usize) };
+    planet_core::render_rgba_moons(size, type_idx as usize, seed, angle, palette, dither, out);
+}
+
 /// Render with params + global style: `palette` (0 natural, 1 game boy, 2 ice,
 /// 3 sunset), `dither` (0..1), `moons` (0/1).
 #[no_mangle]
