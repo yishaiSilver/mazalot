@@ -594,6 +594,33 @@ fn tcircle(angle: f32, r: f32) -> (f32, f32) {
     (angle.cos() * r, angle.sin() * r)
 }
 
+/// Natural limb for the round "sphere" patterns. The photosphere edge should be
+/// a ragged, dithered coastline that dissolves into a warm chromosphere fuzz —
+/// NOT a clean geometric arc. Returns `(body_on, fuzz)`:
+///   • `body_on` — whether this pixel is lit photosphere. The limb radius wobbles
+///     with angle+time (seamless), and coverage across the soft edge band is
+///     resolved through the Bayer mask so the silhouette breaks into pixels.
+///   • `fuzz` — a short emissive chromosphere just outside the lit body, so the
+///     star glows out instead of cutting to black.
+fn natural_edge(ct: &SType, theta: f32, r: f32, angle: f32, seed: u32, bx: f32) -> (bool, f32) {
+    let (ctx, cty) = (theta.cos(), theta.sin());
+    let (tc, ts) = tcircle(angle, 1.1);
+    let sd = (seed % 29) as f32 * 0.31 + 1.0;
+    // Wobbling limb radius (mean ~1.0): coarse lobes + finer spicules.
+    let coarse = fbm5([ctx * 2.4, cty * 2.4, sd, tc, ts], 3) - 0.5;
+    let fine = fbm5([ctx * 6.5, cty * 6.5, sd + 5.0, tc, ts], 2) - 0.5;
+    let amp = 0.05 + 0.07 * ct.fur;
+    let lr = 1.0 + amp * (1.3 * coarse + 0.7 * fine);
+    // Soft edge band; coverage 1 inside → 0 outside.
+    let soft = 0.09 * (0.7 + 0.6 * ct.corona_size);
+    let coverage = smoothstep(lr + soft, lr - soft, r);
+    // Ordered-dither the coverage to 1-bit: a ragged, pixel-broken coastline.
+    let body_on = coverage > bx + 0.5;
+    // Warm fuzz in the ring just past the lit body.
+    let fuzz = smoothstep(lr + soft * 2.2, lr, r) * (1.0 - coverage);
+    (body_on, fuzz * (0.55 + 0.9 * fine.abs()))
+}
+
 /// PixelBands: chunky flat photosphere bands over a boiling blob field, plus an
 /// undulating flat outer ring. Ordered dither is folded into the quantisation so
 /// it only appears at band boundaries — the Deep-Fold pixel-star signature.
@@ -610,26 +637,6 @@ fn px_bands(ct: &SType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32, bx
     let bands = 4.0;
     let level = quant(t + bx * 0.9 / bands, bands);
     ramp3(ct.cool, ct.mid, ct.hot, level)
-}
-
-/// PixelBands outer ring: one flat bright band hugging the limb, its thickness
-/// undulating with angle+time. Returns emissive RGB (black inside/outside).
-fn px_ring(ct: &SType, nx: f32, ny: f32, r: f32, angle: f32, bx: f32) -> Rgb {
-    let edge = r - 1.0;
-    if edge <= 0.0 || edge > 0.5 {
-        return [0.0, 0.0, 0.0];
-    }
-    let theta = ny.atan2(nx);
-    // Integer angular + temporal frequencies keep it seamless.
-    let w = 0.10
-        + 0.05 * (theta * 5.0 + angle * 2.0).sin()
-        + 0.04 * (theta * 11.0 - angle * 3.0).sin();
-    let w = (w * ct.corona_size).max(0.02);
-    // Hard band with a dithered outer pixel.
-    if edge < w + bx * 0.05 {
-        return mix(ct.hot, ct.flare, smoothstep(0.0, w, edge));
-    }
-    [0.0, 0.0, 0.0]
 }
 
 /// Plasma: 2-step domain-warped fBm on the sphere point, evolving on the time
@@ -766,42 +773,70 @@ fn render_pat(size: u32, ct: &SType, seed: u32, angle: f32, pattern: StarPattern
             let d2 = nx * nx + ny * ny;
             let r = d2.sqrt();
             let bx = bayer(ix, iy);
+            let theta = ny.atan2(nx);
+            // PixelBands / Plasma are round "sphere" looks: give them a ragged,
+            // dithered limb + chromosphere fuzz. CelToon / Sunburst are graphic
+            // looks whose hard edge is intentional, so they keep the exact disc.
+            let organic = matches!(pattern, StarPattern::PixelBands | StarPattern::Plasma);
 
             let mut o = [0.0f32, 0.0, 0.0];
-            if d2 <= 1.0 {
+            let mut fuzz_rgb = [0.0f32, 0.0, 0.0];
+            if organic {
+                let (body_on, fuzz) = natural_edge(ct, theta, r, angle, seed, bx);
+                if body_on {
+                    // Clamp to the geometric disc for the sphere normal; pixels
+                    // in the ragged margin just past r=1 read as limb (mu≈0).
+                    let d2c = d2.min(1.0);
+                    let nz = (1.0 - d2c).sqrt();
+                    let sx = nx * cosa + nz * sina;
+                    let sy = ny;
+                    let sz = -nx * sina + nz * cosa;
+                    let mu = nz;
+                    o = match pattern {
+                        StarPattern::PixelBands => px_bands(ct, sx, sy, sz, ofs, angle, bx),
+                        StarPattern::Plasma => {
+                            let c = plasma_body(ct, sx, sy, sz, ofs, angle);
+                            let limb = 0.72 + 0.28 * mu.powf(0.5);
+                            [c[0] * limb, c[1] * limb, c[2] * limb]
+                        }
+                        _ => unreachable!(),
+                    };
+                }
+                if fuzz > 0.0 {
+                    let fc = mix(ct.hot, ct.flare, 0.6);
+                    fuzz_rgb = [fc[0] * fuzz, fc[1] * fuzz, fc[2] * fuzz];
+                }
+            } else if d2 <= 1.0 {
                 let nz = (1.0 - d2).sqrt();
                 let sx = nx * cosa + nz * sina;
                 let sy = ny;
                 let sz = -nx * sina + nz * cosa;
                 let mu = nz;
                 o = match pattern {
-                    StarPattern::PixelBands => px_bands(ct, sx, sy, sz, ofs, angle, bx),
-                    StarPattern::Plasma => {
-                        let c = plasma_body(ct, sx, sy, sz, ofs, angle);
-                        // Gentle limb darkening keeps the sphere read.
-                        let limb = 0.72 + 0.28 * mu.powf(0.5);
-                        [c[0] * limb, c[1] * limb, c[2] * limb]
-                    }
                     StarPattern::CelToon => {
                         let c = cel_body(ct, sx, sy, sz, mu, ofs, angle);
-                        // Thick dark outline rim.
                         let rim = smoothstep(0.82, 0.97, r);
                         mix(c, ct.spot_col, rim)
                     }
                     StarPattern::Sunburst => sunburst_body(ct, nx, ny, mu, angle),
-                    StarPattern::Realistic => unreachable!(),
+                    _ => unreachable!(),
                 };
             }
 
-            // Per-pattern corona / outer decoration.
+            // Per-pattern corona / outer decoration. PixelBands now relies on the
+            // ragged limb + fuzz instead of a clean undulating ring.
             let c = match pattern {
-                StarPattern::PixelBands => px_ring(ct, nx, ny, r, angle, bx),
+                StarPattern::PixelBands => [0.0, 0.0, 0.0],
                 StarPattern::Plasma => corona(ct, nx, ny, r, angle, seed),
                 StarPattern::CelToon => cel_collar(ct, nx, ny, r, angle),
                 StarPattern::Sunburst => sunburst_rays(ct, nx, ny, r, angle),
                 StarPattern::Realistic => [0.0, 0.0, 0.0],
             };
-            o = [clamp01(o[0] + c[0]), clamp01(o[1] + c[1]), clamp01(o[2] + c[2])];
+            o = [
+                clamp01(o[0] + c[0] + fuzz_rgb[0]),
+                clamp01(o[1] + c[1] + fuzz_rgb[1]),
+                clamp01(o[2] + c[2] + fuzz_rgb[2]),
+            ];
 
             // Plasma keeps the natural dither; the hard-edged patterns want much
             // less so bands stay crisp.
@@ -887,9 +922,17 @@ fn render_ct(size: u32, ct: &SType, seed: u32, angle: f32, spin: f32, style: &St
             let d2 = nx * nx + ny * ny;
             let r = d2.sqrt();
 
+            let bx = bayer(ix, iy);
+            let theta = ny.atan2(nx);
+            // Ragged, dithered limb + chromosphere fuzz so the silhouette is not
+            // a clean geometric circle.
+            let (body_on, fuzz) = natural_edge(ct, theta, r, angle, seed, bx);
+
             let mut o;
-            if d2 <= 1.0 {
+            if body_on {
                 // Sphere point, rotated around Y by SPIN_TURNS (0 => no roll).
+                // Clamp to the disc for the normal; ragged-margin pixels are limb.
+                let d2 = d2.min(1.0);
                 let nz = (1.0 - d2).sqrt();
                 let sx = nx * cosa + nz * sina;
                 let sy = ny;
@@ -915,6 +958,12 @@ fn render_ct(size: u32, ct: &SType, seed: u32, angle: f32, spin: f32, style: &St
                 o = [0.0, 0.0, 0.0];
             }
 
+            // Warm chromosphere fuzz just past the ragged limb.
+            if fuzz > 0.0 {
+                let fc = mix(ct.hot, ct.flare, 0.6);
+                o = [clamp01(o[0] + fc[0] * fuzz), clamp01(o[1] + fc[1] * fuzz), clamp01(o[2] + fc[2] * fuzz)];
+            }
+
             // Corona + prominences glow over disc and background alike.
             let c = corona(ct, nx, ny, r, angle, seed);
             o = [clamp01(o[0] + c[0]), clamp01(o[1] + c[1]), clamp01(o[2] + c[2])];
@@ -926,7 +975,7 @@ fn render_ct(size: u32, ct: &SType, seed: u32, angle: f32, spin: f32, style: &St
                 o = [clamp01(o[0] + s), clamp01(o[1] + s), clamp01(o[2] + s)];
             }
 
-            let px = finalize(o, bayer(ix, iy), style);
+            let px = finalize(o, bx, style);
             let idx = ((iy * size + ix) * 4) as usize;
             out[idx] = (clamp01(px[0]) * 255.0) as u8;
             out[idx + 1] = (clamp01(px[1]) * 255.0) as u8;
