@@ -8,7 +8,10 @@
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; overflow: hidden; background: #05050b;
-    color: #d7dae6; font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    color: #d7dae6; font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    /* Lock the page so touch gestures drive the canvas, not the browser. */
+    position: fixed; width: 100%; overscroll-behavior: none; touch-action: none;
+    -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
   #stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block;
     cursor: grab; touch-action: none; background: #05050b; }
   #stage.drag { cursor: grabbing; }
@@ -46,6 +49,21 @@
   .val { font-variant-numeric: tabular-nums; color: #eef1f8; font-size: 12px; min-width: 30px; text-align: right; }
   .err { position: fixed; inset: 0; display: none; place-items: center; text-align: center;
     color: #ff9a9a; padding: 40px; z-index: 10; }
+
+  /* Phones / small screens: tighten the chrome and drop the desktop hint. */
+  @media (max-width: 700px), (pointer: coarse) {
+    .topleft { top: 10px; left: 12px; }
+    .topleft h1 { font-size: 10px; letter-spacing: .12em; }
+    .viewing { font-size: 17px; margin-top: 5px; min-height: 22px; }
+    .viewing small { font-size: 11px; }
+    .hint { display: none; }
+    .bar { bottom: calc(10px + env(safe-area-inset-bottom)); gap: 6px; padding: 8px 10px; border-radius: 12px; }
+    .bar label { display: none; }
+    input[type=number] { width: 66px; padding: 8px; }
+    input[type=range] { width: 84px; }
+    button { padding: 9px 12px; }
+    .divider { display: none; }
+  }
 </style>
 </head>
 <body>
@@ -56,7 +74,7 @@
   <div class="viewing" id="viewing">loading…<small id="sysinfo">Rust → WebAssembly</small></div>
 </div>
 <div class="hint">
-  <b>drag</b> to pan · <b>scroll</b> to zoom<br><b>click a planet</b> to follow it
+  <b>drag</b> to pan · <b>scroll / pinch</b> to zoom<br><b>tap a planet</b> to follow it
 </div>
 
 <div class="bar">
@@ -98,12 +116,16 @@ let follow = -1;                        // planet index the camera tracks, or -1
 let planetKinds = [], sunKind = 0, nPlanets = 0;
 let last = performance.now();
 
-// Cap the internal resolution for perf; the canvas CSS-scales to fill.
-const MAX_PX = 1280;
+// Render at an internal resolution capped by a per-frame PIXEL BUDGET, then
+// CSS-scale the canvas up to fill the screen (pixel-art look). Every rendered
+// pixel costs — a starfield fill + body tiles — so a phone gets a much smaller
+// buffer than a desktop, which is the single biggest mobile-perf lever here.
+const coarse = window.matchMedia("(pointer: coarse)").matches;
+const PIXEL_BUDGET = coarse ? 430_000 : 1_600_000;
 
 function resize() {
   const cssW = window.innerWidth, cssH = window.innerHeight;
-  const scale = Math.min(1, MAX_PX / Math.max(cssW, cssH));
+  const scale = Math.min(1, Math.sqrt(PIXEL_BUDGET / (cssW * cssH)));
   W = Math.max(2, Math.round(cssW * scale));
   H = Math.max(2, Math.round(cssH * scale));
   canvas.width = W; canvas.height = H;
@@ -160,44 +182,92 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 
-// ---- interaction: drag to pan, wheel to zoom, click to follow -------------
-let dragging = false, moved = false, lx = 0, ly = 0;
-const rscale = () => W / canvas.getBoundingClientRect().width; // CSS→render px
+// ---- interaction: one finger / mouse drags to pan, two fingers pinch to
+//      zoom + pan, a tap follows the body under it, the wheel zooms. Unified
+//      over Pointer Events so mouse and touch share one code path. ----------
+const clampZoom = z => Math.min(6, Math.max(0.08, z));
+// CSS px → render px, and the canvas rect (recomputed per gesture step).
+function metrics() { const r = canvas.getBoundingClientRect(); return { r, sc: W / r.width }; }
+// Screen (render px) → world.
+function toWorld(px, py) { return [cam.x + (px - W / 2) / cam.zoom, cam.y + (py - H / 2) / cam.zoom]; }
+
+const pointers = new Map();     // active pointerId -> {x, y} in CSS px
+let panLast = null;             // last pos for single-pointer drag
+let pinch = null;               // {dist, zoom, wx, wy} captured at pinch start
+let gestureMoved = false, gesturePinched = false, gestureCount = 0;
+
+function startPinch() {
+  const [a, b] = [...pointers.values()];
+  const { r, sc } = metrics();
+  const midx = (a.x + b.x) / 2, midy = (a.y + b.y) / 2;
+  const [wx, wy] = toWorld((midx - r.left) * sc, (midy - r.top) * sc);
+  pinch = { dist: Math.hypot(a.x - b.x, a.y - b.y) || 1, zoom: cam.zoom, wx, wy };
+  gesturePinched = true; panLast = null; follow = -1;
+}
 
 canvas.addEventListener("pointerdown", e => {
-  dragging = true; moved = false; lx = e.clientX; ly = e.clientY;
-  canvas.classList.add("drag"); canvas.setPointerCapture(e.pointerId);
+  const first = pointers.size === 0;
+  try { canvas.setPointerCapture(e.pointerId); } catch {}
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  canvas.classList.add("drag");
+  if (first) { panLast = { x: e.clientX, y: e.clientY }; gestureMoved = false; gesturePinched = false; gestureCount = 1; }
+  else gestureCount++;
+  if (pointers.size === 2) startPinch();
 });
+
 canvas.addEventListener("pointermove", e => {
-  if (!dragging) return;
-  const dx = e.clientX - lx, dy = e.clientY - ly; lx = e.clientX; ly = e.clientY;
-  if (Math.abs(dx) + Math.abs(dy) > 2) moved = true;
-  const s = rscale() / cam.zoom;
-  cam.x -= dx * s; cam.y -= dy * s;
-  follow = -1;                    // grabbing the view releases any follow lock
-});
-function endDrag(e) { dragging = false; canvas.classList.remove("drag"); if (e && e.pointerId != null) { try { canvas.releasePointerCapture(e.pointerId); } catch {} } }
-canvas.addEventListener("pointerup", e => {
-  endDrag(e);
-  if (!moved) {                   // a click (not a drag): follow the body hit
-    const r = canvas.getBoundingClientRect(), sc = rscale();
-    const px = (e.clientX - r.left) * sc, py = (e.clientY - r.top) * sc;
-    // Temporarily aim the "nearest to a point" query by shifting the camera math:
-    // reuse nearest_center by pretending the click point is the centre.
-    const cx = cam.x + (px - W / 2) / cam.zoom, cy = cam.y + (py - H / 2) / cam.zoom;
-    const hit = wasm.nearest_center(sys, W, H, cx, cy, cam.zoom, time);
-    follow = hit; // -1 (empty space) simply releases
+  if (!pointers.has(e.pointerId)) return;
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+  if (pointers.size >= 2 && pinch) {                 // two-finger pinch: zoom + pan
+    const [a, b] = [...pointers.values()];
+    const { r, sc } = metrics();
+    const midx = (a.x + b.x) / 2, midy = (a.y + b.y) / 2;
+    const px = (midx - r.left) * sc, py = (midy - r.top) * sc;
+    const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+    cam.zoom = clampZoom(pinch.zoom * dist / pinch.dist);
+    // Pin the world point captured at gesture start to the current midpoint.
+    cam.x = pinch.wx - (px - W / 2) / cam.zoom;
+    cam.y = pinch.wy - (py - H / 2) / cam.zoom;
+    gestureMoved = true;
+    return;
+  }
+
+  if (panLast && pointers.size === 1) {              // one-finger / mouse drag: pan
+    const dx = e.clientX - panLast.x, dy = e.clientY - panLast.y;
+    panLast = { x: e.clientX, y: e.clientY };
+    if (Math.abs(dx) + Math.abs(dy) > 6) gestureMoved = true;
+    const s = metrics().sc / cam.zoom;
+    cam.x -= dx * s; cam.y -= dy * s;
+    follow = -1;                                     // grabbing the view releases follow
   }
 });
-canvas.addEventListener("pointercancel", endDrag);
+
+function liftPointer(e) {
+  try { canvas.releasePointerCapture(e.pointerId); } catch {}
+  pointers.delete(e.pointerId);
+  if (pointers.size < 2) pinch = null;
+  if (pointers.size === 1) { const p = [...pointers.values()][0]; panLast = { x: p.x, y: p.y }; }
+  if (pointers.size === 0) {
+    canvas.classList.remove("drag");
+    // A clean single tap (no drag, no pinch) follows the body under it.
+    if (!gestureMoved && !gesturePinched && gestureCount === 1) {
+      const { r, sc } = metrics();
+      const [cx, cy] = toWorld((e.clientX - r.left) * sc, (e.clientY - r.top) * sc);
+      follow = wasm.nearest_center(sys, W, H, cx, cy, cam.zoom, time); // -1 = release
+    }
+    panLast = null; gestureCount = 0;
+  }
+}
+canvas.addEventListener("pointerup", liftPointer);
+canvas.addEventListener("pointercancel", liftPointer);
+
 canvas.addEventListener("wheel", e => {
   e.preventDefault();
-  const r = canvas.getBoundingClientRect(), sc = rscale();
+  const { r, sc } = metrics();
   const px = (e.clientX - r.left) * sc, py = (e.clientY - r.top) * sc;
-  // World point under the cursor stays fixed as we zoom.
-  const wx = cam.x + (px - W / 2) / cam.zoom, wy = cam.y + (py - H / 2) / cam.zoom;
-  const factor = Math.exp(-e.deltaY * 0.0015);
-  cam.zoom = Math.min(6, Math.max(0.12, cam.zoom * factor));
+  const [wx, wy] = toWorld(px, py);                  // point under cursor stays fixed
+  cam.zoom = clampZoom(cam.zoom * Math.exp(-e.deltaY * 0.0015));
   if (follow < 0) { cam.x = wx - (px - W / 2) / cam.zoom; cam.y = wy - (py - H / 2) / cam.zoom; }
 }, { passive: false });
 
