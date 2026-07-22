@@ -145,8 +145,9 @@ cargo build -p solar --target wasm32-unknown-unknown --release --no-default-feat
 cp target/wasm32-unknown-unknown/release/solar.wasm crates/solar/web/solar.wasm
 cd crates/solar/web && python3 -m http.server 8000   # open http://localhost:8000/
 ```
-Drag to pan · scroll to zoom · click a planet to follow it. (`node verify.mjs`
-renders the system headlessly as a build check.)
+Drag to pan · scroll / pinch to zoom · tap a planet to follow it · a **Pixel
+size** slider trades resolution for chunkier pixel-art (and speed). Works on
+touch/mobile. (`node verify.mjs` renders the system headlessly as a build check.)
 
 **Web — live creature (the bird half):**
 ```bash

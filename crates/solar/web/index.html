@@ -13,7 +13,10 @@
     position: fixed; width: 100%; overscroll-behavior: none; touch-action: none;
     -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
   #stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block;
-    cursor: grab; touch-action: none; background: #05050b; }
+    cursor: grab; touch-action: none; background: #05050b;
+    /* Upscale the internal buffer as crisp square pixels, not a blur — so the
+       "pixel size" slider reads as chunky pixel-art. */
+    image-rendering: pixelated; image-rendering: crisp-edges; }
   #stage.drag { cursor: grabbing; }
 
   .hud { position: fixed; pointer-events: none; z-index: 5;
@@ -91,6 +94,12 @@
     <span class="val" id="speedV">1.0×</span>
   </div>
   <div class="divider"></div>
+  <div class="seg">
+    <label>Pixel size</label>
+    <input type="range" id="pix" min="1" max="8" step="1" value="1" />
+    <span class="val" id="pixV">1×</span>
+  </div>
+  <div class="divider"></div>
   <button id="fit">⤢ Reset view</button>
 </div>
 
@@ -109,9 +118,9 @@ const off = document.createElement("canvas");
 const octx = off.getContext("2d");
 
 let wasm, sys = 0, bufPtr = 0, bufLen = 0, posPtr = 0, imgData;
-let W = 0, H = 0;                       // internal render resolution (px)
+let W = 0, H = 0, prevW = 0;            // internal render resolution (px)
 let cam = { x: 0, y: 0, zoom: 1 };
-let time = 0, speed = 1, seed = 7;
+let time = 0, speed = 1, seed = 7, pix = 1;  // pix = display px per rendered px
 let follow = -1;                        // planet index the camera tracks, or -1
 let planetKinds = [], sunKind = 0, nPlanets = 0;
 let last = performance.now();
@@ -125,9 +134,16 @@ const PIXEL_BUDGET = coarse ? 430_000 : 1_600_000;
 
 function resize() {
   const cssW = window.innerWidth, cssH = window.innerHeight;
-  const scale = Math.min(1, Math.sqrt(PIXEL_BUDGET / (cssW * cssH)));
-  W = Math.max(2, Math.round(cssW * scale));
-  H = Math.max(2, Math.round(cssH * scale));
+  // `pix` chunkiness: aim for one rendered pixel per `pix` display pixels.
+  let tW = cssW / pix, tH = cssH / pix;
+  // Never exceed the per-frame pixel budget (protects perf on big/crisp views).
+  const scale = Math.min(1, Math.sqrt(PIXEL_BUDGET / (tW * tH)));
+  W = Math.max(2, Math.round(tW * scale));
+  H = Math.max(2, Math.round(tH * scale));
+  // Keep the on-screen framing fixed as the resolution changes: display size
+  // per world unit is zoom * (cssW / W), so scale zoom by W to hold it steady.
+  if (prevW) cam.zoom *= W / prevW;
+  prevW = W;
   canvas.width = W; canvas.height = H;
   canvas.style.width = cssW + "px"; canvas.style.height = cssH + "px";
   off.width = W; off.height = H;
@@ -277,7 +293,9 @@ $("dice").addEventListener("click", () => { const s = (Math.random() * 0xffffff)
 $("seed").addEventListener("change", () => generate((parseInt($("seed").value) || 0)));
 $("fit").addEventListener("click", fitView);
 $("speed").addEventListener("input", () => { speed = parseFloat($("speed").value); $("speedV").textContent = speed.toFixed(1) + "×"; });
-window.addEventListener("resize", () => { const z = cam.zoom, x = cam.x, y = cam.y; resize(); cam = { x, y, zoom: z }; });
+$("pix").addEventListener("input", () => { pix = parseInt($("pix").value) || 1; $("pixV").textContent = pix + "×"; resize(); });
+// resize() preserves world framing + zoom on its own, so just re-fit the buffer.
+window.addEventListener("resize", resize);
 
 async function main() {
   const res = await fetch("./solar.wasm?v=" + Date.now(), { cache: "no-store" });
