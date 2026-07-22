@@ -118,43 +118,56 @@ const off = document.createElement("canvas");
 const octx = off.getContext("2d");
 
 let wasm, sys = 0, bufPtr = 0, bufLen = 0, posPtr = 0, imgData;
-let W = 0, H = 0, prevW = 0;            // internal render resolution (px)
+// Two INDEPENDENT quantities, deliberately split so zoom no longer changes how
+// pixelated things look:
+//   • cam.zoom = MAGNIFICATION — display (CSS) px per world unit; what wheel /
+//     pinch / fit change. Bigger = things look larger on screen.
+//   • pix      = PIXEL DENSITY — how many display px each *rendered* pixel spans
+//     (the slider). We render the scene at a density fixed by `pix` alone, then
+//     scale that buffer up crisply, so a body is always the same chunky sprite,
+//     just larger when zoomed. Zoom magnifies pixels; it never adds detail.
 let cam = { x: 0, y: 0, zoom: 1 };
-let time = 0, speed = 1, seed = 7, pix = 1;  // pix = display px per rendered px
+let time = 0, speed = 1, seed = 7, pix = 1;
 let follow = -1;                        // planet index the camera tracks, or -1
 let planetKinds = [], sunKind = 0, nPlanets = 0;
 let last = performance.now();
+let curW = 0, curH = 0, curZoom = 1;    // last frame's render dims + render-px/world
 
-// Render at an internal resolution capped by a per-frame PIXEL BUDGET, then
-// CSS-scale the canvas up to fill the screen (pixel-art look). Every rendered
-// pixel costs — a starfield fill + body tiles — so a phone gets a much smaller
-// buffer than a desktop, which is the single biggest mobile-perf lever here.
+// Base render-pixels per world unit at pix=1. `pix` divides this, so the
+// rendered detail density depends ONLY on the slider — never on zoom.
+const BASE_DENSITY = 1.0;
+// Per-frame pixel-budget cap (perf): a phone renders far fewer pixels than a
+// desktop. The internal buffer is allocated once at this size and reused.
 const coarse = window.matchMedia("(pointer: coarse)").matches;
 const PIXEL_BUDGET = coarse ? 430_000 : 1_600_000;
 
-function resize() {
-  const cssW = window.innerWidth, cssH = window.innerHeight;
-  // `pix` chunkiness: aim for one rendered pixel per `pix` display pixels.
-  let tW = cssW / pix, tH = cssH / pix;
-  // Never exceed the per-frame pixel budget (protects perf on big/crisp views).
-  const scale = Math.min(1, Math.sqrt(PIXEL_BUDGET / (tW * tH)));
-  W = Math.max(2, Math.round(tW * scale));
-  H = Math.max(2, Math.round(tH * scale));
-  // Keep the on-screen framing fixed as the resolution changes: display size
-  // per world unit is zoom * (cssW / W), so scale zoom by W to hold it steady.
-  if (prevW) cam.zoom *= W / prevW;
-  prevW = W;
-  canvas.width = W; canvas.height = H;
-  canvas.style.width = cssW + "px"; canvas.style.height = cssH + "px";
-  off.width = W; off.height = H;
-  imgData = octx.createImageData(W, H);
-  if (bufPtr) wasm.dealloc(bufPtr, bufLen);
-  bufLen = W * H * 4; bufPtr = wasm.alloc(bufLen);
+// Match the canvas backing store to the display size; the crisp upscale from the
+// (smaller) render buffer happens in drawImage with smoothing off.
+function setupCanvas() {
+  canvas.width = window.innerWidth; canvas.height = window.innerHeight;
+  canvas.style.width = window.innerWidth + "px"; canvas.style.height = window.innerHeight + "px";
+  ctx.imageSmoothingEnabled = false; // reset whenever the backing store resizes
+}
+
+// Resolve this frame's render buffer: density fixed by `pix`, size follows zoom
+// (zoom in → fewer, bigger pixels), capped by the budget. `zoomArg` is the
+// render-px-per-world actually used, so world→screen geometry stays exact.
+function computeRender() {
+  const cssW = canvas.width, cssH = canvas.height;
+  const rpw = BASE_DENSITY / pix;
+  let w = Math.round(rpw * cssW / cam.zoom);
+  let h = Math.round(rpw * cssH / cam.zoom);
+  const bs = Math.min(1, Math.sqrt(PIXEL_BUDGET / (w * h)));
+  w = Math.round(w * bs); h = Math.round(h * bs);
+  // Clamp + quantize to 8px steps so the buffer is reallocated rarely while zooming.
+  w = Math.max(16, w - (w % 8)); h = Math.max(12, h - (h % 8));
+  return { w, h, zoomArg: w * cam.zoom / cssW };
 }
 
 function fitView() {
   const ext = wasm.system_extent(sys);
-  const z = Math.min(W * 0.5 * 0.9 / ext, H * 0.5 * 0.9 / (ext * 0.55));
+  // On-screen half-span = ext * zoom; fit it into ~90% of the viewport.
+  const z = Math.min(0.45 * canvas.width / ext, 0.45 * canvas.height / (ext * 0.55));
   cam = { x: 0, y: 0, zoom: z };
   follow = -1;
 }
@@ -184,14 +197,22 @@ function frame(now) {
     cam.x = p[0]; cam.y = p[1];
   }
 
-  wasm.render(sys, bufPtr, W, H, cam.x, cam.y, cam.zoom, time);
-  const view = new Uint8Array(wasm.memory.buffer, bufPtr, bufLen);
+  const { w, h, zoomArg } = computeRender();
+  if (w !== curW || h !== curH) {   // (re)size the render surfaces only on change
+    curW = w; curH = h;
+    off.width = w; off.height = h;
+    imgData = octx.createImageData(w, h);
+  }
+  curZoom = zoomArg;
+  wasm.render(sys, bufPtr, w, h, cam.x, cam.y, zoomArg, time);
+  const view = new Uint8Array(wasm.memory.buffer, bufPtr, w * h * 4);
   imgData.data.set(view);
   octx.putImageData(imgData, 0, 0);
-  ctx.drawImage(off, 0, 0, canvas.width, canvas.height);
+  // Crisp upscale of the small render buffer to the full display (no smoothing).
+  ctx.drawImage(off, 0, 0, w, h, 0, 0, canvas.width, canvas.height);
 
   // HUD: what's under the crosshair (viewport centre)?
-  const near = follow >= 0 ? follow : wasm.nearest_center(sys, W, H, cam.x, cam.y, cam.zoom, time);
+  const near = follow >= 0 ? follow : wasm.nearest_center(sys, w, h, cam.x, cam.y, zoomArg, time);
   const v = $("viewing");
   const kind = near >= 0 ? (PLANET_NAMES[planetKinds[near]] ?? "planet") : (SUN_NAMES[sunKind] ?? "the star");
   v.firstChild.textContent = (follow >= 0 ? "◎ following " : "") + kind + " ";
@@ -201,11 +222,13 @@ function frame(now) {
 // ---- interaction: one finger / mouse drags to pan, two fingers pinch to
 //      zoom + pan, a tap follows the body under it, the wheel zooms. Unified
 //      over Pointer Events so mouse and touch share one code path. ----------
-const clampZoom = z => Math.min(6, Math.max(0.08, z));
-// CSS px → render px, and the canvas rect (recomputed per gesture step).
-function metrics() { const r = canvas.getBoundingClientRect(); return { r, sc: W / r.width }; }
-// Screen (render px) → world.
-function toWorld(px, py) { return [cam.x + (px - W / 2) / cam.zoom, cam.y + (py - H / 2) / cam.zoom]; }
+const clampZoom = z => Math.min(60, Math.max(0.04, z));
+// Everything below works in CSS px; cam.zoom is CSS px per world unit, and the
+// canvas backing store is 1:1 with CSS px, so a client-relative point maps to
+// world directly — no render-resolution factor involved (that's the whole point:
+// interaction and framing are independent of how pixelated the render is).
+function localPt(e) { const r = canvas.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; }
+function toWorld(lx, ly) { return [cam.x + (lx - canvas.width / 2) / cam.zoom, cam.y + (ly - canvas.height / 2) / cam.zoom]; }
 
 const pointers = new Map();     // active pointerId -> {x, y} in CSS px
 let panLast = null;             // last pos for single-pointer drag
@@ -214,9 +237,8 @@ let gestureMoved = false, gesturePinched = false, gestureCount = 0;
 
 function startPinch() {
   const [a, b] = [...pointers.values()];
-  const { r, sc } = metrics();
-  const midx = (a.x + b.x) / 2, midy = (a.y + b.y) / 2;
-  const [wx, wy] = toWorld((midx - r.left) * sc, (midy - r.top) * sc);
+  const r = canvas.getBoundingClientRect();
+  const [wx, wy] = toWorld((a.x + b.x) / 2 - r.left, (a.y + b.y) / 2 - r.top);
   pinch = { dist: Math.hypot(a.x - b.x, a.y - b.y) || 1, zoom: cam.zoom, wx, wy };
   gesturePinched = true; panLast = null; follow = -1;
 }
@@ -237,14 +259,13 @@ canvas.addEventListener("pointermove", e => {
 
   if (pointers.size >= 2 && pinch) {                 // two-finger pinch: zoom + pan
     const [a, b] = [...pointers.values()];
-    const { r, sc } = metrics();
-    const midx = (a.x + b.x) / 2, midy = (a.y + b.y) / 2;
-    const px = (midx - r.left) * sc, py = (midy - r.top) * sc;
+    const r = canvas.getBoundingClientRect();
+    const mx = (a.x + b.x) / 2 - r.left, my = (a.y + b.y) / 2 - r.top;
     const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
     cam.zoom = clampZoom(pinch.zoom * dist / pinch.dist);
     // Pin the world point captured at gesture start to the current midpoint.
-    cam.x = pinch.wx - (px - W / 2) / cam.zoom;
-    cam.y = pinch.wy - (py - H / 2) / cam.zoom;
+    cam.x = pinch.wx - (mx - canvas.width / 2) / cam.zoom;
+    cam.y = pinch.wy - (my - canvas.height / 2) / cam.zoom;
     gestureMoved = true;
     return;
   }
@@ -253,8 +274,7 @@ canvas.addEventListener("pointermove", e => {
     const dx = e.clientX - panLast.x, dy = e.clientY - panLast.y;
     panLast = { x: e.clientX, y: e.clientY };
     if (Math.abs(dx) + Math.abs(dy) > 6) gestureMoved = true;
-    const s = metrics().sc / cam.zoom;
-    cam.x -= dx * s; cam.y -= dy * s;
+    cam.x -= dx / cam.zoom; cam.y -= dy / cam.zoom;  // world units = CSS px / zoom
     follow = -1;                                     // grabbing the view releases follow
   }
 });
@@ -266,11 +286,12 @@ function liftPointer(e) {
   if (pointers.size === 1) { const p = [...pointers.values()][0]; panLast = { x: p.x, y: p.y }; }
   if (pointers.size === 0) {
     canvas.classList.remove("drag");
-    // A clean single tap (no drag, no pinch) follows the body under it.
+    // A clean single tap (no drag, no pinch) follows the body under it. The
+    // hit test reuses the last frame's render dims + density (curW/H/Zoom).
     if (!gestureMoved && !gesturePinched && gestureCount === 1) {
-      const { r, sc } = metrics();
-      const [cx, cy] = toWorld((e.clientX - r.left) * sc, (e.clientY - r.top) * sc);
-      follow = wasm.nearest_center(sys, W, H, cx, cy, cam.zoom, time); // -1 = release
+      const [lx, ly] = localPt(e);
+      const [cx, cy] = toWorld(lx, ly);
+      follow = wasm.nearest_center(sys, curW, curH, cx, cy, curZoom, time); // -1 = release
     }
     panLast = null; gestureCount = 0;
   }
@@ -280,11 +301,13 @@ canvas.addEventListener("pointercancel", liftPointer);
 
 canvas.addEventListener("wheel", e => {
   e.preventDefault();
-  const { r, sc } = metrics();
-  const px = (e.clientX - r.left) * sc, py = (e.clientY - r.top) * sc;
-  const [wx, wy] = toWorld(px, py);                  // point under cursor stays fixed
+  const [lx, ly] = localPt(e);
+  const [wx, wy] = toWorld(lx, ly);                  // point under cursor stays fixed
   cam.zoom = clampZoom(cam.zoom * Math.exp(-e.deltaY * 0.0015));
-  if (follow < 0) { cam.x = wx - (px - W / 2) / cam.zoom; cam.y = wy - (py - H / 2) / cam.zoom; }
+  if (follow < 0) {
+    cam.x = wx - (lx - canvas.width / 2) / cam.zoom;
+    cam.y = wy - (ly - canvas.height / 2) / cam.zoom;
+  }
 }, { passive: false });
 
 // ---- controls --------------------------------------------------------------
@@ -293,16 +316,21 @@ $("dice").addEventListener("click", () => { const s = (Math.random() * 0xffffff)
 $("seed").addEventListener("change", () => generate((parseInt($("seed").value) || 0)));
 $("fit").addEventListener("click", fitView);
 $("speed").addEventListener("input", () => { speed = parseFloat($("speed").value); $("speedV").textContent = speed.toFixed(1) + "×"; });
-$("pix").addEventListener("input", () => { pix = parseInt($("pix").value) || 1; $("pixV").textContent = pix + "×"; resize(); });
-// resize() preserves world framing + zoom on its own, so just re-fit the buffer.
-window.addEventListener("resize", resize);
+// Pixel size only changes render density — framing/zoom are untouched, and the
+// frame loop resizes the buffer on its own, so nothing else to do here.
+$("pix").addEventListener("input", () => { pix = parseInt($("pix").value) || 1; $("pixV").textContent = pix + "×"; });
+window.addEventListener("resize", setupCanvas);
 
 async function main() {
   const res = await fetch("./solar.wasm?v=" + Date.now(), { cache: "no-store" });
   const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
   wasm = instance.exports;
-  posPtr = wasm.alloc(2 * 4); // stable little scratch buffer for planet_pos
-  resize();
+  posPtr = wasm.alloc(2 * 4);              // scratch for planet_pos
+  // Sized to the budget once (+ margin to absorb rounding in computeRender, so
+  // w*h*4 can never exceed this and the WASM render stays in bounds).
+  bufLen = (PIXEL_BUDGET + 16384) * 4;
+  bufPtr = wasm.alloc(bufLen);
+  setupCanvas();
   generate(7);
   requestAnimationFrame(frame);
 }
