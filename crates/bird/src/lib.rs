@@ -51,8 +51,19 @@
 use std::f32::consts::TAU;
 use std::ops::{Range, RangeInclusive};
 
-pub const GRID: u32 = 30; // native pixel resolution (chunky on purpose)
+pub const GRID: u32 = 30; // DESIGN-space resolution — all geometry is authored in these units.
 pub const ANIM_FRAMES: u32 = 6; // idle-loop length
+
+/// Default detail (supersample) factor. The creature is authored in a 30-unit
+/// DESIGN space, but rasterized into a grid of `GRID * detail` cells: 1.0 keeps
+/// the original chunky look, 2.0 halves the pixel size, etc. The web demo lets
+/// the user vary this live; the native generator uses this default.
+pub const DEFAULT_DETAIL: f32 = 2.0;
+
+/// Raster grid dimension for a given detail factor (clamped to something sane).
+pub fn raster_grid(detail: f32) -> u32 {
+    ((GRID as f32) * detail.clamp(0.5, 6.0)).round().max(1.0) as u32
+}
 
 type Rgb = [f32; 3];
 
@@ -110,6 +121,44 @@ impl Img {
         if x < self.w && y < self.h {
             let i = ((y * self.w + x) * 4) as usize;
             self.px[i..i + 4].copy_from_slice(&c);
+        }
+    }
+    /// Filled disc at DESIGN center (xd, yd) with DESIGN radius `rdes`, scaled by
+    /// `sc` into the raster grid. Used for the thin details drawn over the outline.
+    fn dot(&mut self, sc: f32, xd: f32, yd: f32, rdes: f32, c: Rgb) {
+        let (cx, cy) = (xd * sc, yd * sc);
+        let rr = (rdes * sc).max(0.6);
+        let r0 = rr.ceil() as i32;
+        let col = to_rgba(c);
+        for dy in -r0..=r0 {
+            for dx in -r0..=r0 {
+                if (dx * dx + dy * dy) as f32 <= rr * rr + 0.25 {
+                    let (x, y) = (cx.round() as i32 + dx, cy.round() as i32 + dy);
+                    if x >= 0 && y >= 0 {
+                        self.put_pixel(x as u32, y as u32, col);
+                    }
+                }
+            }
+        }
+    }
+    /// Thin segment between two DESIGN points, DESIGN half-thickness `rdes`.
+    fn seg(&mut self, sc: f32, ax: f32, ay: f32, bx: f32, by: f32, rdes: f32, c: Rgb) {
+        let (axp, ayp, bxp, byp) = (ax * sc, ay * sc, bx * sc, by * sc);
+        let rr = (rdes * sc).max(0.5);
+        let x0 = (axp.min(bxp) - rr - 1.0).floor() as i32;
+        let x1 = (axp.max(bxp) + rr + 1.0).ceil() as i32;
+        let y0 = (ayp.min(byp) - rr - 1.0).floor() as i32;
+        let y1 = (ayp.max(byp) + rr + 1.0).ceil() as i32;
+        let col = to_rgba(c);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                if x < 0 || y < 0 {
+                    continue;
+                }
+                if seg_dist(x as f32 + 0.5, y as f32 + 0.5, axp, ayp, bxp, byp) <= rr {
+                    self.put_pixel(x as u32, y as u32, col);
+                }
+            }
         }
     }
 }
@@ -180,25 +229,44 @@ fn vnoise(x: f32, y: f32) -> f32 {
 }
 
 // ---------------- canvas ----------------
+/// The rasterization target. Geometry is authored in DESIGN units; `scale`
+/// converts a design coordinate into this canvas's `w`×`w` pixel grid, so the
+/// same art can be drawn chunky (scale 1) or fine (scale 2, 3, …).
 struct Canvas {
     col: Vec<Rgb>,
     filled: Vec<bool>,
+    w: u32,
+    scale: f32,
 }
 impl Canvas {
-    fn new() -> Self {
-        Canvas { col: vec![[0.0; 3]; (GRID * GRID) as usize], filled: vec![false; (GRID * GRID) as usize] }
+    fn new(w: u32, scale: f32) -> Self {
+        Canvas { col: vec![[0.0; 3]; (w * w) as usize], filled: vec![false; (w * w) as usize], w, scale }
     }
-    fn idx(x: i32, y: i32) -> Option<usize> {
-        if x < 0 || y < 0 || x >= GRID as i32 || y >= GRID as i32 { None } else { Some((y as u32 * GRID + x as u32) as usize) }
+    fn idx(&self, x: i32, y: i32) -> Option<usize> {
+        if x < 0 || y < 0 || x >= self.w as i32 || y >= self.w as i32 { None } else { Some((y as u32 * self.w + x as u32) as usize) }
     }
     fn put(&mut self, x: i32, y: i32, c: Rgb) {
-        if let Some(i) = Self::idx(x, y) {
+        if let Some(i) = self.idx(x, y) {
             self.col[i] = c;
             self.filled[i] = true;
         }
     }
     fn filledp(&self, x: i32, y: i32) -> bool {
-        Self::idx(x, y).map(|i| self.filled[i]).unwrap_or(false)
+        self.idx(x, y).map(|i| self.filled[i]).unwrap_or(false)
+    }
+    /// Filled disc at a DESIGN point (used for tiny in-silhouette bits like teeth).
+    fn dot(&mut self, xd: f32, yd: f32, rdes: f32, c: Rgb) {
+        let sc = self.scale;
+        let (cx, cy) = (xd * sc, yd * sc);
+        let rr = (rdes * sc).max(0.6);
+        let r0 = rr.ceil() as i32;
+        for dy in -r0..=r0 {
+            for dx in -r0..=r0 {
+                if (dx * dx + dy * dy) as f32 <= rr * rr + 0.25 {
+                    self.put(cx.round() as i32 + dx, cy.round() as i32 + dy, c);
+                }
+            }
+        }
     }
 }
 
@@ -234,30 +302,35 @@ enum Pattern {
 }
 
 fn body_blob(cv: &mut Canvas, e: Ell, top: Rgb, bot: Rgb, pat: Pattern, patc: Rgb, hue: f32) {
-    let x0 = (e.cx - e.rx - 1.0).floor() as i32;
-    let x1 = (e.cx + e.rx + 1.0).ceil() as i32;
-    let y0 = (e.cy - e.ry - 1.0).floor() as i32;
-    let y1 = (e.cy + e.ry + 1.0).ceil() as i32;
+    let sc = cv.scale;
+    // pixel bounds derived from the DESIGN ellipse
+    let x0 = ((e.cx - e.rx) * sc - 1.0).floor() as i32;
+    let x1 = ((e.cx + e.rx) * sc + 1.0).ceil() as i32;
+    let y0 = ((e.cy - e.ry) * sc - 1.0).floor() as i32;
+    let y1 = ((e.cy + e.ry) * sc + 1.0).ceil() as i32;
     for y in y0..=y1 {
         for x in x0..=x1 {
-            let nx = (x as f32 + 0.5 - e.cx) / e.rx;
-            let ny = (y as f32 + 0.5 - e.cy) / e.ry;
+            // convert this pixel's centre back to DESIGN space, then test/shade there
+            let dx = (x as f32 + 0.5) / sc;
+            let dy = (y as f32 + 0.5) / sc;
+            let nx = (dx - e.cx) / e.rx;
+            let ny = (dy - e.cy) / e.ry;
             let r2 = nx * nx + ny * ny;
             if r2 > 1.0 {
                 continue;
             }
             let nz = (1.0 - r2).sqrt();
-            let vt = smoothstep(0.35, 0.9, (y as f32 + 0.5 - (e.cy - e.ry)) / (2.0 * e.ry));
+            let vt = smoothstep(0.35, 0.9, (dy - (e.cy - e.ry)) / (2.0 * e.ry));
             let mut base = mix(top, bot, vt);
             match pat {
                 Pattern::Solid => {}
                 Pattern::Spots => {
-                    if vnoise((x as f32) * 0.7 + 3.0, (y as f32) * 0.7) > 0.62 {
+                    if vnoise(dx * 0.7 + 3.0, dy * 0.7) > 0.62 {
                         base = patc;
                     }
                 }
                 Pattern::Stripes => {
-                    if ((x as f32 - y as f32 * 0.4) * 0.9).sin() > 0.35 {
+                    if ((dx - dy * 0.4) * 0.9).sin() > 0.35 {
                         base = patc;
                     }
                 }
@@ -279,13 +352,15 @@ fn blob(cv: &mut Canvas, e: Ell, top: Rgb, bot: Rgb) {
 }
 
 fn capsule(cv: &mut Canvas, ax: f32, ay: f32, bx: f32, by: f32, rad: f32, top: Rgb, bot: Rgb) {
-    let x0 = (ax.min(bx) - rad - 1.0).floor() as i32;
-    let x1 = (ax.max(bx) + rad + 1.0).ceil() as i32;
-    let y0 = (ay.min(by) - rad - 1.0).floor() as i32;
-    let y1 = (ay.max(by) + rad + 1.0).ceil() as i32;
+    let sc = cv.scale;
+    let x0 = ((ax.min(bx) - rad) * sc - 1.0).floor() as i32;
+    let x1 = ((ax.max(bx) + rad) * sc + 1.0).ceil() as i32;
+    let y0 = ((ay.min(by) - rad) * sc - 1.0).floor() as i32;
+    let y1 = ((ay.max(by) + rad) * sc + 1.0).ceil() as i32;
     for y in y0..=y1 {
         for x in x0..=x1 {
-            let d = seg_dist(x as f32 + 0.5, y as f32 + 0.5, ax, ay, bx, by);
+            // measure distance in DESIGN space so `rad` keeps its authored meaning
+            let d = seg_dist((x as f32 + 0.5) / sc, (y as f32 + 0.5) / sc, ax, ay, bx, by);
             if d <= rad {
                 let s = clamp01(0.75 - d / rad.max(0.001) * 0.5);
                 cv.put(x, y, mix(bot, top, s));
@@ -295,22 +370,26 @@ fn capsule(cv: &mut Canvas, ax: f32, ay: f32, bx: f32, by: f32, rad: f32, top: R
 }
 
 fn tri(cv: &mut Canvas, p: [(f32, f32); 3], c: Rgb, edge: Rgb) {
+    let sc = cv.scale;
     let xs = [p[0].0, p[1].0, p[2].0];
     let ys = [p[0].1, p[1].1, p[2].1];
-    let x0 = xs.iter().cloned().fold(f32::MAX, f32::min).floor() as i32 - 1;
-    let x1 = xs.iter().cloned().fold(f32::MIN, f32::max).ceil() as i32 + 1;
-    let y0 = ys.iter().cloned().fold(f32::MAX, f32::min).floor() as i32 - 1;
-    let y1 = ys.iter().cloned().fold(f32::MIN, f32::max).ceil() as i32 + 1;
+    let x0 = (xs.iter().cloned().fold(f32::MAX, f32::min) * sc).floor() as i32 - 1;
+    let x1 = (xs.iter().cloned().fold(f32::MIN, f32::max) * sc).ceil() as i32 + 1;
+    let y0 = (ys.iter().cloned().fold(f32::MAX, f32::min) * sc).floor() as i32 - 1;
+    let y1 = (ys.iter().cloned().fold(f32::MIN, f32::max) * sc).ceil() as i32 + 1;
     let ar = |ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32| (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
     for y in y0..=y1 {
         for x in x0..=x1 {
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            // sample point in DESIGN space (the triangle vertices are design coords)
+            let (fx, fy) = ((x as f32 + 0.5) / sc, (y as f32 + 0.5) / sc);
             let d1 = ar(p[0].0, p[0].1, p[1].0, p[1].1, fx, fy);
             let d2 = ar(p[1].0, p[1].1, p[2].0, p[2].1, fx, fy);
             let d3 = ar(p[2].0, p[2].1, p[0].0, p[0].1, fx, fy);
             if !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0)) {
                 let m = d1.abs().min(d2.abs()).min(d3.abs());
-                cv.put(x, y, if m < 1.1 { edge } else { c });
+                // edge band in DESIGN area units; ×sc keeps the outline ~constant
+                // in output pixels as detail rises (identical to before at sc = 1).
+                cv.put(x, y, if m < 1.1 * sc { edge } else { c });
             }
         }
     }
@@ -927,8 +1006,9 @@ fn draw_sail(cv: &mut Canvas, a: &Alien, s: f32) {
     }
 }
 
-fn draw(a: &Alien, s: f32, s2: f32, blink: bool) -> Img {
-    let mut cv = Canvas::new();
+fn draw(a: &Alien, s: f32, s2: f32, blink: bool, scale: f32) -> Img {
+    let rg = raster_grid(scale);
+    let mut cv = Canvas::new(rg, scale);
 
     // membrane wing goes behind the body (spreads up and back)
     if a.wing_membrane {
@@ -1019,12 +1099,19 @@ fn draw(a: &Alien, s: f32, s2: f32, blink: bool) -> Img {
             ry: a.body.ry * 0.62 * (1.0 + flap),
         };
         blob(&mut cv, we, a.wing_col, darker(a.wing_col, 0.28));
-        // covert feather lines for definition
+        // covert feather lines for definition (drawn ~1 design-px thick, at any scale)
+        let sc = cv.scale;
+        let th = sc.round().max(1.0) as i32;
+        let fc = darker(a.wing_col, 0.42);
         for k in 0..3 {
-            let yy = (we.cy - 1.0 + k as f32 * 1.8) as i32;
-            for xx in (we.cx - we.rx * 0.7) as i32..=(we.cx + we.rx * 0.45) as i32 {
-                if cv.filledp(xx, yy) {
-                    cv.put(xx, yy, darker(a.wing_col, 0.42));
+            let yy = ((we.cy - 1.0 + k as f32 * 1.8) * sc) as i32;
+            let xlo = ((we.cx - we.rx * 0.7) * sc) as i32;
+            let xhi = ((we.cx + we.rx * 0.45) * sc) as i32;
+            for row in 0..th {
+                for xx in xlo..=xhi {
+                    if cv.filledp(xx, yy + row) {
+                        cv.put(xx, yy + row, fc);
+                    }
                 }
             }
         }
@@ -1062,9 +1149,8 @@ fn draw(a: &Alien, s: f32, s2: f32, blink: bool) -> Img {
             Mouth::Beak => tri(&mut cv, [up, dn, (tipx, my)], a.beak_col, darker(a.beak_col, 0.3)),
             Mouth::Hook => {
                 tri(&mut cv, [up, dn, (tipx, my + 0.5)], a.beak_col, darker(a.beak_col, 0.3));
-                for k in 0..2 {
-                    cv.put(tipx as i32 - k, my as i32 + 1 + k, darker(a.beak_col, 0.2));
-                }
+                // downward hook off the beak tip
+                capsule(&mut cv, tipx, my + 0.5, tipx - 1.0, my + 1.6, 0.55, darker(a.beak_col, 0.2), darker(a.beak_col, 0.35));
             }
             Mouth::Tube => capsule(&mut cv, mx, my, tipx, my + a.mouth_len * 0.15, 1.0, a.beak_col, darker(a.beak_col, 0.3)),
             Mouth::Mandible => {
@@ -1082,30 +1168,40 @@ fn draw(a: &Alien, s: f32, s2: f32, blink: bool) -> Img {
                 tri(&mut cv, [up, dn, (tipx - a.mouth_len * 0.4, my)], a.beak_col, a.outline);
                 // teeth
                 for k in 0..a.teeth_n {
-                    cv.put((mx + k as f32 * 1.2) as i32, (my + a.mouth_half - 0.5) as i32, [0.95, 0.95, 0.9]);
+                    cv.dot(mx + k as f32 * 1.2, my + a.mouth_half - 0.5, 0.45, [0.95, 0.95, 0.9]);
                 }
             }
         }
     }
 
     // ---- outline pass ----
-    let mut img = Img::new(GRID, GRID);
-    for y in 0..GRID as i32 {
-        for x in 0..GRID as i32 {
+    let mut img = Img::new(rg, rg);
+    // outline stays ~1 DESIGN-px thick so the silhouette keeps reading against
+    // the dark background even as the interior detail gets finer.
+    let ot = (scale * 0.75).round().clamp(1.0, 2.0) as i32;
+    for y in 0..rg as i32 {
+        for x in 0..rg as i32 {
             if cv.filledp(x, y) {
-                img.put_pixel(x as u32, y as u32, to_rgba(cv.col[(y as u32 * GRID + x as u32) as usize]));
-            } else if (-1..=1).any(|dy| (-1..=1).any(|dx| (dx != 0 || dy != 0) && cv.filledp(x + dx, y + dy))) {
-                img.put_pixel(x as u32, y as u32, to_rgba(a.outline));
+                img.put_pixel(x as u32, y as u32, to_rgba(cv.col[(y as u32 * rg + x as u32) as usize]));
+            } else {
+                let mut edge = false;
+                'scan: for dy in -ot..=ot {
+                    for dx in -ot..=ot {
+                        if (dx != 0 || dy != 0) && cv.filledp(x + dx, y + dy) {
+                            edge = true;
+                            break 'scan;
+                        }
+                    }
+                }
+                if edge {
+                    img.put_pixel(x as u32, y as u32, to_rgba(a.outline));
+                }
             }
         }
     }
 
-    // ---- thin details on top (bounds-checked) ----
-    let mut sp = |x: i32, y: i32, c: Rgb| {
-        if x >= 0 && y >= 0 && (x as u32) < GRID && (y as u32) < GRID {
-            img.put_pixel(x as u32, y as u32, to_rgba(c));
-        }
-    };
+    // ---- thin details on top (authored in DESIGN space, rasterized at `scale`) ----
+    let sc = scale;
     // (legs are now drawn into the silhouette above)
     // antennae
     if a.gear == Gear::Antennae {
@@ -1114,14 +1210,9 @@ fn draw(a: &Alien, s: f32, s2: f32, blink: bool) -> Img {
             let sy = a.head.cy - a.head.ry * 0.8;
             let tx = sx + (i as f32 - 0.5) * a.ant_splay + a.sway_amp * s; // antennae sway
             let ty = sy - a.ant_len;
-            let steps = 6;
-            for s in 0..=steps {
-                let t = s as f32 / steps as f32;
-                sp((sx + (tx - sx) * t) as i32, (sy + (ty - sy) * t) as i32, a.outline);
-            }
-            sp(tx as i32, ty as i32, a.accent);
-            sp(tx as i32 + 1, ty as i32, a.accent);
-            sp(tx as i32, ty as i32 - 1, lighter(a.accent, 0.3));
+            img.seg(sc, sx, sy, tx, ty, 0.45, a.outline);
+            img.dot(sc, tx, ty, 0.8, a.accent);
+            img.dot(sc, tx, ty - 0.7, 0.45, lighter(a.accent, 0.3));
         }
     }
     // eyes — on bespoke stalks (crustacean/abyssal), else fitted to the head.
@@ -1132,19 +1223,10 @@ fn draw(a: &Alien, s: f32, s2: f32, blink: bool) -> Img {
             let by = a.head.cy - a.head.ry * 0.55;
             let tx = bx + off * (a.stalk_splay * 4.5) + a.sway_amp * s * 0.4;
             let ty = by - a.stalk_len + s2 * 0.7; // stalks bob
-            for k in 0..=5 {
-                let t = k as f32 / 5.0;
-                sp((bx + (tx - bx) * t) as i32, (by + (ty - by) * t) as i32, a.outline);
-            }
-            for dy in -1..=1 {
-                for dx in -1..=1 {
-                    if dx * dx + dy * dy <= 2 {
-                        sp(tx as i32 + dx, ty as i32 + dy, a.iris);
-                    }
-                }
-            }
-            sp(tx as i32, ty as i32, [0.05, 0.04, 0.08]);
-            sp(tx as i32, ty as i32 - 1, [1.0, 1.0, 1.0]);
+            img.seg(sc, bx, by, tx, ty, 0.5, a.outline);
+            img.dot(sc, tx, ty, 1.2, a.iris);
+            img.dot(sc, tx, ty, 0.55, [0.05, 0.04, 0.08]);
+            img.dot(sc, tx, ty - 0.7, 0.4, [1.0, 1.0, 1.0]);
         }
     } else {
         let rr = a.eye_r.min(a.head.rx * if a.eyes >= 2 { 0.40 } else { 0.55 });
@@ -1156,30 +1238,18 @@ fn draw(a: &Alien, s: f32, s2: f32, blink: bool) -> Img {
         }
         let cxp = a.head.cx + a.head.rx * 0.18;
         let cyp = a.head.cy - a.head.ry * 0.05;
-        let ceil = rr.ceil() as i32;
         for i in 0..a.eyes {
             let off = (i as f32 - (a.eyes as f32 - 1.0) / 2.0) * spacing;
             let (mut ex, mut ey) = if a.eyes_vertical { (cxp, cyp + off) } else { (cxp + off, cyp) };
             ex = ex.clamp(a.head.cx - a.head.rx * 0.55, a.head.cx + a.head.rx * 0.72);
             ey = ey.clamp(a.head.cy - a.head.ry * 0.5, a.head.cy + a.head.ry * 0.5);
             if blink {
-                for dx in -ceil..=ceil {
-                    sp(ex as i32 + dx, ey as i32, a.outline);
-                }
+                img.seg(sc, ex - rr, ey, ex + rr, ey, 0.4, a.outline);
                 continue;
             }
-            for dy in -ceil..=ceil {
-                for dx in -ceil..=ceil {
-                    if (dx * dx + dy * dy) as f32 <= rr * rr + 0.5 {
-                        sp(ex as i32 + dx, ey as i32 + dy, a.iris);
-                    }
-                }
-            }
-            sp(ex as i32, ey as i32, [0.05, 0.04, 0.08]);
-            if rr >= 1.5 {
-                sp(ex as i32 + 1, ey as i32, [0.05, 0.04, 0.08]);
-            }
-            sp(ex as i32, ey as i32 - 1, [1.0, 1.0, 1.0]);
+            img.dot(sc, ex, ey, rr, a.iris);
+            img.dot(sc, ex, ey, (rr * 0.55).clamp(0.4, 1.0), [0.05, 0.04, 0.08]);
+            img.dot(sc, ex, ey - rr * 0.45, (rr * 0.3).max(0.35), [1.0, 1.0, 1.0]);
         }
     }
     // anglerfish lure: a stalk arcing forward over the mouth with a glowing bulb
@@ -1189,20 +1259,17 @@ fn draw(a: &Alien, s: f32, s2: f32, blink: bool) -> Img {
         let tipx = a.head.cx + a.head.rx * (0.9 + a.lure_len);
         let tipy = a.head.cy - a.head.ry * 0.1 + s2 * 1.3; // bulb bobs
         let (cx2, cy2) = (bx + 2.0, by - a.lure_arc);
-        for k in 0..=9 {
-            let t = k as f32 / 9.0;
+        let mut prev = (bx, by);
+        for k in 1..=12 {
+            let t = k as f32 / 12.0;
             let it = 1.0 - t;
             let x = it * it * bx + 2.0 * it * t * cx2 + t * t * tipx;
             let y = it * it * by + 2.0 * it * t * cy2 + t * t * tipy;
-            sp(x as i32, y as i32, a.outline);
+            img.seg(sc, prev.0, prev.1, x, y, 0.4, a.outline);
+            prev = (x, y);
         }
-        let glow = [1.0, 0.95, 0.5];
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                sp(tipx as i32 + dx, tipy as i32 + dy, glow);
-            }
-        }
-        sp(tipx as i32 - 1, tipy as i32 - 1, [1.0, 1.0, 0.92]);
+        img.dot(sc, tipx, tipy, 1.0, [1.0, 0.95, 0.5]);
+        img.dot(sc, tipx - 0.5, tipy - 0.5, 0.4, [1.0, 1.0, 0.92]);
     }
     // bioluminescent spots — brighten/dim with the idle loop
     if a.biolum_n > 0 {
@@ -1210,11 +1277,9 @@ fn draw(a: &Alien, s: f32, s2: f32, blink: bool) -> Img {
         let core = lighter(a.biolum_col, 0.25 * pulse);
         let halo = mix(darker(a.biolum_col, 0.45), a.biolum_col, pulse);
         for i in 0..a.biolum_n as usize {
-            let (xi, yi) = (a.biolum_spots[i].0 as i32, a.biolum_spots[i].1 as i32);
-            for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-                sp(xi + dx, yi + dy, halo);
-            }
-            sp(xi, yi, core);
+            let (xi, yi) = (a.biolum_spots[i].0, a.biolum_spots[i].1);
+            img.dot(sc, xi, yi, 1.0, halo);
+            img.dot(sc, xi, yi, 0.5, core);
         }
     }
     img
@@ -1229,8 +1294,10 @@ fn creature(genus_seed: u64, indiv: u64) -> Alien {
 
 /// Render one animated frame of a creature (seed -> genus/individual) into `out`
 /// (size*size*4 RGBA). `phase` in [0,1) drives the idle loop; `energy` scales the
-/// idle-motion amplitudes (1.0 = as generated, lower = calmer).
-pub fn render_rgba(size: u32, seed: u32, phase: f32, energy: f32, out: &mut [u8]) {
+/// idle-motion amplitudes (1.0 = as generated, lower = calmer). `detail` is the
+/// supersample factor — 1.0 is the original chunky look, 2.0 halves the pixel
+/// size, and so on (see `DEFAULT_DETAIL`).
+pub fn render_rgba(size: u32, seed: u32, phase: f32, energy: f32, detail: f32, out: &mut [u8]) {
     let mut a = creature(seed as u64, 0);
     a.bob_amp *= energy;
     a.sway_amp *= energy;
@@ -1242,10 +1309,11 @@ pub fn render_rgba(size: u32, seed: u32, phase: f32, energy: f32, out: &mut [u8]
     let s = (TAU * phase * tempo).sin();
     let s2 = (TAU * phase * tempo).cos();
     let f = ((phase.rem_euclid(1.0) * ANIM_FRAMES as f32).floor() as i32) % ANIM_FRAMES as i32;
-    let img = draw(&a, s, s2, a.blink_frame == f);
+    let img = draw(&a, s, s2, a.blink_frame == f, detail);
+    let rg = raster_grid(detail); // raster dimension the creature was drawn at
 
-    let bob = a.bob_amp * s; // native px, up = +
-    let inv = GRID as f32 / size as f32;
+    let bob = a.bob_amp * s * (rg as f32 / GRID as f32); // design px -> raster px
+    let inv = rg as f32 / size as f32;
     let bg = [10u8, 9, 16, 255];
     for oy in 0..size {
         let sy_f = oy as f32 * inv + bob;
@@ -1255,8 +1323,8 @@ pub fn render_rgba(size: u32, seed: u32, phase: f32, energy: f32, out: &mut [u8]
             let mut col = bg;
             if sy_f >= 0.0 && sx_f >= 0.0 {
                 let (sx, sy) = (sx_f as u32, sy_f as u32);
-                if sx < GRID && sy < GRID {
-                    let si = ((sy * GRID + sx) * 4) as usize;
+                if sx < rg && sy < rg {
+                    let si = ((sy * rg + sx) * 4) as usize;
                     if img.px[si + 3] > 0 {
                         col = [img.px[si], img.px[si + 1], img.px[si + 2], 255];
                     }
