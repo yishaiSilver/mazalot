@@ -54,6 +54,32 @@ pub extern "C" fn render_params(
     crate::render_rgba_params(size, type_idx as usize, seed, angle, params, dither, spin, out);
 }
 
+/// Render a chosen look pattern (index into `StarPattern::ALL`: 0 realistic,
+/// 1 pixelbands, 2 plasma, 3 celtoon, 4 sunburst) with slider params + style.
+#[no_mangle]
+pub extern "C" fn render_pattern_params(
+    ptr: *mut u8,
+    size: u32,
+    type_idx: u32,
+    seed: u32,
+    angle: f32,
+    pattern: u32,
+    params_ptr: *const f32,
+    dither: f32,
+    spin: f32,
+) {
+    let out = unsafe { slice::from_raw_parts_mut(ptr, (size * size * 4) as usize) };
+    let params = unsafe { slice::from_raw_parts(params_ptr, crate::NUM_PARAMS) };
+    let pat = crate::pattern_from_index(pattern as usize);
+    crate::render_rgba_pattern_params(size, type_idx as usize, seed, angle, pat, params, dither, spin, out);
+}
+
+/// Number of look patterns (length of `StarPattern::ALL`).
+#[no_mangle]
+pub extern "C" fn pattern_count() -> u32 {
+    crate::pattern_count() as u32
+}
+
 /// Read a type's default value for parameter `which` (see `crate::param`), so the
 /// sliders can snap to sensible per-type starting values.
 #[no_mangle]

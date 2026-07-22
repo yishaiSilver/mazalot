@@ -750,19 +750,57 @@ pub fn render_pattern(size: u32, type_idx: usize, seed: u32, angle: f32, pattern
     if pattern == StarPattern::Realistic {
         return render_ct(size, ct, seed, angle, SPIN_TURNS, &Style::natural(), out);
     }
-    render_pat(size, ct, seed, angle, pattern, &Style::natural(), out);
+    // Stylised patterns want a lighter dither than the realistic natural() so the
+    // flat bands stay crisp; a slow rigid roll drifts the surface blobs.
+    render_pat(size, ct, seed, angle, pattern, 1.0, &Style { dither: 0.35 }, out);
 }
 
-/// Shared per-pixel loop for the stylised patterns.
-fn render_pat(size: u32, ct: &SType, seed: u32, angle: f32, pattern: StarPattern, style: &Style, out: &mut [u8]) {
+/// Pattern index in [`StarPattern::ALL`] order → the variant (wraps on overflow).
+pub fn pattern_from_index(i: usize) -> StarPattern {
+    StarPattern::ALL[i % StarPattern::ALL.len()]
+}
+
+/// Number of [`StarPattern`] variants.
+pub fn pattern_count() -> usize {
+    StarPattern::ALL.len()
+}
+
+/// Render a chosen pattern with slider-parameter overrides + global `dither` and
+/// `spin` (see [`render_rgba_params`]). Used by the web demo's style selector.
+#[allow(clippy::too_many_arguments)]
+pub fn render_rgba_pattern_params(
+    size: u32,
+    type_idx: usize,
+    seed: u32,
+    angle: f32,
+    pattern: StarPattern,
+    p: &[f32],
+    dither: f32,
+    spin: f32,
+    out: &mut [u8],
+) {
+    let mut ct = STYPES[type_idx % STYPES.len()];
+    if p.len() >= NUM_PARAMS {
+        ct.gran_freq = p[0];
+        ct.turb = p[1];
+        ct.spots = p[2];
+        ct.activity = p[3];
+        ct.flicker = p[4];
+        ct.corona_size = p[5];
+        ct.fur = p[6];
+    }
+    if pattern == StarPattern::Realistic {
+        render_ct(size, &ct, seed, angle, spin, &Style { dither }, out);
+    } else {
+        render_pat(size, &ct, seed, angle, pattern, spin, &Style { dither }, out);
+    }
+}
+
+/// Shared per-pixel loop for the stylised patterns. `spin` is whole rigid turns
+/// per 2π loop (Sunburst's 2D body ignores it — its motion is the wedge phase).
+fn render_pat(size: u32, ct: &SType, seed: u32, angle: f32, pattern: StarPattern, spin: f32, style: &Style, out: &mut [u8]) {
     let (cx, cy) = (size as f32 / 2.0, size as f32 / 2.0);
     let ofs = seed_offsets(seed);
-    // Sunburst gets a modest spin baked into its wedge/ray phase already; give
-    // the body a slow rigid roll so the surface blobs also drift for the others.
-    let spin = match pattern {
-        StarPattern::Sunburst => 0.0,
-        _ => 1.0,
-    };
     let (sina, cosa) = (angle * spin).sin_cos();
     let rad = size as f32 * 0.235 * ct.radius_scale;
 
@@ -838,13 +876,7 @@ fn render_pat(size: u32, ct: &SType, seed: u32, angle: f32, pattern: StarPattern
                 clamp01(o[2] + c[2] + fuzz_rgb[2]),
             ];
 
-            // Plasma keeps the natural dither; the hard-edged patterns want much
-            // less so bands stay crisp.
-            let ps = match pattern {
-                StarPattern::Plasma => style.dither,
-                _ => 0.25,
-            };
-            let px = finalize(o, bx, &Style { dither: ps });
+            let px = finalize(o, bx, style);
             let idx = ((iy * size + ix) * 4) as usize;
             out[idx] = (clamp01(px[0]) * 255.0) as u8;
             out[idx + 1] = (clamp01(px[1]) * 255.0) as u8;
