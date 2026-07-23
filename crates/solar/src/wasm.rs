@@ -38,6 +38,29 @@ pub extern "C" fn system_new(seed: u32) -> *mut System {
     Box::into_raw(Box::new(System::generate(seed)))
 }
 
+/// Generate a system for `seed`, forcing the planet count when `count > 0`
+/// (0 = the seed-derived 4..=8). Opaque pointer, freed with [`system_free`].
+#[no_mangle]
+pub extern "C" fn system_new_params(seed: u32, count: u32) -> *mut System {
+    Box::into_raw(Box::new(System::generate_n(seed, count)))
+}
+
+/// Set the live view multipliers (planet spacing, planet/sun size, and per-body
+/// pixelation). These rescale the existing system without regenerating it, so
+/// the sliders are smooth and the worlds keep their identity.
+#[no_mangle]
+pub extern "C" fn system_set_view(
+    sys: *mut System,
+    spacing: f32,
+    planet_size: f32,
+    sun_size: f32,
+    planet_pixel: f32,
+    sun_pixel: f32,
+) {
+    let sys = unsafe { &mut *sys };
+    sys.set_view(spacing, planet_size, sun_size, planet_pixel, sun_pixel);
+}
+
 /// Free a system previously returned by [`system_new`].
 #[no_mangle]
 pub extern "C" fn system_free(ptr: *mut System) {

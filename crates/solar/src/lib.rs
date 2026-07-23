@@ -333,34 +333,50 @@ pub struct Planet {
 }
 
 impl Planet {
-    /// World-space position + a depth key at time `t`. Depth > 0 means the
-    /// planet is on the near side of its orbit (drawn in front of the sun).
-    fn at(&self, t: f32) -> (f32, f32, f32) {
+    /// World-space position + a depth key at time `t`. `spacing` scales the
+    /// orbit radius (a live UI multiplier). Depth > 0 means the planet is on the
+    /// near side of its orbit (drawn in front of the sun).
+    fn at(&self, t: f32, spacing: f32) -> (f32, f32, f32) {
         let a = self.phase + self.speed * t;
         let (s, c) = a.sin_cos();
-        let x = c * self.orbit;
-        let y = s * self.orbit * ORBIT_FLATTEN * self.tilt;
+        let x = c * self.orbit * spacing;
+        let y = s * self.orbit * ORBIT_FLATTEN * self.tilt * spacing;
         (x, y, s) // depth = sin(a): +1 at the front of the ellipse
     }
 }
 
 /// A whole generated solar system: one star and its planets. Deterministic in
-/// `seed`.
+/// `seed`. The `view` multipliers below are live, UI-tunable overrides that do
+/// NOT change the system's identity (same worlds, just rescaled) — only the
+/// seed and planet count are structural.
 pub struct System {
     pub seed: u32,
     pub sun_kind: usize,
     pub sun_radius: f32, // world units
     pub planets: Vec<Planet>,
+    // --- live view multipliers (1.0 = as generated) ---
+    pub spacing: f32,      // orbit-radius scale (planet spacing)
+    pub planet_size: f32,  // planet body-radius scale
+    pub sun_size: f32,     // sun radius scale
+    pub planet_pixel: f32, // planet render chunkiness (>= 1, bigger = blockier)
+    pub sun_pixel: f32,    // sun render chunkiness (>= 1)
 }
 
 /// How much orbits are squashed vertically to fake a tilted, near-top-down view.
 const ORBIT_FLATTEN: f32 = 0.42;
 
 impl System {
-    /// Build the system for `seed`. Planet count, types, sizes, spacing and
-    /// speeds all derive from the seed; placement respects each type's
-    /// `orbit_band` so rocky worlds fall near the star and giants far out.
+    /// Build the system for `seed` with the seed-derived planet count (4..=8).
     pub fn generate(seed: u32) -> System {
+        System::generate_n(seed, 0)
+    }
+
+    /// Build the system for `seed`, forcing the planet count when
+    /// `count_override > 0` (0 keeps the seed-derived 4..=8). The auto count is
+    /// still drawn from the RNG either way, so the shared planets are identical
+    /// whether or not the count is forced — nudging the count just adds/removes
+    /// the outermost worlds instead of re-rolling the whole system.
+    pub fn generate_n(seed: u32, count_override: u32) -> System {
         let mut rng = Rng::new(seed ^ 0x5013_a1);
         let sun_kind = (rng.f() * SUNS.len() as f32) as usize % SUNS.len();
         // Bigger, cooler stars get a bigger disc.
@@ -372,7 +388,8 @@ impl System {
             _ => 48.0,
         };
 
-        let count = 4 + (rng.f() * 5.0) as usize; // 4..=8
+        let auto = 4 + (rng.f() * 5.0) as usize; // 4..=8
+        let count = if count_override > 0 { (count_override as usize).clamp(1, 16) } else { auto };
         let mut planets = Vec::with_capacity(count);
         // Orbits march outward from just past the corona with growing gaps.
         let mut orbit = sun_radius + 78.0;
@@ -416,12 +433,30 @@ impl System {
             orbit += radius + rng.range(58.0, 96.0) + i as f32 * 8.0;
         }
 
-        System { seed, sun_kind, sun_radius, planets }
+        System {
+            seed, sun_kind, sun_radius, planets,
+            spacing: 1.0, planet_size: 1.0, sun_size: 1.0, planet_pixel: 1.0, sun_pixel: 1.0,
+        }
     }
 
-    /// The outermost orbit radius (world units) — handy for framing / zoom-fit.
+    /// Apply the live view multipliers (from the web UI). Sizes/spacing are
+    /// clamped away from zero; pixel factors are >= 1 (1 = full detail).
+    pub fn set_view(&mut self, spacing: f32, planet_size: f32, sun_size: f32, planet_pixel: f32, sun_pixel: f32) {
+        self.spacing = spacing.max(0.05);
+        self.planet_size = planet_size.max(0.05);
+        self.sun_size = sun_size.max(0.05);
+        self.planet_pixel = planet_pixel.max(1.0);
+        self.sun_pixel = sun_pixel.max(1.0);
+    }
+
+    /// The outermost extent (world units) with the current view multipliers —
+    /// handy for framing / zoom-fit.
     pub fn extent(&self) -> f32 {
-        self.planets.last().map(|p| p.orbit + p.radius).unwrap_or(self.sun_radius) + 40.0
+        self.planets
+            .last()
+            .map(|p| p.orbit * self.spacing + p.radius * self.planet_size)
+            .unwrap_or(self.sun_radius * self.sun_size)
+            + 40.0
     }
 }
 
@@ -695,22 +730,35 @@ fn to_screen(wx: f32, wy: f32, cam: &Camera, w: u32, h: u32) -> (f32, f32) {
     )
 }
 
-/// Alpha-blend a tile centred at screen `(sx, sy)` into the RGBA `out`.
-fn blit(out: &mut [u8], w: u32, h: u32, tile: &Tile, sx: f32, sy: f32) {
-    let half = tile.size as f32 * 0.5;
-    let x0 = (sx - half).floor() as i32;
-    let y0 = (sy - half).floor() as i32;
-    for ty in 0..tile.size as i32 {
-        let dy = y0 + ty;
+/// Alpha-blend a tile centred at screen `(sx, sy)` into the RGBA `out`,
+/// nearest-neighbour scaled by `scale` (1.0 = 1:1). `scale > 1` blows each tile
+/// pixel up into a crisp `scale`×`scale` block — this is how per-body pixelation
+/// is applied: a body is rendered into a small tile, then upsized with hard
+/// edges, so it turns blocky without changing its on-screen size.
+fn blit(out: &mut [u8], w: u32, h: u32, tile: &Tile, sx: f32, sy: f32, scale: f32) {
+    let dsize = (tile.size as f32 * scale).round().max(1.0) as i32;
+    let x0 = (sx - dsize as f32 * 0.5).floor() as i32;
+    let y0 = (sy - dsize as f32 * 0.5).floor() as i32;
+    let inv = 1.0 / scale;
+    for ddy in 0..dsize {
+        let dy = y0 + ddy;
         if dy < 0 || dy >= h as i32 {
             continue;
         }
-        for tx in 0..tile.size as i32 {
-            let dx = x0 + tx;
+        let ty = ((ddy as f32 + 0.5) * inv) as u32;
+        if ty >= tile.size {
+            continue;
+        }
+        for ddx in 0..dsize {
+            let dx = x0 + ddx;
             if dx < 0 || dx >= w as i32 {
                 continue;
             }
-            let si = ((ty as u32 * tile.size + tx as u32) * 4) as usize;
+            let tx = ((ddx as f32 + 0.5) * inv) as u32;
+            if tx >= tile.size {
+                continue;
+            }
+            let si = ((ty * tile.size + tx) * 4) as usize;
             let a = tile.px[si + 3] as u32;
             if a == 0 {
                 continue;
@@ -768,7 +816,7 @@ fn paint_stars(out: &mut [u8], w: u32, h: u32, cam: &Camera) {
 }
 
 /// Dot in a planet's orbit path as a faint dashed ellipse around the sun.
-fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, p: &Planet) {
+fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, p: &Planet, spacing: f32) {
     let steps = 220;
     for k in 0..steps {
         // Dashed: skip every few samples.
@@ -777,8 +825,8 @@ fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, p: &Planet) {
         }
         let a = TAU * k as f32 / steps as f32;
         let (s, c) = a.sin_cos();
-        let wx = c * p.orbit;
-        let wy = s * p.orbit * ORBIT_FLATTEN * p.tilt;
+        let wx = c * p.orbit * spacing;
+        let wy = s * p.orbit * ORBIT_FLATTEN * p.tilt * spacing;
         let (sx, sy) = to_screen(wx, wy, cam, w, h);
         let (px, py) = (sx as i32, sy as i32);
         if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
@@ -803,7 +851,7 @@ pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, t: f32, out: &m
     assert!(out.len() >= (w * h * 4) as usize);
     paint_stars(out, w, h, cam);
     for p in &sys.planets {
-        paint_orbit(out, w, h, cam, p);
+        paint_orbit(out, w, h, cam, p, sys.spacing);
     }
 
     // Build a draw list of (depth, is_sun, planet_index). The sun sits at
@@ -811,7 +859,7 @@ pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, t: f32, out: &m
     let mut order: Vec<(f32, i32)> = Vec::with_capacity(sys.planets.len() + 1);
     order.push((0.0, -1)); // sun
     for (i, p) in sys.planets.iter().enumerate() {
-        let (_, _, depth) = p.at(t);
+        let (_, _, depth) = p.at(t, sys.spacing);
         order.push((depth, i as i32));
     }
     order.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -821,18 +869,21 @@ pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, t: f32, out: &m
 
     for (_, which) in order {
         if which < 0 {
-            // The star.
-            let rad_px = sys.sun_radius * cam.zoom;
+            // The star. Per-body pixelation: render the tile smaller by
+            // `sun_pixel`, then `blit` upsizes it by the same factor, so it
+            // stays the same on-screen size but turns blockier.
+            let rad_px = sys.sun_radius * sys.sun_size * cam.zoom;
             if rad_px < 0.5 {
                 continue;
             }
-            let tile = render_sun_tile(sun, sys.seed, t, rad_px);
-            blit(out, w, h, &tile, suncx, suncy);
+            let rad_render = (rad_px / sys.sun_pixel).max(2.0);
+            let tile = render_sun_tile(sun, sys.seed, t, rad_render);
+            blit(out, w, h, &tile, suncx, suncy, rad_px / rad_render);
         } else {
             let p = &sys.planets[which as usize];
-            let (wx, wy, _depth) = p.at(t);
+            let (wx, wy, _depth) = p.at(t, sys.spacing);
             let (sx, sy) = to_screen(wx, wy, cam, w, h);
-            let rad_px = p.radius * cam.zoom;
+            let rad_px = p.radius * sys.planet_size * cam.zoom;
             if rad_px < 0.5 {
                 continue;
             }
@@ -848,8 +899,9 @@ pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, t: f32, out: &m
 
             let pk = &PKINDS[p.kind];
             let spin_a = p.phase + p.spin * t * TAU; // axial rotation
-            let tile = render_planet_tile(pk, p.seed, spin_a, t, light, rad_px);
-            blit(out, w, h, &tile, sx, sy);
+            let rad_render = (rad_px / sys.planet_pixel).max(2.0);
+            let tile = render_planet_tile(pk, p.seed, spin_a, t, light, rad_render);
+            blit(out, w, h, &tile, sx, sy, rad_px / rad_render);
         }
     }
 }
@@ -859,7 +911,7 @@ pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, t: f32, out: &m
 pub fn planet_world_pos(sys: &System, i: usize, t: f32) -> (f32, f32) {
     match sys.planets.get(i) {
         Some(p) => {
-            let (x, y, _) = p.at(t);
+            let (x, y, _) = p.at(t, sys.spacing);
             (x, y)
         }
         None => (0.0, 0.0),
@@ -873,11 +925,11 @@ pub fn planet_nearest_center(sys: &System, w: u32, h: u32, cam: &Camera, t: f32)
     let mut best = -1i32;
     let mut best_d = f32::MAX;
     for (i, p) in sys.planets.iter().enumerate() {
-        let (wx, wy, _) = p.at(t);
+        let (wx, wy, _) = p.at(t, sys.spacing);
         let (sx, sy) = to_screen(wx, wy, cam, w, h);
         let d = (sx - ccx).powi(2) + (sy - ccy).powi(2);
         // Only count it if the centre is within ~2.5 body radii on screen.
-        let reach = (p.radius * cam.zoom * 2.5 + 24.0).powi(2);
+        let reach = (p.radius * sys.planet_size * cam.zoom * 2.5 + 24.0).powi(2);
         if d < best_d && d < reach {
             best_d = d;
             best = i as i32;

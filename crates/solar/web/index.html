@@ -32,40 +32,50 @@
     font-size: 12px; color: #6b7290; text-align: right; text-shadow: 0 1px 3px rgba(0,0,0,.9); letter-spacing: .03em; }
   .hint b { color: #aeb4cd; font-weight: 600; }
 
-  .bar { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 6;
-    display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: center;
-    padding: 10px 12px; border-radius: 14px; max-width: calc(100vw - 24px);
-    background: rgba(14,15,24,.82); border: 1px solid rgba(255,255,255,.08);
-    box-shadow: 0 10px 40px rgba(0,0,0,.6); backdrop-filter: blur(8px); }
-  .bar .seg { display: flex; align-items: center; gap: 6px; }
-  .bar label { font-size: 11px; color: #8790ad; letter-spacing: .04em; }
-  input[type=number] { width: 92px; padding: 7px 9px; font: inherit; font-size: 13px; color: #eef1f8;
-    background: #0e0f18; border: 1px solid rgba(255,255,255,.12); border-radius: 8px; }
-  input[type=range] { width: 120px; accent-color: #f4b74a; cursor: pointer; }
-  button { padding: 8px 13px; font: inherit; font-size: 13px; color: #d7dae6; background: #1a1c2b;
-    border: 1px solid rgba(255,255,255,.12); border-radius: 8px; cursor: pointer; white-space: nowrap; }
+  /* Control dock — docked bottom-right on desktop, collapsible. */
+  .dock { position: fixed; right: 16px; bottom: 16px; z-index: 6; width: 268px;
+    max-width: calc(100vw - 32px);
+    background: rgba(14,15,24,.86); border: 1px solid rgba(255,255,255,.08);
+    border-radius: 14px; box-shadow: 0 10px 40px rgba(0,0,0,.6); backdrop-filter: blur(9px); }
+  .dock-head { display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 12px; cursor: pointer; user-select: none; }
+  .dock-head span { font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: #8790ad; }
+  .dock-head .chev { color: #8790ad; transition: transform .18s; }
+  .dock.collapsed .chev { transform: rotate(180deg); }
+  .dock-body { max-height: min(64vh, 560px); overflow-y: auto; overscroll-behavior: contain;
+    padding: 2px 14px 14px; }
+  .dock.collapsed .dock-body { display: none; }
+
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row input[type=number] { flex: 1; }
+  .grp { font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: #565d78;
+    margin: 15px 0 8px; border-top: 1px solid rgba(255,255,255,.07); padding-top: 11px; }
+  .ctl { margin: 0 0 10px; }
+  .ctl label { display: flex; justify-content: space-between; font-size: 12px; color: #9aa0bb; margin-bottom: 4px; }
+  .ctl label b { color: #eef1f8; font-variant-numeric: tabular-nums; font-weight: 600; }
+  input[type=number] { width: 100%; box-sizing: border-box; padding: 8px 9px; font: inherit; font-size: 13px;
+    color: #eef1f8; background: #0e0f18; border: 1px solid rgba(255,255,255,.12); border-radius: 8px; }
+  input[type=range] { width: 100%; accent-color: #f4b74a; cursor: pointer; }
+  button { padding: 8px 12px; font: inherit; font-size: 13px; color: #d7dae6; background: #1a1c2b;
+    border: 1px solid rgba(255,255,255,.12); border-radius: 8px; cursor: pointer; white-space: nowrap;
+    -webkit-tap-highlight-color: transparent; }
   button:hover { background: #23263a; }
   button:active { transform: translateY(1px); }
   button.primary { color: #06060c; font-weight: 700; border: 0;
     background: linear-gradient(180deg, #ffe8b0, #f4b74a); }
-  .divider { width: 1px; align-self: stretch; background: rgba(255,255,255,.1); margin: 0 2px; }
-  .val { font-variant-numeric: tabular-nums; color: #eef1f8; font-size: 12px; min-width: 30px; text-align: right; }
+  button.wide { width: 100%; margin-top: 14px; }
   .err { position: fixed; inset: 0; display: none; place-items: center; text-align: center;
     color: #ff9a9a; padding: 40px; z-index: 10; }
 
-  /* Phones / small screens: tighten the chrome and drop the desktop hint. */
+  /* Phones / small screens: dock becomes a bottom sheet; drop the desktop hint. */
   @media (max-width: 700px), (pointer: coarse) {
     .topleft { top: 10px; left: 12px; }
     .topleft h1 { font-size: 10px; letter-spacing: .12em; }
     .viewing { font-size: 17px; margin-top: 5px; min-height: 22px; }
     .viewing small { font-size: 11px; }
     .hint { display: none; }
-    .bar { bottom: calc(10px + env(safe-area-inset-bottom)); gap: 6px; padding: 8px 10px; border-radius: 12px; }
-    .bar label { display: none; }
-    input[type=number] { width: 66px; padding: 8px; }
-    input[type=range] { width: 84px; }
-    button { padding: 9px 12px; }
-    .divider { display: none; }
+    .dock { left: 10px; right: 10px; bottom: calc(10px + env(safe-area-inset-bottom)); width: auto; }
+    .dock-body { max-height: 46vh; }
   }
 </style>
 </head>
@@ -80,27 +90,33 @@
   <b>drag</b> to pan · <b>scroll / pinch</b> to zoom<br><b>tap a planet</b> to follow it
 </div>
 
-<div class="bar">
-  <div class="seg">
-    <label>Seed</label>
-    <input type="number" id="seed" min="0" value="7" />
-    <button id="dice" title="random seed">🎲</button>
+<div class="dock" id="dock">
+  <div class="dock-head" id="dockHead">
+    <span>Controls</span><span class="chev">▾</span>
   </div>
-  <button class="primary" id="gen">✦ Generate</button>
-  <div class="divider"></div>
-  <div class="seg">
-    <label>Speed</label>
-    <input type="range" id="speed" min="0" max="4" step="0.1" value="1" />
-    <span class="val" id="speedV">1.0×</span>
+  <div class="dock-body">
+    <div class="row">
+      <input type="number" id="seed" min="0" value="7" title="seed" />
+      <button id="dice" title="random seed">🎲</button>
+      <button class="primary" id="gen">✦ Generate</button>
+    </div>
+
+    <div class="grp">Layout</div>
+    <div class="ctl"><label>Planets <b id="countV">—</b></label><input type="range" id="count" min="1" max="12" step="1" value="6" /></div>
+    <div class="ctl"><label>Planet spacing <b id="spacingV">1.00×</b></label><input type="range" id="spacing" min="0.4" max="2.5" step="0.05" value="1" /></div>
+    <div class="ctl"><label>Planet size <b id="psizeV">1.00×</b></label><input type="range" id="psize" min="0.3" max="3" step="0.05" value="1" /></div>
+    <div class="ctl"><label>Sun size <b id="ssizeV">1.00×</b></label><input type="range" id="ssize" min="0.3" max="3" step="0.05" value="1" /></div>
+
+    <div class="grp">Motion</div>
+    <div class="ctl"><label>Orbit speed <b id="speedV">1.0×</b></label><input type="range" id="speed" min="0" max="4" step="0.1" value="1" /></div>
+
+    <div class="grp">Pixelation</div>
+    <div class="ctl"><label>Scene <b id="pixV">1×</b></label><input type="range" id="pix" min="1" max="8" step="1" value="1" /></div>
+    <div class="ctl"><label>Planets <b id="ppixV">1×</b></label><input type="range" id="ppix" min="1" max="6" step="1" value="1" /></div>
+    <div class="ctl"><label>Sun <b id="spixV">1×</b></label><input type="range" id="spix" min="1" max="6" step="1" value="1" /></div>
+
+    <button class="wide" id="fit">⤢ Reset view</button>
   </div>
-  <div class="divider"></div>
-  <div class="seg">
-    <label>Pixel size</label>
-    <input type="range" id="pix" min="1" max="8" step="1" value="1" />
-    <span class="val" id="pixV">1×</span>
-  </div>
-  <div class="divider"></div>
-  <button id="fit">⤢ Reset view</button>
 </div>
 
 <div class="err" id="err"></div>
@@ -132,6 +148,12 @@ let follow = -1;                        // planet index the camera tracks, or -1
 let planetKinds = [], sunKind = 0, nPlanets = 0;
 let last = performance.now();
 let curW = 0, curH = 0, curZoom = 1;    // last frame's render dims + render-px/world
+
+// Manual overrides applied to the System without regenerating it (spacing,
+// sizes, per-body pixelation), plus the planet count (structural — needs a
+// rebuild). countAuto keeps the seed-derived count until the user sets one.
+let vSpacing = 1, vPsize = 1, vSsize = 1, vPpix = 1, vSpix = 1;
+let planetCount = 6, countAuto = true;
 
 // Base render-pixels per world unit at pix=1. `pix` divides this, so the
 // rendered detail density depends ONLY on the slider — never on zoom.
@@ -172,18 +194,33 @@ function fitView() {
   follow = -1;
 }
 
-function generate(s) {
+// Push the live view multipliers into the current system.
+function applyView() {
+  if (sys) wasm.system_set_view(sys, vSpacing, vPsize, vSsize, vPpix, vSpix);
+}
+
+// (Re)build the system for the current seed + planet count and re-apply the
+// view multipliers. Does NOT touch the camera — callers decide whether to fit.
+function buildSystem() {
   if (sys) wasm.system_free(sys);
-  seed = s >>> 0;
-  sys = wasm.system_new(seed);
+  sys = wasm.system_new_params(seed, countAuto ? 0 : planetCount);
   nPlanets = wasm.planet_count(sys);
   sunKind = wasm.sun_kind_of(sys);
   planetKinds = [];
   for (let i = 0; i < nPlanets; i++) planetKinds.push(wasm.planet_kind_at(sys, i));
+  if (countAuto) { planetCount = nPlanets; $("count").value = nPlanets; }
+  $("countV").textContent = nPlanets;
+  applyView();
+  $("sysinfo").textContent = `${SUN_NAMES[sunKind] ?? "star"} · ${nPlanets} planets · seed ${seed}`;
+}
+
+// A new seed: rebuild and re-frame the whole system.
+function generate(s) {
+  seed = s >>> 0;
+  $("seed").value = seed;
+  buildSystem();
   time = 0;
   fitView();
-  $("seed").value = seed;
-  $("sysinfo").textContent = `${SUN_NAMES[sunKind] ?? "star"} · ${nPlanets} planets · seed ${seed}`;
 }
 
 function frame(now) {
@@ -311,13 +348,32 @@ canvas.addEventListener("wheel", e => {
 }, { passive: false });
 
 // ---- controls --------------------------------------------------------------
+$("dockHead").addEventListener("click", () => $("dock").classList.toggle("collapsed"));
+
 $("gen").addEventListener("click", () => generate((parseInt($("seed").value) || 0)));
-$("dice").addEventListener("click", () => { const s = (Math.random() * 0xffffff) >>> 0; $("seed").value = s; generate(s); });
+$("dice").addEventListener("click", () => generate((Math.random() * 0xffffff) >>> 0));
 $("seed").addEventListener("change", () => generate((parseInt($("seed").value) || 0)));
 $("fit").addEventListener("click", fitView);
+
+// Planet count is structural → rebuild (keep the camera). Once set, it sticks
+// across new seeds (countAuto stays off).
+$("count").addEventListener("input", () => {
+  planetCount = parseInt($("count").value) || 1; countAuto = false;
+  $("countV").textContent = planetCount; buildSystem();
+});
+
+// Live view multipliers: rescale the existing system, no rebuild, no re-frame.
+const liveMul = (id, valId, set, fmt) => $(id).addEventListener("input", () => {
+  const v = parseFloat($(id).value); set(v); $(valId).textContent = fmt(v); applyView();
+});
+liveMul("spacing", "spacingV", v => vSpacing = v, v => v.toFixed(2) + "×");
+liveMul("psize", "psizeV", v => vPsize = v, v => v.toFixed(2) + "×");
+liveMul("ssize", "ssizeV", v => vSsize = v, v => v.toFixed(2) + "×");
+liveMul("ppix", "ppixV", v => vPpix = v, v => v + "×");
+liveMul("spix", "spixV", v => vSpix = v, v => v + "×");
+
+// Purely JS-side: animation rate and scene render density.
 $("speed").addEventListener("input", () => { speed = parseFloat($("speed").value); $("speedV").textContent = speed.toFixed(1) + "×"; });
-// Pixel size only changes render density — framing/zoom are untouched, and the
-// frame loop resizes the buffer on its own, so nothing else to do here.
 $("pix").addEventListener("input", () => { pix = parseInt($("pix").value) || 1; $("pixV").textContent = pix + "×"; });
 window.addEventListener("resize", setupCanvas);
 
