@@ -290,9 +290,11 @@ let gestureMoved = false, gesturePinched = false, gestureCount = 0;
 
 function startPinch() {
   const [a, b] = [...pointers.values()];
-  const r = canvas.getBoundingClientRect();
-  const [wx, wy] = toWorld((a.x + b.x) / 2 - r.left, (a.y + b.y) / 2 - r.top);
-  pinch = { dist: Math.hypot(a.x - b.x, a.y - b.y) || 1, zoom: cam.zoom, wx, wy };
+  pinch = {
+    dist: Math.hypot(a.x - b.x, a.y - b.y) || 1, zoom: cam.zoom,
+    mx0: (a.x + b.x) / 2, my0: (a.y + b.y) / 2, // client-px midpoint at start
+    camx0: cam.x, camy0: cam.y,
+  };
   gesturePinched = true; panLast = null; follow = -1;
 }
 
@@ -312,13 +314,13 @@ canvas.addEventListener("pointermove", e => {
 
   if (pointers.size >= 2 && pinch) {                 // two-finger pinch: zoom + pan
     const [a, b] = [...pointers.values()];
-    const r = canvas.getBoundingClientRect();
-    const mx = (a.x + b.x) / 2 - r.left, my = (a.y + b.y) / 2 - r.top;
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2; // client px
     const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+    // Zoom about the camera CENTRE (the zoom itself never moves cam); a
+    // two-finger drag pans by the midpoint movement.
     cam.zoom = clampZoom(pinch.zoom * dist / pinch.dist);
-    // Pin the world point captured at gesture start to the current midpoint.
-    cam.x = pinch.wx - (mx - canvas.width / 2) / cam.zoom;
-    cam.y = pinch.wy - (my - canvas.height / 2) / cam.zoom;
+    cam.x = pinch.camx0 - (mx - pinch.mx0) / cam.zoom;
+    cam.y = pinch.camy0 - (my - pinch.my0) / cam.zoom;
     gestureMoved = true;
     return;
   }
@@ -354,13 +356,10 @@ canvas.addEventListener("pointercancel", liftPointer);
 
 canvas.addEventListener("wheel", e => {
   e.preventDefault();
-  const [lx, ly] = localPt(e);
-  const [wx, wy] = toWorld(lx, ly);                  // point under cursor stays fixed
+  // Zoom about the camera CENTRE: only the zoom changes, cam stays put. This
+  // keeps the whole scene (and the background parallax anchor) centred, so the
+  // parallax doesn't lurch when the system is panned off-centre.
   cam.zoom = clampZoom(cam.zoom * Math.exp(-e.deltaY * 0.0015));
-  if (follow < 0) {
-    cam.x = wx - (lx - canvas.width / 2) / cam.zoom;
-    cam.y = wy - (ly - canvas.height / 2) / cam.zoom;
-  }
 }, { passive: false });
 
 // ---- controls --------------------------------------------------------------

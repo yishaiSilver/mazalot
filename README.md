@@ -100,15 +100,19 @@ system view needs). The new work is the layer on top:
   worlds show crescent → gibbous phases depending on where they are in orbit.
 - **Depth sorting** — planets are drawn back-to-front by orbital depth, so one on
   the far side is occluded by the sun and one on the near side passes in front.
-- **Draggable camera** — a world→screen camera with pan + zoom-to-cursor.
+- **Draggable camera** — a world→screen camera; drag to pan, zoom about the
+  viewport centre (keeps the scene + parallax anchored no matter where you've
+  panned).
 - **Space background** — a faint seed-colored **nebula** (baked at low res each
   frame → pixel-art clouds) plus three **parallax** star layers with temperature
-  colors. Each layer is a fixed *screen-space* grid that scrolls at its own rate
-  on **pan** (slower than the central star) and does not scale on **zoom**, so
-  the on-screen star **count stays roughly constant** whether you zoom in or out
-  (and there's no swim). A **Star density** control scales how many there are.
-  Stars are drawn by iterating the visible grid cells and plotting one pixel each
-  — O(cells), not O(pixels). The far layer and the nebula fade out (and are
+  colors. Each layer is a distant plane anchored at the viewport centre: it
+  scrolls slower than the central star on **pan** (rate `cam·p`), and on **zoom**
+  it scales by a *reduced* `z^p` (p < 1) instead of the foreground's `z` — so the
+  stars trail the system as you zoom rather than racing ahead, and the density
+  grows only mildly instead of walling up. **Star density** and **star parallax**
+  controls tune the count and scroll rate. Stars are 1px points plotted by
+  iterating the visible grid cells — O(cells), not O(pixels), with a cell-count
+  cap so cost stays bounded. The far layer and the nebula fade out (and are
   skipped) when you zoom in on a body.
 - **Click to follow** — click a planet and the camera locks on and tracks it
   around its orbit; drag anywhere to release.
