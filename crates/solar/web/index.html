@@ -119,6 +119,9 @@
     <div class="ctl"><label>Planet detail cap <b id="pdetV">160</b></label><input type="range" id="pdet" min="16" max="256" step="8" value="160" /></div>
     <div class="ctl"><label>Sun detail cap <b id="sdetV">110</b></label><input type="range" id="sdet" min="16" max="176" step="8" value="110" /></div>
 
+    <div class="grp">Background</div>
+    <div class="ctl"><label>Star density <b id="sdenV">0.50×</b></label><input type="range" id="sden" min="0" max="2" step="0.05" value="0.5" /></div>
+
     <button class="wide" id="fit">⤢ Reset view</button>
   </div>
 </div>
@@ -164,7 +167,7 @@ let curW = 0, curH = 0, curZoom = 1;    // last frame's render dims + render-px/
 // sizes, per-body pixelation, per-body detail caps), plus the planet count
 // (structural — needs a rebuild). countAuto keeps the seed-derived count until
 // the user sets one.
-let vSpacing = 1, vPsize = 1, vSsize = 1, vPpix = 1, vSpix = 1, vPdetail = 160, vSdetail = 110;
+let vSpacing = 1, vPsize = 1, vSsize = 1, vPpix = 1, vSpix = 1, vPdetail = 160, vSdetail = 110, vStarDen = 0.5;
 let planetCount = 6, countAuto = true;
 
 // Per-frame pixel-budget cap (perf): a phone renders far fewer pixels than a
@@ -206,7 +209,7 @@ function fitView() {
 
 // Push the live view multipliers + detail caps into the current system.
 function applyView() {
-  if (sys) wasm.system_set_view(sys, vSpacing, vPsize, vSsize, vPpix, vSpix, vPdetail, vSdetail);
+  if (sys) wasm.system_set_view(sys, vSpacing, vPsize, vSsize, vPpix, vSpix, vPdetail, vSdetail, vStarDen);
 }
 
 // (Re)build the system for the current seed + planet count and re-apply the
@@ -394,6 +397,7 @@ $("pix").addEventListener("input", () => { pix = parseInt($("pix").value) || 1; 
 // Detail caps (the "lower bound of pixelation"): live view params, no rebuild.
 liveMul("pdet", "pdetV", v => vPdetail = v, v => String(v | 0));
 liveMul("sdet", "sdetV", v => vSdetail = v, v => String(v | 0));
+liveMul("sden", "sdenV", v => vStarDen = v, v => v.toFixed(2) + "×");
 window.addEventListener("resize", setupCanvas);
 
 async function main() {

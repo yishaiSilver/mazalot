@@ -364,6 +364,8 @@ pub struct System {
     // in before it stays pixelated" floor; smaller = coarser detail sooner ---
     pub planet_detail: f32,
     pub sun_detail: f32,
+    // Background star density (0 = none, 1 = default field, higher = more).
+    pub star_density: f32,
 }
 
 /// How much orbits are squashed vertically to fake a tilted, near-top-down view.
@@ -440,7 +442,7 @@ impl System {
         System {
             seed, sun_kind, sun_radius, planets,
             spacing: 1.0, planet_size: 1.0, sun_size: 1.0, planet_pixel: 1.0, sun_pixel: 1.0,
-            planet_detail: 160.0, sun_detail: 110.0,
+            planet_detail: 160.0, sun_detail: 110.0, star_density: 0.5,
         }
     }
 
@@ -458,6 +460,7 @@ impl System {
         sun_pixel: f32,
         planet_detail: f32,
         sun_detail: f32,
+        star_density: f32,
     ) {
         self.spacing = spacing.max(0.05);
         self.planet_size = planet_size.max(0.05);
@@ -466,6 +469,7 @@ impl System {
         self.sun_pixel = sun_pixel.max(1.0);
         self.planet_detail = planet_detail.clamp(6.0, 256.0);
         self.sun_detail = sun_detail.clamp(6.0, 180.0);
+        self.star_density = star_density.clamp(0.0, 4.0);
     }
 
     /// The outermost extent (world units) with the current view multipliers —
@@ -835,20 +839,14 @@ fn star_tint(hh: f32) -> Rgb {
 /// still parallax-scrolling as you pan. To stay cheap AND uncluttered when
 /// zoomed in, the far star layer and the whole nebula fade out (and are skipped
 /// entirely) past a couple of zoom steps — you're focused on a body then anyway.
-fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32) {
+fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32, density: f32) {
     let z = cam.zoom;
-    let invz = 1.0 / z;
-    let (cx0, cy0) = (w as f32 * 0.5, h as f32 * 0.5);
     let si = seed as i32;
-    // The background is a distant field sampled in WORLD space at a
-    // parallax-reduced camera position `cam·p` (p well below 1). It therefore
-    // SCALES with the scene on zoom — receding (denser) as you zoom out, thinning
-    // as you zoom in, so it reads as a backdrop rather than a foreground pane —
-    // and PANS slower than the central star. Because it scales about the view
-    // centre (not a uniform screen translation), zoom never makes it swim, and
-    // each star is a single fixed pixel so world sampling can't balloon into
-    // squares. Zoom also drives a fade that declutters/skips the far layer +
-    // nebula when you're zoomed in on a body.
+    // A fixed SCREEN-SPACE backdrop: each layer is a grid of fixed pixel spacing
+    // that scrolls at its own rate `p` on PAN (slower than the central star) and
+    // does NOT scale on zoom. So the number of stars on screen is ~constant
+    // whether you zoom in or out (and there's no swim). `density` scales how many
+    // stars there are (0 = none). The far layer + nebula fade when you zoom in.
     let far_amt = 1.0 - smoothstep(3.0, 9.0, z);
     let neb_amt = 1.0 - smoothstep(2.5, 7.0, z);
 
@@ -860,19 +858,14 @@ fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32) {
     if neb_amt > 0.02 {
         let ta = NEB_TINTS[(hash3(si, 1, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
         let tb = NEB_TINTS[(hash3(si, 2, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
-        let np = 0.07; // nebula parallax (farthest, slowest)
+        let np = 0.09; // nebula scroll rate (slowest)
         let (nox, noy) = (cam.x * np + hash3(si, 5, 2) * 500.0, cam.y * np + hash3(si, 6, 2) * 500.0);
-        let f = 1.0 / 460.0;
-        // Clamp how far the nebula zooms out so its soft clouds never turn into
-        // high-frequency blocky noise when the whole system is a speck (it just
-        // stops scaling past this — stars still recede to carry the depth cue).
-        let nz = invz.min(2.2);
+        let f = 1.0 / 240.0;
         neb = vec![[0.0f32; 3]; (nw * nh) as usize];
         for cy in 0..nh {
             for cx in 0..nw {
-                // World position of this cell on the parallax-reduced plane.
-                let gx = (nox + ((cx * CELL) as f32 - cx0) * nz) * f;
-                let gy = (noy + ((cy * CELL) as f32 - cy0) * nz) * f;
+                let gx = ((cx * CELL) as f32 + nox) * f;
+                let gy = ((cy * CELL) as f32 + noy) * f;
                 let dens = smoothstep(0.50, 0.74, fbm(gx, gy, 4.2, 3)); // patchy -> not crowded
                 if dens > 0.0 {
                     let n2 = fbm(gx * 1.8 + 40.0, gy * 1.8 + 7.0, 1.5, 2);
@@ -904,34 +897,32 @@ fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32) {
         }
     }
 
-    // --- pass 2: stars. Each layer is a WORLD-space grid sampled at the
-    // parallax-reduced camera `cam·p`. We iterate the visible cells and plot one
-    // pixel per star — O(cells), not O(pixels). Because it's world space the
-    // field scales with zoom (recedes/densifies as you zoom out); `p` well below
-    // 1 makes it pan slower than the central star. The far layer fades on
-    // zoom-in. To bound cost when zoomed far out, the grid is coarsened only once
-    // a layer would exceed ~CELL_CAP cells across (stars just thin out then).
-    // (parallax p, base world grid, density threshold, brightness, salt)
-    const CELL_CAP: f32 = 300.0;
-    let coarsen = (w.max(h) as f32 * invz) / CELL_CAP;
+    // --- pass 2: stars. Each layer is a fixed screen-space grid (spacing `sp`
+    // px) scrolled by `cam·p`. Iterate the visible cells, plot one pixel per star
+    // — O(cells), not O(pixels). Fixed screen spacing => the on-screen count is
+    // constant across zoom; `density` scales each layer's hit rate.
+    // (parallax p, screen grid px, base threshold, brightness, salt)
+    let d = density.max(0.0);
     let layers: [(f32, f32, f32, f32, i32); 3] = [
-        (0.12, 7.0, 0.72, 0.55, 0),  // far  — slow, dim
-        (0.26, 9.0, 0.75, 0.80, 1),  // mid
-        (0.45, 12.0, 0.78, 1.00, 2), // near — most parallax, brightest (still < sun)
+        (0.13, 6.0, 0.80, 0.55, 0),  // far  — slow, dim
+        (0.28, 8.0, 0.83, 0.80, 1),  // mid
+        (0.45, 11.0, 0.86, 1.00, 2), // near — most parallax, brightest (still < sun)
     ];
     let (wi, hi) = (w as i32, h as i32);
-    for (p, g0, thr, bri, salt) in layers {
+    for (p, sp, base_thr, bri, salt) in layers {
         if salt == 0 && far_amt <= 0.02 {
             continue;
         }
+        // Scale the star fraction by `density`: fraction ≈ (1 - base_thr) · d.
+        let thr = 1.0 - (1.0 - base_thr) * d;
+        if thr >= 0.9999 {
+            continue; // density ~0 -> no stars in this layer
+        }
         let amt = if salt == 0 { far_amt } else { 1.0 };
-        let g = g0.max(coarsen);
-        let (cxp, cyp) = (cam.x * p, cam.y * p);
-        // Visible world range on this layer's plane → cell index bounds.
-        let (minx, maxx) = (cxp - cx0 * invz, cxp + cx0 * invz);
-        let (miny, maxy) = (cyp - cy0 * invz, cyp + cy0 * invz);
-        let (c0x, c1x) = ((minx / g).floor() as i32 - 1, (maxx / g).floor() as i32 + 1);
-        let (c0y, c1y) = ((miny / g).floor() as i32 - 1, (maxy / g).floor() as i32 + 1);
+        let inv = 1.0 / sp;
+        let (ox, oy) = (cam.x * p, cam.y * p); // screen-space scroll offset (no zoom)
+        let (c0x, c1x) = ((ox * inv).floor() as i32 - 1, ((ox + w as f32) * inv).floor() as i32 + 1);
+        let (c0y, c1y) = ((oy * inv).floor() as i32 - 1, ((oy + h as f32) * inv).floor() as i32 + 1);
         for cy in c0y..=c1y {
             for cx in c0x..=c1x {
                 let hh = hash3(cx, cy, 17 + salt);
@@ -940,9 +931,8 @@ fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32) {
                 }
                 let jx = (hh * 137.0).fract(); // jitter across the cell, [0,1)
                 let jy = (hh * 71.3 + 0.37).fract();
-                // World position -> screen (scales with zoom, panned by cam·p).
-                let px = (cx0 + ((cx as f32 + jx) * g - cxp) * z).floor() as i32;
-                let py = (cy0 + ((cy as f32 + jy) * g - cyp) * z).floor() as i32;
+                let px = ((cx as f32 + jx) * sp - ox).floor() as i32;
+                let py = ((cy as f32 + jy) * sp - oy).floor() as i32;
                 if px < 0 || py < 0 || px >= wi || py >= hi {
                     continue;
                 }
@@ -995,7 +985,7 @@ fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, p: &Planet, spacing
 #[allow(clippy::too_many_arguments)]
 pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin: f32, t_sun: f32, out: &mut [u8]) {
     assert!(out.len() >= (w * h * 4) as usize);
-    paint_background(out, w, h, cam, sys.seed);
+    paint_background(out, w, h, cam, sys.seed, sys.star_density);
     for p in &sys.planets {
         paint_orbit(out, w, h, cam, p, sys.spacing);
     }

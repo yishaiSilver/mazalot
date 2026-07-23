@@ -60,9 +60,12 @@ pub extern "C" fn system_set_view(
     sun_pixel: f32,
     planet_detail: f32,
     sun_detail: f32,
+    star_density: f32,
 ) {
     let sys = unsafe { &mut *sys };
-    sys.set_view(spacing, planet_size, sun_size, planet_pixel, sun_pixel, planet_detail, sun_detail);
+    sys.set_view(
+        spacing, planet_size, sun_size, planet_pixel, sun_pixel, planet_detail, sun_detail, star_density,
+    );
 }
 
 /// Free a system previously returned by [`system_new`].

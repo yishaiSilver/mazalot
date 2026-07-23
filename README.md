@@ -103,16 +103,13 @@ system view needs). The new work is the layer on top:
 - **Draggable camera** — a world→screen camera with pan + zoom-to-cursor.
 - **Space background** — a faint seed-colored **nebula** (baked at low res each
   frame → pixel-art clouds) plus three **parallax** star layers with temperature
-  colors. Each layer is a *world-space* field sampled at a parallax-reduced
-  camera position `cam·p` (p ≪ 1), so it **pans** slower than the central star
-  and **scales with the scene on zoom** — receding (densifying) as you zoom out,
-  thinning as you zoom in, so it reads as a backdrop, not a foreground pane.
-  Because it scales about the view centre rather than translating, zoom never
-  makes it swim; each star is a single fixed pixel, so world sampling can't
-  balloon into squares. Stars are drawn by iterating the visible grid cells (a
-  few thousand) and plotting one pixel each — O(cells), not O(pixels), with a
-  cell-count cap so cost stays bounded when zoomed far out. The far layer and the
-  nebula fade out (and are skipped) when you zoom in on a body.
+  colors. Each layer is a fixed *screen-space* grid that scrolls at its own rate
+  on **pan** (slower than the central star) and does not scale on **zoom**, so
+  the on-screen star **count stays roughly constant** whether you zoom in or out
+  (and there's no swim). A **Star density** control scales how many there are.
+  Stars are drawn by iterating the visible grid cells and plotting one pixel each
+  — O(cells), not O(pixels). The far layer and the nebula fade out (and are
+  skipped) when you zoom in on a body.
 - **Click to follow** — click a planet and the camera locks on and tracks it
   around its orbit; drag anywhere to release.
 
@@ -168,6 +165,8 @@ manual overrides:
   (planets and sun separately): the "lower bound of pixelation" — how far you can
   zoom before a body stops resolving finer and just enlarges its blocks. Lower
   caps also keep zoomed-in views cheap.
+- **Background** — **star density** (how many background stars, constant across
+  zoom).
 
 Sizes/spacing/pixelation/detail-caps are live view params applied to the system
 (`system_set_view`) with no regeneration; only seed and planet count rebuild it.
