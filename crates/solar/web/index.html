@@ -350,7 +350,9 @@ canvas.addEventListener("wheel", e => {
 // ---- controls --------------------------------------------------------------
 $("dockHead").addEventListener("click", () => $("dock").classList.toggle("collapsed"));
 
-$("gen").addEventListener("click", () => generate((parseInt($("seed").value) || 0)));
+// Generate makes a NEW random system each click; the dice does the same. Type a
+// number in the seed field to load a specific system instead.
+$("gen").addEventListener("click", () => generate((Math.random() * 0xffffff) >>> 0));
 $("dice").addEventListener("click", () => generate((Math.random() * 0xffffff) >>> 0));
 $("seed").addEventListener("change", () => generate((parseInt($("seed").value) || 0)));
 $("fit").addEventListener("click", fitView);
