@@ -366,6 +366,9 @@ pub struct System {
     pub sun_detail: f32,
     // Background star density (0 = none, 1 = default field, higher = more).
     pub star_density: f32,
+    // Background pan-parallax rate multiplier (scales every layer's scroll rate
+    // `p`; 0 = stars fixed on pan, 1 = default).
+    pub star_parallax: f32,
 }
 
 /// How much orbits are squashed vertically to fake a tilted, near-top-down view.
@@ -442,7 +445,7 @@ impl System {
         System {
             seed, sun_kind, sun_radius, planets,
             spacing: 1.0, planet_size: 1.0, sun_size: 1.0, planet_pixel: 1.0, sun_pixel: 1.0,
-            planet_detail: 160.0, sun_detail: 110.0, star_density: 0.5,
+            planet_detail: 160.0, sun_detail: 110.0, star_density: 0.5, star_parallax: 1.0,
         }
     }
 
@@ -461,6 +464,7 @@ impl System {
         planet_detail: f32,
         sun_detail: f32,
         star_density: f32,
+        star_parallax: f32,
     ) {
         self.spacing = spacing.max(0.05);
         self.planet_size = planet_size.max(0.05);
@@ -470,6 +474,7 @@ impl System {
         self.planet_detail = planet_detail.clamp(6.0, 256.0);
         self.sun_detail = sun_detail.clamp(6.0, 180.0);
         self.star_density = star_density.clamp(0.0, 4.0);
+        self.star_parallax = star_parallax.clamp(0.0, 4.0);
     }
 
     /// The outermost extent (world units) with the current view multipliers —
@@ -839,7 +844,7 @@ fn star_tint(hh: f32) -> Rgb {
 /// still parallax-scrolling as you pan. To stay cheap AND uncluttered when
 /// zoomed in, the far star layer and the whole nebula fade out (and are skipped
 /// entirely) past a couple of zoom steps — you're focused on a body then anyway.
-fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32, density: f32) {
+fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32, density: f32, parallax: f32) {
     let z = cam.zoom;
     let si = seed as i32;
     // A fixed SCREEN-SPACE backdrop: each layer is a grid of fixed pixel spacing
@@ -858,7 +863,7 @@ fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32, den
     if neb_amt > 0.02 {
         let ta = NEB_TINTS[(hash3(si, 1, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
         let tb = NEB_TINTS[(hash3(si, 2, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
-        let np = 0.09; // nebula scroll rate (slowest)
+        let np = 0.09 * parallax; // nebula scroll rate (slowest)
         let (nox, noy) = (cam.x * np + hash3(si, 5, 2) * 500.0, cam.y * np + hash3(si, 6, 2) * 500.0);
         let f = 1.0 / 240.0;
         neb = vec![[0.0f32; 3]; (nw * nh) as usize];
@@ -920,7 +925,8 @@ fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32, den
         }
         let amt = if salt == 0 { far_amt } else { 1.0 };
         let inv = 1.0 / sp;
-        let (ox, oy) = (cam.x * p, cam.y * p); // screen-space scroll offset (no zoom)
+        // Screen-space scroll offset (no zoom), scaled by the parallax control.
+        let (ox, oy) = (cam.x * p * parallax, cam.y * p * parallax);
         let (c0x, c1x) = ((ox * inv).floor() as i32 - 1, ((ox + w as f32) * inv).floor() as i32 + 1);
         let (c0y, c1y) = ((oy * inv).floor() as i32 - 1, ((oy + h as f32) * inv).floor() as i32 + 1);
         for cy in c0y..=c1y {
@@ -985,7 +991,7 @@ fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, p: &Planet, spacing
 #[allow(clippy::too_many_arguments)]
 pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin: f32, t_sun: f32, out: &mut [u8]) {
     assert!(out.len() >= (w * h * 4) as usize);
-    paint_background(out, w, h, cam, sys.seed, sys.star_density);
+    paint_background(out, w, h, cam, sys.seed, sys.star_density, sys.star_parallax);
     for p in &sys.planets {
         paint_orbit(out, w, h, cam, p, sys.spacing);
     }

@@ -166,7 +166,8 @@ manual overrides:
   zoom before a body stops resolving finer and just enlarges its blocks. Lower
   caps also keep zoomed-in views cheap.
 - **Background** — **star density** (how many background stars, constant across
-  zoom).
+  zoom) and **star parallax** (scroll-rate multiplier: 0 pins the stars on pan,
+  higher makes them scroll faster / feel closer).
 
 Sizes/spacing/pixelation/detail-caps are live view params applied to the system
 (`system_set_view`) with no regeneration; only seed and planet count rebuild it.

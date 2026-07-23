@@ -121,6 +121,7 @@
 
     <div class="grp">Background</div>
     <div class="ctl"><label>Star density <b id="sdenV">0.50×</b></label><input type="range" id="sden" min="0" max="2" step="0.05" value="0.5" /></div>
+    <div class="ctl"><label>Star parallax <b id="sparV">1.00×</b></label><input type="range" id="spar" min="0" max="3" step="0.05" value="1" /></div>
 
     <button class="wide" id="fit">⤢ Reset view</button>
   </div>
@@ -167,7 +168,7 @@ let curW = 0, curH = 0, curZoom = 1;    // last frame's render dims + render-px/
 // sizes, per-body pixelation, per-body detail caps), plus the planet count
 // (structural — needs a rebuild). countAuto keeps the seed-derived count until
 // the user sets one.
-let vSpacing = 1, vPsize = 1, vSsize = 1, vPpix = 1, vSpix = 1, vPdetail = 160, vSdetail = 110, vStarDen = 0.5;
+let vSpacing = 1, vPsize = 1, vSsize = 1, vPpix = 1, vSpix = 1, vPdetail = 160, vSdetail = 110, vStarDen = 0.5, vStarPar = 1;
 let planetCount = 6, countAuto = true;
 
 // Per-frame pixel-budget cap (perf): a phone renders far fewer pixels than a
@@ -209,7 +210,7 @@ function fitView() {
 
 // Push the live view multipliers + detail caps into the current system.
 function applyView() {
-  if (sys) wasm.system_set_view(sys, vSpacing, vPsize, vSsize, vPpix, vSpix, vPdetail, vSdetail, vStarDen);
+  if (sys) wasm.system_set_view(sys, vSpacing, vPsize, vSsize, vPpix, vSpix, vPdetail, vSdetail, vStarDen, vStarPar);
 }
 
 // (Re)build the system for the current seed + planet count and re-apply the
@@ -398,6 +399,7 @@ $("pix").addEventListener("input", () => { pix = parseInt($("pix").value) || 1; 
 liveMul("pdet", "pdetV", v => vPdetail = v, v => String(v | 0));
 liveMul("sdet", "sdetV", v => vSdetail = v, v => String(v | 0));
 liveMul("sden", "sdenV", v => vStarDen = v, v => v.toFixed(2) + "×");
+liveMul("spar", "sparV", v => vStarPar = v, v => v.toFixed(2) + "×");
 window.addEventListener("resize", setupCanvas);
 
 async function main() {
