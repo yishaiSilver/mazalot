@@ -1201,13 +1201,17 @@ fn draw(a: &Alien, s: f32, s2: f32, blink: bool) -> RgbaImage {
         img_dot(&mut img, sc, tipx, tipy, 1.0, [1.0, 0.95, 0.5]);
         img_dot(&mut img, sc, tipx - 0.5, tipy - 0.5, 0.4, [1.0, 1.0, 0.92]);
     }
-    // bioluminescent spots — brighten/dim with the idle loop
+    // bioluminescent spots — brighten/dim with the idle loop, and ride the body's
+    // breathing so they stay pinned to it (same rx/ry swell body_blob uses above).
     if a.biolum_n > 0 {
         let pulse = (0.6 + 0.4 * s).clamp(0.0, 1.0); // s in [-1,1]
         let core = lighter(a.biolum_col, 0.25 * pulse);
         let halo = mix(darker(a.biolum_col, 0.45), a.biolum_col, pulse);
+        let (bx, by) = (1.0 + 0.02 * s2, 1.0 + 0.05 * s2);
         for i in 0..a.biolum_n as usize {
-            let (xi, yi) = (a.biolum_spots[i].0, a.biolum_spots[i].1);
+            // spot offset from the body centre, scaled by the current breath
+            let xi = a.body.cx + (a.biolum_spots[i].0 - a.body.cx) * bx;
+            let yi = a.body.cy + (a.biolum_spots[i].1 - a.body.cy) * by;
             img_dot(&mut img, sc, xi, yi, 1.0, halo);
             img_dot(&mut img, sc, xi, yi, 0.5, core);
         }
