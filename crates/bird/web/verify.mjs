@@ -5,10 +5,12 @@ const w = instance.exports;
 const size = 120, len = size * size * 4, bg = [10, 9, 16];
 const ptr = w.alloc(len);
 console.log('native_grid =', w.native_grid());
+const detail = w.default_detail ? w.default_detail() : 1.0;
+console.log('default_detail =', detail);
 // render a few frames/seeds; ensure a creature actually draws and animates
 let frameCounts = [];
 for (const ph of [0.0, 0.25, 0.5, 0.75]) {
-  w.render(ptr, size, 9001, ph, 0.5);
+  w.render(ptr, size, 9001, ph, 0.5, detail);
   const mem = new Uint8Array(w.memory.buffer, ptr, len);
   let n = 0;
   for (let i = 0; i < len; i += 4)

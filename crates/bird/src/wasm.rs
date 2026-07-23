@@ -27,15 +27,22 @@ pub extern "C" fn dealloc(ptr: *mut u8, len: usize) {
 }
 
 /// Render one animated creature frame (RGBA) into the buffer at `ptr`.
-/// `phase` in [0,1) drives the idle loop; `energy` scales idle motion.
+/// `phase` in [0,1) drives the idle loop; `energy` scales idle motion; `detail`
+/// is the supersample factor (1.0 = chunky, 2.0 = finer pixels, …).
 #[no_mangle]
-pub extern "C" fn render(ptr: *mut u8, size: u32, seed: u32, phase: f32, energy: f32) {
+pub extern "C" fn render(ptr: *mut u8, size: u32, seed: u32, phase: f32, energy: f32, detail: f32) {
     let out = unsafe { slice::from_raw_parts_mut(ptr, (size * size * 4) as usize) };
-    crate::render_rgba(size, seed, phase, energy, out);
+    crate::render_rgba(size, seed, phase, energy, detail, out);
 }
 
-/// Native grid resolution the creature is drawn at (before upscaling).
+/// Design-space grid resolution the creature geometry is authored in.
 #[no_mangle]
 pub extern "C" fn native_grid() -> u32 {
     crate::GRID
+}
+
+/// Default detail (supersample) factor the UI should start at.
+#[no_mangle]
+pub extern "C" fn default_detail() -> f32 {
+    crate::DEFAULT_DETAIL
 }

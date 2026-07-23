@@ -30,7 +30,7 @@ bird crates; birds never touch the planet crates.
 |-------|------------|
 | `bird-core/` (`bird-core`) | Procedural alien/bird creature generation — structural randomness (body plans, features, palettes), not just recolor. **Pure, zero dependencies.** |
 | `bird/` (`bird`) | Native generators. `--bin alien` (hybrid alien "genus" families, animated) and `--bin bird` (naturalistic earth birds). |
-| `bird-web/` (`bird-web`) | Rust → WASM (raw cdylib, no wasm-bindgen). Renders a live creature on a canvas. |
+| `bird-web/` (`bird-web`) | Rust → WASM (raw cdylib, no wasm-bindgen). Renders a live creature on a canvas, with a **Detail** slider that varies the pixelation live (supersamples the same art from chunky to fine). |
 
 ## The planet system
 

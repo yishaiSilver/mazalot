@@ -54,7 +54,8 @@
     </div>
     <div class="ctl"><label>Idle energy <b id="enV">0.50</b></label><input type="range" id="en" min="0" max="1.5" step="0.05" value="0.5" /></div>
     <div class="ctl"><label>Loop speed <b id="spV">0.020</b></label><input type="range" id="sp" min="0" max="0.06" step="0.002" value="0.02" /></div>
-    <div class="ctl"><label>Resolution <b id="resV">120</b></label><input type="range" id="res" min="30" max="300" step="30" value="120" /></div>
+    <div class="ctl"><label>Detail <b id="dtV">2.0</b></label><input type="range" id="dt" min="1" max="4" step="0.5" value="2" /></div>
+    <div class="ctl"><label>Resolution <b id="resV">180</b></label><input type="range" id="res" min="30" max="360" step="30" value="180" /></div>
   </div>
   <div class="foot">rendered live in <code>bird.wasm</code> — same code as the native generator · <span id="fps">–</span> fps</div>
 </div>
@@ -64,8 +65,8 @@ const $ = id => document.getElementById(id);
 const stage = $("stage"); const sctx = stage.getContext("2d"); sctx.imageSmoothingEnabled = false;
 const off = document.createElement("canvas"); const octx = off.getContext("2d");
 
-let wasm, bufPtr, bufLen, imgData, SIZE = 120;
-let seed = 9001, phase = 0, speed = 0.02, energy = 0.5;
+let wasm, bufPtr, bufLen, imgData, SIZE = 180;
+let seed = 9001, phase = 0, speed = 0.02, energy = 0.5, detail = 2.0;
 let lastRaf = 0, ema = 0, lastFps = 0;
 
 function setSize(n) {
@@ -78,7 +79,7 @@ function frame(ts) {
   if (lastRaf) { const f = 1000 / (ts - lastRaf); ema = ema ? ema * 0.9 + f * 0.1 : f; }
   lastRaf = ts;
   phase = (phase + speed) % 1.0;
-  wasm.render(bufPtr, SIZE, seed >>> 0, phase, energy);
+  wasm.render(bufPtr, SIZE, seed >>> 0, phase, energy, detail);
   imgData.data.set(new Uint8Array(wasm.memory.buffer, bufPtr, bufLen));
   octx.putImageData(imgData, 0, 0);
   sctx.clearRect(0, 0, stage.width, stage.height);
@@ -91,13 +92,15 @@ async function main() {
   const res = await fetch("./bird.wasm?v=" + Date.now(), { cache: "no-store" });
   const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
   wasm = instance.exports;
-  setSize(120);
+  if (wasm.default_detail) { detail = wasm.default_detail(); $("dt").value = detail; $("dtV").textContent = detail.toFixed(1); }
+  setSize(180);
 
   $("seed").addEventListener("input", () => { seed = parseInt($("seed").value) || 0; });
   $("rndseed").addEventListener("click", () => { seed = (Math.random() * 0xffffff) >>> 0; $("seed").value = seed; });
   $("gen").addEventListener("click", () => { seed = (Math.random() * 0xffffff) >>> 0; $("seed").value = seed; });
   $("en").addEventListener("input", () => { energy = parseFloat($("en").value); $("enV").textContent = energy.toFixed(2); });
   $("sp").addEventListener("input", () => { speed = parseFloat($("sp").value); $("spV").textContent = speed.toFixed(3); });
+  $("dt").addEventListener("input", () => { detail = parseFloat($("dt").value); $("dtV").textContent = detail.toFixed(1); });
   $("res").addEventListener("input", () => setSize(parseInt($("res").value)));
 
   requestAnimationFrame(frame);
