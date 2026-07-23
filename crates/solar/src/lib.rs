@@ -837,12 +837,18 @@ fn star_tint(hh: f32) -> Rgb {
 /// entirely) past a couple of zoom steps — you're focused on a body then anyway.
 fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32) {
     let z = cam.zoom;
+    let invz = 1.0 / z;
+    let (cx0, cy0) = (w as f32 * 0.5, h as f32 * 0.5);
     let si = seed as i32;
-    // The background is a fixed SCREEN-SPACE backdrop: it only reacts to PAN
-    // (each layer scrolls at its own rate `p`), never to zoom — you can't zoom
-    // into a background patch, so zoom leaves the stars put (no swim, constant
-    // pixel size + density). Zoom only drives a gentle fade that declutters the
-    // far layer + nebula when you zoom in on a body (and skips their work).
+    // The background is a distant field sampled in WORLD space at a
+    // parallax-reduced camera position `cam·p` (p well below 1). It therefore
+    // SCALES with the scene on zoom — receding (denser) as you zoom out, thinning
+    // as you zoom in, so it reads as a backdrop rather than a foreground pane —
+    // and PANS slower than the central star. Because it scales about the view
+    // centre (not a uniform screen translation), zoom never makes it swim, and
+    // each star is a single fixed pixel so world sampling can't balloon into
+    // squares. Zoom also drives a fade that declutters/skips the far layer +
+    // nebula when you're zoomed in on a body.
     let far_amt = 1.0 - smoothstep(3.0, 9.0, z);
     let neb_amt = 1.0 - smoothstep(2.5, 7.0, z);
 
@@ -854,14 +860,19 @@ fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32) {
     if neb_amt > 0.02 {
         let ta = NEB_TINTS[(hash3(si, 1, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
         let tb = NEB_TINTS[(hash3(si, 2, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
-        let np = 0.09; // nebula scroll rate (slowest layer)
+        let np = 0.07; // nebula parallax (farthest, slowest)
         let (nox, noy) = (cam.x * np + hash3(si, 5, 2) * 500.0, cam.y * np + hash3(si, 6, 2) * 500.0);
-        let f = 1.0 / 240.0;
+        let f = 1.0 / 460.0;
+        // Clamp how far the nebula zooms out so its soft clouds never turn into
+        // high-frequency blocky noise when the whole system is a speck (it just
+        // stops scaling past this — stars still recede to carry the depth cue).
+        let nz = invz.min(2.2);
         neb = vec![[0.0f32; 3]; (nw * nh) as usize];
         for cy in 0..nh {
             for cx in 0..nw {
-                let gx = ((cx * CELL) as f32 + nox) * f;
-                let gy = ((cy * CELL) as f32 + noy) * f;
+                // World position of this cell on the parallax-reduced plane.
+                let gx = (nox + ((cx * CELL) as f32 - cx0) * nz) * f;
+                let gy = (noy + ((cy * CELL) as f32 - cy0) * nz) * f;
                 let dens = smoothstep(0.50, 0.74, fbm(gx, gy, 4.2, 3)); // patchy -> not crowded
                 if dens > 0.0 {
                     let n2 = fbm(gx * 1.8 + 40.0, gy * 1.8 + 7.0, 1.5, 2);
@@ -893,27 +904,34 @@ fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32) {
         }
     }
 
-    // --- pass 2: stars. Each layer is a fixed screen-space grid (spacing `sp`
-    // px) scrolled by `cam·p`. We iterate the visible cells and plot one pixel
-    // per star — O(cells), not O(pixels). `p` is well below 1 so every layer
-    // clearly trails the central star on pan; the far layer fades out on zoom-in.
-    // (scroll rate p, screen grid px, density threshold, brightness, salt)
+    // --- pass 2: stars. Each layer is a WORLD-space grid sampled at the
+    // parallax-reduced camera `cam·p`. We iterate the visible cells and plot one
+    // pixel per star — O(cells), not O(pixels). Because it's world space the
+    // field scales with zoom (recedes/densifies as you zoom out); `p` well below
+    // 1 makes it pan slower than the central star. The far layer fades on
+    // zoom-in. To bound cost when zoomed far out, the grid is coarsened only once
+    // a layer would exceed ~CELL_CAP cells across (stars just thin out then).
+    // (parallax p, base world grid, density threshold, brightness, salt)
+    const CELL_CAP: f32 = 300.0;
+    let coarsen = (w.max(h) as f32 * invz) / CELL_CAP;
     let layers: [(f32, f32, f32, f32, i32); 3] = [
-        (0.13, 6.0, 0.72, 0.55, 0),  // far  — slow, dim
-        (0.28, 8.0, 0.75, 0.80, 1),  // mid
-        (0.45, 11.0, 0.78, 1.00, 2), // near — most parallax, brightest (still < sun)
+        (0.12, 7.0, 0.72, 0.55, 0),  // far  — slow, dim
+        (0.26, 9.0, 0.75, 0.80, 1),  // mid
+        (0.45, 12.0, 0.78, 1.00, 2), // near — most parallax, brightest (still < sun)
     ];
     let (wi, hi) = (w as i32, h as i32);
-    for (p, sp, thr, bri, salt) in layers {
+    for (p, g0, thr, bri, salt) in layers {
         if salt == 0 && far_amt <= 0.02 {
             continue;
         }
         let amt = if salt == 0 { far_amt } else { 1.0 };
-        let inv = 1.0 / sp;
-        let (ox, oy) = (cam.x * p, cam.y * p); // screen-space scroll offset (no zoom)
-        // Visible cell range: star screen x = (cx+jx)*sp - ox ∈ [0, w).
-        let (c0x, c1x) = ((ox * inv).floor() as i32 - 1, ((ox + w as f32) * inv).floor() as i32 + 1);
-        let (c0y, c1y) = ((oy * inv).floor() as i32 - 1, ((oy + h as f32) * inv).floor() as i32 + 1);
+        let g = g0.max(coarsen);
+        let (cxp, cyp) = (cam.x * p, cam.y * p);
+        // Visible world range on this layer's plane → cell index bounds.
+        let (minx, maxx) = (cxp - cx0 * invz, cxp + cx0 * invz);
+        let (miny, maxy) = (cyp - cy0 * invz, cyp + cy0 * invz);
+        let (c0x, c1x) = ((minx / g).floor() as i32 - 1, (maxx / g).floor() as i32 + 1);
+        let (c0y, c1y) = ((miny / g).floor() as i32 - 1, (maxy / g).floor() as i32 + 1);
         for cy in c0y..=c1y {
             for cx in c0x..=c1x {
                 let hh = hash3(cx, cy, 17 + salt);
@@ -922,8 +940,9 @@ fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32) {
                 }
                 let jx = (hh * 137.0).fract(); // jitter across the cell, [0,1)
                 let jy = (hh * 71.3 + 0.37).fract();
-                let px = ((cx as f32 + jx) * sp - ox).floor() as i32;
-                let py = ((cy as f32 + jy) * sp - oy).floor() as i32;
+                // World position -> screen (scales with zoom, panned by cam·p).
+                let px = (cx0 + ((cx as f32 + jx) * g - cxp) * z).floor() as i32;
+                let py = (cy0 + ((cy as f32 + jy) * g - cyp) * z).floor() as i32;
                 if px < 0 || py < 0 || px >= wi || py >= hi {
                     continue;
                 }

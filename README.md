@@ -103,13 +103,16 @@ system view needs). The new work is the layer on top:
 - **Draggable camera** — a world→screen camera with pan + zoom-to-cursor.
 - **Space background** — a faint seed-colored **nebula** (baked at low res each
   frame → pixel-art clouds) plus three **parallax** star layers with temperature
-  colors. The background is a fixed *screen-space* backdrop: each layer scrolls
-  at its own rate on **pan** (slower than the central star) but does not react to
-  **zoom** at all — so zooming never makes the stars swim relative to the system,
-  and they stay a constant pixel size and density. Stars are drawn by iterating
-  the visible grid cells (a few thousand) and plotting one pixel each — O(cells),
-  not O(pixels). To stay uncluttered when zoomed in, the far layer and the whole
-  nebula fade out (and are skipped) past a couple of zoom steps.
+  colors. Each layer is a *world-space* field sampled at a parallax-reduced
+  camera position `cam·p` (p ≪ 1), so it **pans** slower than the central star
+  and **scales with the scene on zoom** — receding (densifying) as you zoom out,
+  thinning as you zoom in, so it reads as a backdrop, not a foreground pane.
+  Because it scales about the view centre rather than translating, zoom never
+  makes it swim; each star is a single fixed pixel, so world sampling can't
+  balloon into squares. Stars are drawn by iterating the visible grid cells (a
+  few thousand) and plotting one pixel each — O(cells), not O(pixels), with a
+  cell-count cap so cost stays bounded when zoomed far out. The far layer and the
+  nebula fade out (and are skipped) when you zoom in on a body.
 - **Click to follow** — click a planet and the camera locks on and tracks it
   around its orbit; drag anywhere to release.
 
