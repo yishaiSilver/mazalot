@@ -100,14 +100,20 @@ system view needs). The new work is the layer on top:
   worlds show crescent → gibbous phases depending on where they are in orbit.
 - **Depth sorting** — planets are drawn back-to-front by orbital depth, so one on
   the far side is occluded by the sun and one on the near side passes in front.
-- **Draggable camera** — a world→screen camera with pan + zoom-to-cursor; the
-  starfield parallax-scrolls so panning feels like moving through space.
+- **Draggable camera** — a world→screen camera with pan + zoom-to-cursor.
+- **Space background** — a faint seed-colored **nebula** (baked at low res each
+  frame → pixel-art clouds) plus three **parallax** star layers with temperature
+  colors. Stars live in per-layer *screen* space, so they stay a constant pixel
+  size and density at any zoom (no ballooning into squares when zoomed in) while
+  still parallax-scrolling as you pan. To stay cheap and uncluttered when zoomed
+  in, the far layer and the whole nebula fade out — and are skipped — past a
+  couple of zoom steps.
 - **Click to follow** — click a planet and the camera locks on and tracks it
   around its orbit; drag anywhere to release.
 
-Each frame: paint the parallax starfield → dot in each orbit path → render every
-body to a small RGBA tile and alpha-blend it in, depth-sorted. Bodies are small,
-so the whole scene stays cheap enough to render live *while you drag*.
+Each frame: paint the background → dot in each orbit path → render every body to
+a small RGBA tile and alpha-blend it in, depth-sorted. Bodies are small, so the
+whole scene stays cheap enough to render live *while you drag*.
 
 **Add a planet archetype** = add a row to `PKINDS`; **add a star** = add a row to
 `SUNS` — both in `crates/solar/src/lib.rs`.

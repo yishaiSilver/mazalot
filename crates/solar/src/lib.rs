@@ -800,36 +800,115 @@ fn blit(out: &mut [u8], w: u32, h: u32, tile: &Tile, sx: f32, sy: f32, scale: f3
     }
 }
 
-/// Paint the parallax starfield: a static field of stars fixed in world space,
-/// so panning the camera moves past them. Two depth layers give a little
-/// parallax; a faint radial vignette keeps the centre readable.
-fn paint_stars(out: &mut [u8], w: u32, h: u32, cam: &Camera) {
+/// Low-saturation nebula tints; two are picked per system by seed.
+const NEB_TINTS: &[Rgb] = &[
+    [0.44, 0.20, 0.60], // violet
+    [0.18, 0.36, 0.70], // blue
+    [0.62, 0.24, 0.42], // rose
+    [0.14, 0.52, 0.52], // teal
+    [0.52, 0.34, 0.22], // dusty amber
+    [0.30, 0.24, 0.68], // indigo
+];
+
+/// Star colour by a hash in [0,1): mostly pale/blue-white, a few warm, rare cyan.
+fn star_tint(hh: f32) -> Rgb {
+    if hh < 0.46 {
+        [0.92, 0.95, 1.00]
+    } else if hh < 0.64 {
+        [0.72, 0.83, 1.00]
+    } else if hh < 0.78 {
+        [1.00, 0.96, 0.78]
+    } else if hh < 0.89 {
+        [1.00, 0.82, 0.60]
+    } else if hh < 0.96 {
+        [1.00, 0.62, 0.55]
+    } else {
+        [0.72, 1.00, 0.95]
+    }
+}
+
+/// Paint the space background: a faint colored nebula plus parallax star layers.
+///
+/// Everything lives in a per-layer *screen* space offset by the camera (scaled
+/// by depth `p`), NOT world space — so stars stay a constant pixel size and
+/// density at any zoom (no ballooning into big squares when zoomed in) while
+/// still parallax-scrolling as you pan. To stay cheap AND uncluttered when
+/// zoomed in, the far star layer and the whole nebula fade out (and are skipped
+/// entirely) past a couple of zoom steps — you're focused on a body then anyway.
+fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32) {
+    let z = cam.zoom;
+    // Distant richness fades in as you zoom out / away as you zoom in.
+    let far_amt = 1.0 - smoothstep(3.0, 9.0, z);
+    let neb_amt = 1.0 - smoothstep(2.5, 7.0, z);
+    let si = seed as i32;
+
+    // --- nebula: baked at low res each frame (8px blocks => pixel-art clouds) ---
+    const CELL: u32 = 8;
+    let nw = (w + CELL - 1) / CELL;
+    let nh = (h + CELL - 1) / CELL;
+    let mut neb: Vec<[f32; 3]> = Vec::new();
+    if neb_amt > 0.02 {
+        let ta = NEB_TINTS[(hash3(si, 1, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
+        let tb = NEB_TINTS[(hash3(si, 2, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
+        let (ox, oy) = (cam.x * z * 0.15 + hash3(si, 5, 2) * 500.0, cam.y * z * 0.15 + hash3(si, 6, 2) * 500.0);
+        let f = 1.0 / 230.0;
+        neb = vec![[0.0f32; 3]; (nw * nh) as usize];
+        for cy in 0..nh {
+            for cx in 0..nw {
+                let gx = (cx * CELL) as f32 + ox;
+                let gy = (cy * CELL) as f32 + oy;
+                let dens = smoothstep(0.50, 0.74, fbm(gx * f, gy * f, 4.2, 3)); // patchy -> not crowded
+                if dens > 0.0 {
+                    let n2 = fbm(gx * f * 1.8 + 40.0, gy * f * 1.8 + 7.0, 1.5, 2);
+                    let col = mix(ta, tb, clamp01((n2 - 0.35) * 2.2));
+                    let k = dens * neb_amt * 0.34; // faint
+                    neb[(cy * nw + cx) as usize] = [col[0] * k, col[1] * k, col[2] * k];
+                }
+            }
+        }
+    }
+
+    // Star layers: (parallax depth, brightness, density threshold, hash salt).
+    // Far layer is culled once it's faded (perf) — see the `salt == 0` guard.
+    let layers: [(f32, f32, f32, i32); 3] = [
+        (0.30, 0.42, 0.9940, 0), // far  — dim, slow
+        (0.54, 0.72, 0.9968, 1), // mid
+        (0.80, 1.00, 0.9984, 2), // near — brightest, most parallax
+    ];
+
     for iy in 0..h {
         for ix in 0..w {
-            // Back to front: sample two layers at different parallax factors.
-            let mut r = 8u32;
-            let mut g = 7u32;
-            let mut b = 18u32;
-            for (layer, par) in [(0i32, 0.35f32), (1, 0.7)] {
-                // World coord of this pixel at the layer's parallax.
-                let wx = (ix as f32 - w as f32 * 0.5) / cam.zoom * par + cam.x * par;
-                let wy = (iy as f32 - h as f32 * 0.5) / cam.zoom * par + cam.y * par;
-                let cellx = wx.floor() as i32;
-                let celly = wy.floor() as i32;
-                let hh = hash3(cellx, celly, 7 + layer);
-                let thresh = if layer == 0 { 0.994 } else { 0.9975 };
-                if hh > thresh {
-                    let bri = if layer == 0 { 120.0 } else { 200.0 };
-                    let v = (bri + 55.0 * (hh - thresh) / (1.0 - thresh)) as u32;
-                    r = r.max(v);
-                    g = g.max(v);
-                    b = b.max(v.min(255));
+            let bx = bayer(ix, iy);
+            let (mut r, mut g, mut b) = (0.031f32, 0.027, 0.068); // base navy
+            if !neb.is_empty() {
+                let c = neb[((iy / CELL) * nw + ix / CELL) as usize];
+                // Dither the nebula so its gradients read as pixel-art, not banding.
+                r += (c[0] + bx * 0.015).max(0.0);
+                g += (c[1] + bx * 0.015).max(0.0);
+                b += (c[2] + bx * 0.015).max(0.0);
+            }
+            for (p, bri, thr, salt) in layers {
+                if salt == 0 && far_amt <= 0.02 {
+                    continue;
+                }
+                // 1px cells in the layer's parallax screen space.
+                let cx = (ix as f32 + cam.x * z * p).floor() as i32;
+                let cy = (iy as f32 + cam.y * z * p).floor() as i32;
+                let hh = hash3(cx, cy, 17 + salt);
+                if hh > thr {
+                    let t = (hh - thr) / (1.0 - thr);
+                    let amt = if salt == 0 { far_amt } else { 1.0 };
+                    let s = bri * (0.5 + 0.5 * t) * amt;
+                    let col = star_tint(hash3(cx, cy, 60 + salt));
+                    r += s * col[0];
+                    g += s * col[1];
+                    b += s * col[2];
                 }
             }
             let idx = ((iy * w + ix) * 4) as usize;
-            out[idx] = r.min(255) as u8;
-            out[idx + 1] = g.min(255) as u8;
-            out[idx + 2] = b.min(255) as u8;
+            out[idx] = (clamp01(r) * 255.0) as u8;
+            out[idx + 1] = (clamp01(g) * 255.0) as u8;
+            out[idx + 2] = (clamp01(b) * 255.0) as u8;
             out[idx + 3] = 255;
         }
     }
@@ -872,7 +951,7 @@ fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, p: &Planet, spacing
 #[allow(clippy::too_many_arguments)]
 pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin: f32, t_sun: f32, out: &mut [u8]) {
     assert!(out.len() >= (w * h * 4) as usize);
-    paint_stars(out, w, h, cam);
+    paint_background(out, w, h, cam, sys.seed);
     for p in &sys.planets {
         paint_orbit(out, w, h, cam, p, sys.spacing);
     }
