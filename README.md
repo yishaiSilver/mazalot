@@ -145,13 +145,24 @@ cargo build -p solar --target wasm32-unknown-unknown --release --no-default-feat
 cp target/wasm32-unknown-unknown/release/solar.wasm crates/solar/web/solar.wasm
 cd crates/solar/web && python3 -m http.server 8000   # open http://localhost:8000/
 ```
-Drag to pan · scroll / pinch to zoom · tap a planet to follow it. A **Controls**
-dock exposes manual overrides — planet count, planet spacing, planet size, sun
-size, orbit speed, and independent **pixelation** for the scene, the planets, and
-the sun. Sizes/spacing/pixelation are live multipliers applied to the system
+Drag to pan · scroll / pinch to zoom · tap a planet to follow it. Zoom reveals
+detail rather than magnifying fixed pixels — the render buffer is sized so a
+rendered pixel is a constant on-screen block at every zoom, while bodies are
+rendered at a resolution that grows as you zoom in. A **Controls** dock exposes
+manual overrides:
+- **Layout** — planet count, planet spacing, planet size, sun size.
+- **Motion** — orbit speed, and separate **planet** and **star rotation** speeds
+  (three independent clocks; each accumulates so changing a speed never jumps).
+- **Pixelation** — scene / planet / sun pixel size, plus per-body **detail caps**
+  (planets and sun separately): the "lower bound of pixelation" — how far you can
+  zoom before a body stops resolving finer and just enlarges its blocks. Lower
+  caps also keep zoomed-in views cheap.
+
+Sizes/spacing/pixelation/detail-caps are live view params applied to the system
 (`system_set_view`) with no regeneration; only seed and planet count rebuild it.
-Works on touch/mobile. (`node verify.mjs` renders the system headlessly as a
-build check.)
+Off-screen bodies are culled and each body's tile is bounded, so zoom stays
+responsive. Works on touch/mobile. (`node verify.mjs` renders the system
+headlessly as a build check.)
 
 **Web — live creature (the bird half):**
 ```bash

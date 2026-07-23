@@ -360,6 +360,10 @@ pub struct System {
     pub sun_size: f32,     // sun radius scale
     pub planet_pixel: f32, // planet render chunkiness (>= 1, bigger = blockier)
     pub sun_pixel: f32,    // sun render chunkiness (>= 1)
+    // --- per-body detail caps (max tile radius, px) — the "how far you can zoom
+    // in before it stays pixelated" floor; smaller = coarser detail sooner ---
+    pub planet_detail: f32,
+    pub sun_detail: f32,
 }
 
 /// How much orbits are squashed vertically to fake a tilted, near-top-down view.
@@ -436,17 +440,32 @@ impl System {
         System {
             seed, sun_kind, sun_radius, planets,
             spacing: 1.0, planet_size: 1.0, sun_size: 1.0, planet_pixel: 1.0, sun_pixel: 1.0,
+            planet_detail: 160.0, sun_detail: 110.0,
         }
     }
 
     /// Apply the live view multipliers (from the web UI). Sizes/spacing are
-    /// clamped away from zero; pixel factors are >= 1 (1 = full detail).
-    pub fn set_view(&mut self, spacing: f32, planet_size: f32, sun_size: f32, planet_pixel: f32, sun_pixel: f32) {
+    /// clamped away from zero; pixel factors are >= 1 (1 = full detail); detail
+    /// caps are clamped to a safe range (a hard ceiling keeps zoomed-in tiles
+    /// from getting pathologically large).
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_view(
+        &mut self,
+        spacing: f32,
+        planet_size: f32,
+        sun_size: f32,
+        planet_pixel: f32,
+        sun_pixel: f32,
+        planet_detail: f32,
+        sun_detail: f32,
+    ) {
         self.spacing = spacing.max(0.05);
         self.planet_size = planet_size.max(0.05);
         self.sun_size = sun_size.max(0.05);
         self.planet_pixel = planet_pixel.max(1.0);
         self.sun_pixel = sun_pixel.max(1.0);
+        self.planet_detail = planet_detail.clamp(6.0, 256.0);
+        self.sun_detail = sun_detail.clamp(6.0, 180.0);
     }
 
     /// The outermost extent (world units) with the current view multipliers —
@@ -740,20 +759,21 @@ fn blit(out: &mut [u8], w: u32, h: u32, tile: &Tile, sx: f32, sy: f32, scale: f3
     let x0 = (sx - dsize as f32 * 0.5).floor() as i32;
     let y0 = (sy - dsize as f32 * 0.5).floor() as i32;
     let inv = 1.0 / scale;
-    for ddy in 0..dsize {
+    // Iterate only the on-screen slice of the (possibly huge, when zoomed in)
+    // destination rectangle — clamping the loop bounds instead of testing every
+    // pixel keeps blit cost proportional to visible area, not tile size.
+    let ddy0 = (-y0).max(0);
+    let ddy1 = (h as i32 - y0).min(dsize);
+    let ddx0 = (-x0).max(0);
+    let ddx1 = (w as i32 - x0).min(dsize);
+    for ddy in ddy0..ddy1 {
         let dy = y0 + ddy;
-        if dy < 0 || dy >= h as i32 {
-            continue;
-        }
         let ty = ((ddy as f32 + 0.5) * inv) as u32;
         if ty >= tile.size {
             continue;
         }
-        for ddx in 0..dsize {
+        for ddx in ddx0..ddx1 {
             let dx = x0 + ddx;
-            if dx < 0 || dx >= w as i32 {
-                continue;
-            }
             let tx = ((ddx as f32 + 0.5) * inv) as u32;
             if tx >= tile.size {
                 continue;
@@ -840,14 +860,17 @@ fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, p: &Planet, spacing
     }
 }
 
-/// Render the whole system into `out` (RGBA, `w*h*4` bytes) for the given
-/// camera and time `t`. This is the one call the native bin and the wasm face
-/// both go through.
+/// Render the whole system into `out` (RGBA, `w*h*4` bytes). Three separate
+/// clocks drive the animation so the web UI can pace them independently:
+/// `t_orbit` advances the orbital positions, `t_spin` the planets' axial spin +
+/// surface weather, and `t_sun` the star's boil/corona. (The native bin passes
+/// the same value for all three.)
 ///
 /// Draw order: starfield → orbit paths → bodies sorted back-to-front by depth,
 /// so a planet on the far side of its orbit is occluded by the sun and one on
 /// the near side passes in front of it.
-pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, t: f32, out: &mut [u8]) {
+#[allow(clippy::too_many_arguments)]
+pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin: f32, t_sun: f32, out: &mut [u8]) {
     assert!(out.len() >= (w * h * 4) as usize);
     paint_stars(out, w, h, cam);
     for p in &sys.planets {
@@ -859,13 +882,30 @@ pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, t: f32, out: &m
     let mut order: Vec<(f32, i32)> = Vec::with_capacity(sys.planets.len() + 1);
     order.push((0.0, -1)); // sun
     for (i, p) in sys.planets.iter().enumerate() {
-        let (_, _, depth) = p.at(t, sys.spacing);
+        let (_, _, depth) = p.at(t_orbit, sys.spacing);
         order.push((depth, i as i32));
     }
     order.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let (suncx, suncy) = to_screen(0.0, 0.0, cam, w, h);
     let sun = &SUNS[sys.sun_kind];
+    // A body renders into a tile of at most this radius. Detail grows with zoom
+    // until it hits the cap, then `blit` just upsizes the fixed-resolution tile
+    // (bigger blocks, no new detail) — this is the user-set "lower bound of
+    // pixelation": how far you can zoom before it stays pixelated. The buffer
+    // term (0.6·maxdim) is a safety ceiling that also keeps tiles bounded.
+    let buf_cap = w.max(h) as f32 * 0.6;
+    let maxr = buf_cap.min(sys.planet_detail);
+    let maxr_sun = buf_cap.min(sys.sun_detail);
+    let (wf, hf) = (w as f32, h as f32);
+    // True if a body of on-screen radius `r` centred at (bx, by), padded by
+    // `pad`× for its corona/rings, lies fully outside the viewport — then we skip
+    // rendering its tile entirely (crucial when zoomed in, where most bodies fly
+    // off-screen but would otherwise still render full-size tiles).
+    let offscreen = |bx: f32, by: f32, r: f32, pad: f32| {
+        let e = r * pad;
+        bx + e < 0.0 || bx - e > wf || by + e < 0.0 || by - e > hf
+    };
 
     for (_, which) in order {
         if which < 0 {
@@ -873,18 +913,19 @@ pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, t: f32, out: &m
             // `sun_pixel`, then `blit` upsizes it by the same factor, so it
             // stays the same on-screen size but turns blockier.
             let rad_px = sys.sun_radius * sys.sun_size * cam.zoom;
-            if rad_px < 0.5 {
+            if rad_px < 0.5 || offscreen(suncx, suncy, rad_px, 1.0 + CORONA_REACH) {
                 continue;
             }
-            let rad_render = (rad_px / sys.sun_pixel).max(2.0);
-            let tile = render_sun_tile(sun, sys.seed, t, rad_render);
+            let rad_render = (rad_px / sys.sun_pixel).clamp(2.0, maxr_sun);
+            let tile = render_sun_tile(sun, sys.seed, t_sun, rad_render);
             blit(out, w, h, &tile, suncx, suncy, rad_px / rad_render);
         } else {
             let p = &sys.planets[which as usize];
-            let (wx, wy, _depth) = p.at(t, sys.spacing);
+            let (wx, wy, _depth) = p.at(t_orbit, sys.spacing);
             let (sx, sy) = to_screen(wx, wy, cam, w, h);
             let rad_px = p.radius * sys.planet_size * cam.zoom;
-            if rad_px < 0.5 {
+            // Rings reach ~2 radii; pad generously so a ringed giant isn't clipped.
+            if rad_px < 0.5 || offscreen(sx, sy, rad_px, 2.2) {
                 continue;
             }
             // Light comes from the sun: direction from planet toward the star,
@@ -898,9 +939,9 @@ pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, t: f32, out: &m
             let light = [lx / m, ly / m, lz / m];
 
             let pk = &PKINDS[p.kind];
-            let spin_a = p.phase + p.spin * t * TAU; // axial rotation
-            let rad_render = (rad_px / sys.planet_pixel).max(2.0);
-            let tile = render_planet_tile(pk, p.seed, spin_a, t, light, rad_render);
+            let spin_a = p.phase + p.spin * t_spin * TAU; // axial rotation (its own clock)
+            let rad_render = (rad_px / sys.planet_pixel).clamp(2.0, maxr);
+            let tile = render_planet_tile(pk, p.seed, spin_a, t_spin, light, rad_render);
             blit(out, w, h, &tile, sx, sy, rad_px / rad_render);
         }
     }

@@ -45,10 +45,12 @@ pub extern "C" fn system_new_params(seed: u32, count: u32) -> *mut System {
     Box::into_raw(Box::new(System::generate_n(seed, count)))
 }
 
-/// Set the live view multipliers (planet spacing, planet/sun size, and per-body
-/// pixelation). These rescale the existing system without regenerating it, so
-/// the sliders are smooth and the worlds keep their identity.
+/// Set the live view multipliers (planet spacing, planet/sun size, per-body
+/// pixelation) and per-body detail caps (max tile radius, px). These rescale the
+/// existing system without regenerating it, so the sliders are smooth and the
+/// worlds keep their identity.
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub extern "C" fn system_set_view(
     sys: *mut System,
     spacing: f32,
@@ -56,9 +58,11 @@ pub extern "C" fn system_set_view(
     sun_size: f32,
     planet_pixel: f32,
     sun_pixel: f32,
+    planet_detail: f32,
+    sun_detail: f32,
 ) {
     let sys = unsafe { &mut *sys };
-    sys.set_view(spacing, planet_size, sun_size, planet_pixel, sun_pixel);
+    sys.set_view(spacing, planet_size, sun_size, planet_pixel, sun_pixel, planet_detail, sun_detail);
 }
 
 /// Free a system previously returned by [`system_new`].
@@ -71,7 +75,8 @@ pub extern "C" fn system_free(ptr: *mut System) {
     }
 }
 
-/// Render the system into the RGBA buffer at `buf` (must be >= w*h*4 bytes).
+/// Render the system into the RGBA buffer at `buf` (must be >= w*h*4 bytes) with
+/// one clock for everything. Kept for simple callers (e.g. the menu thumbnail).
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn render(
@@ -87,7 +92,30 @@ pub extern "C" fn render(
     let sys = unsafe { &*sys };
     let out = unsafe { slice::from_raw_parts_mut(buf, (w * h * 4) as usize) };
     let cam = Camera { x: cam_x, y: cam_y, zoom };
-    crate::render_system(sys, w, h, &cam, t, out);
+    crate::render_system(sys, w, h, &cam, t, t, t, out);
+}
+
+/// Render with independent clocks: `t_orbit` (orbital motion), `t_spin` (planet
+/// axial spin + weather), `t_sun` (star boil/corona). The web demo accumulates
+/// each at its own rate so planet and star rotation speeds are separable.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn render_t(
+    sys: *const System,
+    buf: *mut u8,
+    w: u32,
+    h: u32,
+    cam_x: f32,
+    cam_y: f32,
+    zoom: f32,
+    t_orbit: f32,
+    t_spin: f32,
+    t_sun: f32,
+) {
+    let sys = unsafe { &*sys };
+    let out = unsafe { slice::from_raw_parts_mut(buf, (w * h * 4) as usize) };
+    let cam = Camera { x: cam_x, y: cam_y, zoom };
+    crate::render_system(sys, w, h, &cam, t_orbit, t_spin, t_sun, out);
 }
 
 /// Number of planets in the system.

@@ -109,11 +109,15 @@
 
     <div class="grp">Motion</div>
     <div class="ctl"><label>Orbit speed <b id="speedV">1.0×</b></label><input type="range" id="speed" min="0" max="4" step="0.1" value="1" /></div>
+    <div class="ctl"><label>Planet rotation <b id="protV">1.0×</b></label><input type="range" id="prot" min="0" max="4" step="0.1" value="1" /></div>
+    <div class="ctl"><label>Star rotation <b id="srotV">1.0×</b></label><input type="range" id="srot" min="0" max="4" step="0.1" value="1" /></div>
 
     <div class="grp">Pixelation</div>
     <div class="ctl"><label>Scene <b id="pixV">1×</b></label><input type="range" id="pix" min="1" max="8" step="1" value="1" /></div>
     <div class="ctl"><label>Planets <b id="ppixV">1×</b></label><input type="range" id="ppix" min="1" max="6" step="1" value="1" /></div>
     <div class="ctl"><label>Sun <b id="spixV">1×</b></label><input type="range" id="spix" min="1" max="6" step="1" value="1" /></div>
+    <div class="ctl"><label>Planet detail cap <b id="pdetV">160</b></label><input type="range" id="pdet" min="16" max="256" step="8" value="160" /></div>
+    <div class="ctl"><label>Sun detail cap <b id="sdetV">110</b></label><input type="range" id="sdet" min="16" max="176" step="8" value="110" /></div>
 
     <button class="wide" id="fit">⤢ Reset view</button>
   </div>
@@ -134,30 +138,35 @@ const off = document.createElement("canvas");
 const octx = off.getContext("2d");
 
 let wasm, sys = 0, bufPtr = 0, bufLen = 0, posPtr = 0, imgData;
-// Two INDEPENDENT quantities, deliberately split so zoom no longer changes how
-// pixelated things look:
-//   • cam.zoom = MAGNIFICATION — display (CSS) px per world unit; what wheel /
-//     pinch / fit change. Bigger = things look larger on screen.
-//   • pix      = PIXEL DENSITY — how many display px each *rendered* pixel spans
-//     (the slider). We render the scene at a density fixed by `pix` alone, then
-//     scale that buffer up crisply, so a body is always the same chunky sprite,
-//     just larger when zoomed. Zoom magnifies pixels; it never adds detail.
+// Two INDEPENDENT quantities:
+//   • cam.zoom = MAGNIFICATION — display (CSS) px per world unit; wheel / pinch /
+//     fit change it. Bigger = a closer camera: things look larger AND resolve
+//     more detail.
+//   • pix      = PIXEL SIZE — how many display px one rendered pixel spans (the
+//     slider). The render buffer is sized so a rendered pixel is always ~`pix`
+//     display px REGARDLESS of zoom, then upscaled crisply. So the on-screen
+//     block size is constant at every zoom (a consistent pixel-art look), while
+//     zooming in renders bodies at a higher resolution — zoom reveals detail
+//     rather than magnifying fixed blocks. Per-body pixel sliders (planet / sun)
+//     make those bodies chunkier still, on top of this.
 let cam = { x: 0, y: 0, zoom: 1 };
-let time = 0, speed = 1, seed = 7, pix = 1;
+let seed = 7, pix = 1;
+// Three independent animation clocks so orbit / planet-spin / star-spin pace
+// separately; each accumulates so changing a speed never makes motion jump.
+let tOrbit = 0, tSpin = 0, tSun = 0;
+let orbitSpeed = 1, planetRot = 1, starRot = 1;
 let follow = -1;                        // planet index the camera tracks, or -1
 let planetKinds = [], sunKind = 0, nPlanets = 0;
 let last = performance.now();
 let curW = 0, curH = 0, curZoom = 1;    // last frame's render dims + render-px/world
 
 // Manual overrides applied to the System without regenerating it (spacing,
-// sizes, per-body pixelation), plus the planet count (structural — needs a
-// rebuild). countAuto keeps the seed-derived count until the user sets one.
-let vSpacing = 1, vPsize = 1, vSsize = 1, vPpix = 1, vSpix = 1;
+// sizes, per-body pixelation, per-body detail caps), plus the planet count
+// (structural — needs a rebuild). countAuto keeps the seed-derived count until
+// the user sets one.
+let vSpacing = 1, vPsize = 1, vSsize = 1, vPpix = 1, vSpix = 1, vPdetail = 160, vSdetail = 110;
 let planetCount = 6, countAuto = true;
 
-// Base render-pixels per world unit at pix=1. `pix` divides this, so the
-// rendered detail density depends ONLY on the slider — never on zoom.
-const BASE_DENSITY = 1.0;
 // Per-frame pixel-budget cap (perf): a phone renders far fewer pixels than a
 // desktop. The internal buffer is allocated once at this size and reused.
 const coarse = window.matchMedia("(pointer: coarse)").matches;
@@ -171,17 +180,18 @@ function setupCanvas() {
   ctx.imageSmoothingEnabled = false; // reset whenever the backing store resizes
 }
 
-// Resolve this frame's render buffer: density fixed by `pix`, size follows zoom
-// (zoom in → fewer, bigger pixels), capped by the budget. `zoomArg` is the
-// render-px-per-world actually used, so world→screen geometry stays exact.
+// Resolve this frame's render buffer. Its size follows `pix` (one rendered pixel
+// ≈ `pix` display px) and is INDEPENDENT of zoom, so the on-screen block size is
+// constant. `zoomArg` = render-px-per-world = w·zoom/cssW, which GROWS with zoom,
+// so bodies are rendered at higher resolution as you zoom in (detail, not bigger
+// blocks). The budget cap only makes it chunkier under load.
 function computeRender() {
   const cssW = canvas.width, cssH = canvas.height;
-  const rpw = BASE_DENSITY / pix;
-  let w = Math.round(rpw * cssW / cam.zoom);
-  let h = Math.round(rpw * cssH / cam.zoom);
+  let w = Math.round(cssW / pix);
+  let h = Math.round(cssH / pix);
   const bs = Math.min(1, Math.sqrt(PIXEL_BUDGET / (w * h)));
   w = Math.round(w * bs); h = Math.round(h * bs);
-  // Clamp + quantize to 8px steps so the buffer is reallocated rarely while zooming.
+  // Clamp + quantize to 8px steps so the buffer is reallocated rarely.
   w = Math.max(16, w - (w % 8)); h = Math.max(12, h - (h % 8));
   return { w, h, zoomArg: w * cam.zoom / cssW };
 }
@@ -194,9 +204,9 @@ function fitView() {
   follow = -1;
 }
 
-// Push the live view multipliers into the current system.
+// Push the live view multipliers + detail caps into the current system.
 function applyView() {
-  if (sys) wasm.system_set_view(sys, vSpacing, vPsize, vSsize, vPpix, vSpix);
+  if (sys) wasm.system_set_view(sys, vSpacing, vPsize, vSsize, vPpix, vSpix, vPdetail, vSdetail);
 }
 
 // (Re)build the system for the current seed + planet count and re-apply the
@@ -219,17 +229,19 @@ function generate(s) {
   seed = s >>> 0;
   $("seed").value = seed;
   buildSystem();
-  time = 0;
+  tOrbit = tSpin = tSun = 0;
   fitView();
 }
 
 function frame(now) {
   const dt = Math.min(0.05, (now - last) / 1000); last = now;
-  time += dt * speed;
+  tOrbit += dt * orbitSpeed;
+  tSpin  += dt * planetRot;
+  tSun   += dt * starRot;
 
   // Camera follows a clicked planet as it sweeps around its orbit.
   if (follow >= 0 && follow < nPlanets) {
-    wasm.planet_pos(sys, follow, time, posPtr);
+    wasm.planet_pos(sys, follow, tOrbit, posPtr);
     const p = new Float32Array(wasm.memory.buffer, posPtr, 2);
     cam.x = p[0]; cam.y = p[1];
   }
@@ -241,7 +253,7 @@ function frame(now) {
     imgData = octx.createImageData(w, h);
   }
   curZoom = zoomArg;
-  wasm.render(sys, bufPtr, w, h, cam.x, cam.y, zoomArg, time);
+  wasm.render_t(sys, bufPtr, w, h, cam.x, cam.y, zoomArg, tOrbit, tSpin, tSun);
   const view = new Uint8Array(wasm.memory.buffer, bufPtr, w * h * 4);
   imgData.data.set(view);
   octx.putImageData(imgData, 0, 0);
@@ -249,7 +261,7 @@ function frame(now) {
   ctx.drawImage(off, 0, 0, w, h, 0, 0, canvas.width, canvas.height);
 
   // HUD: what's under the crosshair (viewport centre)?
-  const near = follow >= 0 ? follow : wasm.nearest_center(sys, w, h, cam.x, cam.y, zoomArg, time);
+  const near = follow >= 0 ? follow : wasm.nearest_center(sys, w, h, cam.x, cam.y, zoomArg, tOrbit);
   const v = $("viewing");
   const kind = near >= 0 ? (PLANET_NAMES[planetKinds[near]] ?? "planet") : (SUN_NAMES[sunKind] ?? "the star");
   v.firstChild.textContent = (follow >= 0 ? "◎ following " : "") + kind + " ";
@@ -328,7 +340,7 @@ function liftPointer(e) {
     if (!gestureMoved && !gesturePinched && gestureCount === 1) {
       const [lx, ly] = localPt(e);
       const [cx, cy] = toWorld(lx, ly);
-      follow = wasm.nearest_center(sys, curW, curH, cx, cy, curZoom, time); // -1 = release
+      follow = wasm.nearest_center(sys, curW, curH, cx, cy, curZoom, tOrbit); // -1 = release
     }
     panLast = null; gestureCount = 0;
   }
@@ -375,8 +387,13 @@ liveMul("ppix", "ppixV", v => vPpix = v, v => v + "×");
 liveMul("spix", "spixV", v => vSpix = v, v => v + "×");
 
 // Purely JS-side: animation rate and scene render density.
-$("speed").addEventListener("input", () => { speed = parseFloat($("speed").value); $("speedV").textContent = speed.toFixed(1) + "×"; });
+$("speed").addEventListener("input", () => { orbitSpeed = parseFloat($("speed").value); $("speedV").textContent = orbitSpeed.toFixed(1) + "×"; });
+$("prot").addEventListener("input", () => { planetRot = parseFloat($("prot").value); $("protV").textContent = planetRot.toFixed(1) + "×"; });
+$("srot").addEventListener("input", () => { starRot = parseFloat($("srot").value); $("srotV").textContent = starRot.toFixed(1) + "×"; });
 $("pix").addEventListener("input", () => { pix = parseInt($("pix").value) || 1; $("pixV").textContent = pix + "×"; });
+// Detail caps (the "lower bound of pixelation"): live view params, no rebuild.
+liveMul("pdet", "pdetV", v => vPdetail = v, v => String(v | 0));
+liveMul("sdet", "sdetV", v => vSdetail = v, v => String(v | 0));
 window.addEventListener("resize", setupCanvas);
 
 async function main() {
