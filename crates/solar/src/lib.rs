@@ -837,10 +837,14 @@ fn star_tint(hh: f32) -> Rgb {
 /// entirely) past a couple of zoom steps — you're focused on a body then anyway.
 fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32) {
     let z = cam.zoom;
-    // Distant richness fades in as you zoom out / away as you zoom in.
+    let si = seed as i32;
+    // The background is a fixed SCREEN-SPACE backdrop: it only reacts to PAN
+    // (each layer scrolls at its own rate `p`), never to zoom — you can't zoom
+    // into a background patch, so zoom leaves the stars put (no swim, constant
+    // pixel size + density). Zoom only drives a gentle fade that declutters the
+    // far layer + nebula when you zoom in on a body (and skips their work).
     let far_amt = 1.0 - smoothstep(3.0, 9.0, z);
     let neb_amt = 1.0 - smoothstep(2.5, 7.0, z);
-    let si = seed as i32;
 
     // --- nebula: baked at low res each frame (8px blocks => pixel-art clouds) ---
     const CELL: u32 = 8;
@@ -850,16 +854,17 @@ fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32) {
     if neb_amt > 0.02 {
         let ta = NEB_TINTS[(hash3(si, 1, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
         let tb = NEB_TINTS[(hash3(si, 2, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
-        let (ox, oy) = (cam.x * z * 0.15 + hash3(si, 5, 2) * 500.0, cam.y * z * 0.15 + hash3(si, 6, 2) * 500.0);
-        let f = 1.0 / 230.0;
+        let np = 0.09; // nebula scroll rate (slowest layer)
+        let (nox, noy) = (cam.x * np + hash3(si, 5, 2) * 500.0, cam.y * np + hash3(si, 6, 2) * 500.0);
+        let f = 1.0 / 240.0;
         neb = vec![[0.0f32; 3]; (nw * nh) as usize];
         for cy in 0..nh {
             for cx in 0..nw {
-                let gx = (cx * CELL) as f32 + ox;
-                let gy = (cy * CELL) as f32 + oy;
-                let dens = smoothstep(0.50, 0.74, fbm(gx * f, gy * f, 4.2, 3)); // patchy -> not crowded
+                let gx = ((cx * CELL) as f32 + nox) * f;
+                let gy = ((cy * CELL) as f32 + noy) * f;
+                let dens = smoothstep(0.50, 0.74, fbm(gx, gy, 4.2, 3)); // patchy -> not crowded
                 if dens > 0.0 {
-                    let n2 = fbm(gx * f * 1.8 + 40.0, gy * f * 1.8 + 7.0, 1.5, 2);
+                    let n2 = fbm(gx * 1.8 + 40.0, gy * 1.8 + 7.0, 1.5, 2);
                     let col = mix(ta, tb, clamp01((n2 - 0.35) * 2.2));
                     let k = dens * neb_amt * 0.34; // faint
                     neb[(cy * nw + cx) as usize] = [col[0] * k, col[1] * k, col[2] * k];
@@ -868,48 +873,68 @@ fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32) {
         }
     }
 
-    // Star layers: (parallax depth, brightness, density threshold, hash salt).
-    // Far layer is culled once it's faded (perf) — see the `salt == 0` guard.
-    let layers: [(f32, f32, f32, i32); 3] = [
-        (0.30, 0.42, 0.9940, 0), // far  — dim, slow
-        (0.54, 0.72, 0.9968, 1), // mid
-        (0.80, 1.00, 0.9984, 2), // near — brightest, most parallax
-    ];
-
+    // --- pass 1: base navy + nebula (cheap: no per-pixel hashing) ---
     for iy in 0..h {
+        let nrow = (iy / CELL) * nw;
         for ix in 0..w {
-            let bx = bayer(ix, iy);
             let (mut r, mut g, mut b) = (0.031f32, 0.027, 0.068); // base navy
             if !neb.is_empty() {
-                let c = neb[((iy / CELL) * nw + ix / CELL) as usize];
-                // Dither the nebula so its gradients read as pixel-art, not banding.
-                r += (c[0] + bx * 0.015).max(0.0);
-                g += (c[1] + bx * 0.015).max(0.0);
-                b += (c[2] + bx * 0.015).max(0.0);
-            }
-            for (p, bri, thr, salt) in layers {
-                if salt == 0 && far_amt <= 0.02 {
-                    continue;
-                }
-                // 1px cells in the layer's parallax screen space.
-                let cx = (ix as f32 + cam.x * z * p).floor() as i32;
-                let cy = (iy as f32 + cam.y * z * p).floor() as i32;
-                let hh = hash3(cx, cy, 17 + salt);
-                if hh > thr {
-                    let t = (hh - thr) / (1.0 - thr);
-                    let amt = if salt == 0 { far_amt } else { 1.0 };
-                    let s = bri * (0.5 + 0.5 * t) * amt;
-                    let col = star_tint(hash3(cx, cy, 60 + salt));
-                    r += s * col[0];
-                    g += s * col[1];
-                    b += s * col[2];
-                }
+                let c = neb[(nrow + ix / CELL) as usize];
+                let d = bayer(ix, iy) * 0.015; // dither -> pixel-art gradient
+                r += (c[0] + d).max(0.0);
+                g += (c[1] + d).max(0.0);
+                b += (c[2] + d).max(0.0);
             }
             let idx = ((iy * w + ix) * 4) as usize;
             out[idx] = (clamp01(r) * 255.0) as u8;
             out[idx + 1] = (clamp01(g) * 255.0) as u8;
             out[idx + 2] = (clamp01(b) * 255.0) as u8;
             out[idx + 3] = 255;
+        }
+    }
+
+    // --- pass 2: stars. Each layer is a fixed screen-space grid (spacing `sp`
+    // px) scrolled by `cam·p`. We iterate the visible cells and plot one pixel
+    // per star — O(cells), not O(pixels). `p` is well below 1 so every layer
+    // clearly trails the central star on pan; the far layer fades out on zoom-in.
+    // (scroll rate p, screen grid px, density threshold, brightness, salt)
+    let layers: [(f32, f32, f32, f32, i32); 3] = [
+        (0.13, 6.0, 0.72, 0.55, 0),  // far  — slow, dim
+        (0.28, 8.0, 0.75, 0.80, 1),  // mid
+        (0.45, 11.0, 0.78, 1.00, 2), // near — most parallax, brightest (still < sun)
+    ];
+    let (wi, hi) = (w as i32, h as i32);
+    for (p, sp, thr, bri, salt) in layers {
+        if salt == 0 && far_amt <= 0.02 {
+            continue;
+        }
+        let amt = if salt == 0 { far_amt } else { 1.0 };
+        let inv = 1.0 / sp;
+        let (ox, oy) = (cam.x * p, cam.y * p); // screen-space scroll offset (no zoom)
+        // Visible cell range: star screen x = (cx+jx)*sp - ox ∈ [0, w).
+        let (c0x, c1x) = ((ox * inv).floor() as i32 - 1, ((ox + w as f32) * inv).floor() as i32 + 1);
+        let (c0y, c1y) = ((oy * inv).floor() as i32 - 1, ((oy + h as f32) * inv).floor() as i32 + 1);
+        for cy in c0y..=c1y {
+            for cx in c0x..=c1x {
+                let hh = hash3(cx, cy, 17 + salt);
+                if hh <= thr {
+                    continue;
+                }
+                let jx = (hh * 137.0).fract(); // jitter across the cell, [0,1)
+                let jy = (hh * 71.3 + 0.37).fract();
+                let px = ((cx as f32 + jx) * sp - ox).floor() as i32;
+                let py = ((cy as f32 + jy) * sp - oy).floor() as i32;
+                if px < 0 || py < 0 || px >= wi || py >= hi {
+                    continue;
+                }
+                let t = (hh - thr) / (1.0 - thr);
+                let s = bri * (0.5 + 0.5 * t) * amt;
+                let col = star_tint((hh * 313.0).fract());
+                let idx = ((py as u32 * w + px as u32) * 4) as usize;
+                out[idx] = (clamp01(out[idx] as f32 / 255.0 + s * col[0]) * 255.0) as u8;
+                out[idx + 1] = (clamp01(out[idx + 1] as f32 / 255.0 + s * col[1]) * 255.0) as u8;
+                out[idx + 2] = (clamp01(out[idx + 2] as f32 / 255.0 + s * col[2]) * 255.0) as u8;
+            }
         }
     }
 }
