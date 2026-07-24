@@ -844,10 +844,14 @@ fn star_tint(hh: f32) -> Rgb {
 /// (the JS wheel/pinch keep `cam` fixed during zoom), the stars stay perfectly
 /// still while zooming — so they can never move faster than the solar system —
 /// and the on-screen count stays constant (no wall when zoomed out, no swim).
-/// `density` scales how many stars there are. Stars are 1px points plotted by
-/// iterating the visible grid cells (O(cells)); the far layer + nebula fade out
-/// when you zoom in on a body.
-fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32, density: f32, parallax: f32) {
+/// `density` scales how many stars there are. `bgx`/`bgy` are the accumulated
+/// SCREEN-space pan of the camera (Δcam·zoom summed over time), so each layer's
+/// pan-parallax rate is constant at every zoom and pure zoom (which adds no
+/// screen displacement) moves nothing. Stars are 1px points plotted by iterating
+/// the visible grid cells (O(cells)); the far layer + nebula fade out when you
+/// zoom in on a body.
+#[allow(clippy::too_many_arguments)]
+fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32, density: f32, parallax: f32, bgx: f32, bgy: f32) {
     let z = cam.zoom;
     let si = seed as i32;
     let far_amt = 1.0 - smoothstep(3.0, 9.0, z);
@@ -862,7 +866,7 @@ fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32, den
         let ta = NEB_TINTS[(hash3(si, 1, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
         let tb = NEB_TINTS[(hash3(si, 2, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
         let np = 0.09 * parallax; // nebula scroll rate (slowest, pan only)
-        let (nox, noy) = (cam.x * np + hash3(si, 5, 2) * 500.0, cam.y * np + hash3(si, 6, 2) * 500.0);
+        let (nox, noy) = (bgx * np + hash3(si, 5, 2) * 500.0, bgy * np + hash3(si, 6, 2) * 500.0);
         let f = 1.0 / 240.0;
         neb = vec![[0.0f32; 3]; (nw * nh) as usize];
         for cy in 0..nh {
@@ -923,7 +927,7 @@ fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32, den
         }
         let amt = if salt == 0 { far_amt } else { 1.0 };
         let inv = 1.0 / sp;
-        let (ox, oy) = (cam.x * p * parallax, cam.y * p * parallax); // pan only, no zoom
+        let (ox, oy) = (bgx * p * parallax, bgy * p * parallax); // screen-space pan, no zoom
         let (c0x, c1x) = ((ox * inv).floor() as i32 - 1, ((ox + w as f32) * inv).floor() as i32 + 1);
         let (c0y, c1y) = ((oy * inv).floor() as i32 - 1, ((oy + h as f32) * inv).floor() as i32 + 1);
         for cy in c0y..=c1y {
@@ -986,9 +990,9 @@ fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, p: &Planet, spacing
 /// so a planet on the far side of its orbit is occluded by the sun and one on
 /// the near side passes in front of it.
 #[allow(clippy::too_many_arguments)]
-pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin: f32, t_sun: f32, out: &mut [u8]) {
+pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: f32, t_orbit: f32, t_spin: f32, t_sun: f32, out: &mut [u8]) {
     assert!(out.len() >= (w * h * 4) as usize);
-    paint_background(out, w, h, cam, sys.seed, sys.star_density, sys.star_parallax);
+    paint_background(out, w, h, cam, sys.seed, sys.star_density, sys.star_parallax, bgx, bgy);
     for p in &sys.planets {
         paint_orbit(out, w, h, cam, p, sys.spacing);
     }

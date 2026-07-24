@@ -13,8 +13,9 @@ use std::fs::File;
 /// Render one scene frame straight into an `RgbaImage`.
 fn frame(sys: &System, w: u32, h: u32, cam: &Camera, t: f32) -> RgbaImage {
     let mut buf = vec![0u8; (w * h * 4) as usize];
-    // Native uses one clock for orbit / spin / sun alike.
-    render_system(sys, w, h, cam, t, t, t, &mut buf);
+    // Native uses one clock for orbit / spin / sun alike; the background scroll
+    // is the camera pan in screen space (cam·zoom), correct at fixed zoom.
+    render_system(sys, w, h, cam, cam.x * cam.zoom, cam.y * cam.zoom, t, t, t, &mut buf);
     RgbaImage::from_raw(w, h, buf).expect("buffer size matches")
 }
 

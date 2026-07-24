@@ -105,13 +105,14 @@ system view needs). The new work is the layer on top:
   panned).
 - **Space background** — a faint seed-colored **nebula** (baked at low res each
   frame → pixel-art clouds) plus three **parallax** star layers with temperature
-  colors. Each layer is a fixed *screen-space* grid that scrolls slower than the
-  central star on **pan** (rate `cam·p`) and does **not** respond to zoom at all.
-  Combined with zoom-about-centre (`cam` stays fixed during zoom), the stars are
-  perfectly still while zooming — so they can never move faster than the
-  (zoom-scaled) solar system — and the on-screen count stays constant (no wall
-  when zoomed out, no swim). **Star density** and **star parallax** controls tune
-  the count and pan scroll rate. Stars are 1px points plotted by iterating the
+  colors. Each layer is a fixed *screen-space* grid scrolled by the camera's
+  **accumulated screen-space pan** (Δcam·zoom summed over time) at a fraction `p`
+  of the foreground — so on **pan** the stars always move slower than the system
+  by the same ratio at every zoom (no runaway when zoomed out), and on **zoom**
+  they don't move at all (pure zoom adds no screen displacement, and zoom is
+  about the viewport centre). So a star can never move faster than the solar
+  system, and the on-screen count stays constant (no wall, no swim). **Star
+  density** and **star parallax** controls tune the count and pan scroll rate. Stars are 1px points plotted by iterating the
   visible grid cells — O(cells), not O(pixels). The far layer and the nebula fade
   out (and are skipped) when you zoom in on a body.
 - **Click to follow** — click a planet and the camera locks on and tracks it

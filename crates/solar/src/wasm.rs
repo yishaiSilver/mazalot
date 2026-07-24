@@ -97,12 +97,14 @@ pub extern "C" fn render(
     let sys = unsafe { &*sys };
     let out = unsafe { slice::from_raw_parts_mut(buf, (w * h * 4) as usize) };
     let cam = Camera { x: cam_x, y: cam_y, zoom };
-    crate::render_system(sys, w, h, &cam, t, t, t, out);
+    // Static single frame (menu thumbnail): screen-space bg offset = cam·zoom.
+    crate::render_system(sys, w, h, &cam, cam_x * zoom, cam_y * zoom, t, t, t, out);
 }
 
 /// Render with independent clocks: `t_orbit` (orbital motion), `t_spin` (planet
-/// axial spin + weather), `t_sun` (star boil/corona). The web demo accumulates
-/// each at its own rate so planet and star rotation speeds are separable.
+/// axial spin + weather), `t_sun` (star boil/corona), plus `bgx`/`bgy` — the
+/// accumulated SCREEN-space camera pan that drives the background parallax at a
+/// zoom-independent rate. The web demo accumulates each at its own rate.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn render_t(
@@ -113,6 +115,8 @@ pub extern "C" fn render_t(
     cam_x: f32,
     cam_y: f32,
     zoom: f32,
+    bgx: f32,
+    bgy: f32,
     t_orbit: f32,
     t_spin: f32,
     t_sun: f32,
@@ -120,7 +124,7 @@ pub extern "C" fn render_t(
     let sys = unsafe { &*sys };
     let out = unsafe { slice::from_raw_parts_mut(buf, (w * h * 4) as usize) };
     let cam = Camera { x: cam_x, y: cam_y, zoom };
-    crate::render_system(sys, w, h, &cam, t_orbit, t_spin, t_sun, out);
+    crate::render_system(sys, w, h, &cam, bgx, bgy, t_orbit, t_spin, t_sun, out);
 }
 
 /// Number of planets in the system.

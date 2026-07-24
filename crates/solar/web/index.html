@@ -163,6 +163,9 @@ let follow = -1;                        // planet index the camera tracks, or -1
 let planetKinds = [], sunKind = 0, nPlanets = 0;
 let last = performance.now();
 let curW = 0, curH = 0, curZoom = 1;    // last frame's render dims + render-px/world
+// Background scroll = accumulated SCREEN-space camera pan (Δcam·zoom summed), so
+// the star parallax rate is the same at every zoom and pure zoom moves nothing.
+let bgPanX = 0, bgPanY = 0, camPrevX = 0, camPrevY = 0, bgResync = true;
 
 // Manual overrides applied to the System without regenerating it (spacing,
 // sizes, per-body pixelation, per-body detail caps), plus the planet count
@@ -206,6 +209,7 @@ function fitView() {
   const z = Math.min(0.45 * canvas.width / ext, 0.45 * canvas.height / (ext * 0.55));
   cam = { x: 0, y: 0, zoom: z };
   follow = -1;
+  bgPanX = 0; bgPanY = 0; bgResync = true; // recenter + skip the jump next frame
 }
 
 // Push the live view multipliers + detail caps into the current system.
@@ -250,6 +254,14 @@ function frame(now) {
     cam.x = p[0]; cam.y = p[1];
   }
 
+  // Accumulate the camera's SCREEN-space pan (Δcam·zoom) for the background.
+  // A resync (after fit/generate/follow-start) skips one frame so a camera jump
+  // doesn't lurch the stars; pure zoom adds nothing since Δcam is 0.
+  if (bgResync) { camPrevX = cam.x; camPrevY = cam.y; bgResync = false; }
+  bgPanX += (cam.x - camPrevX) * cam.zoom;
+  bgPanY += (cam.y - camPrevY) * cam.zoom;
+  camPrevX = cam.x; camPrevY = cam.y;
+
   const { w, h, zoomArg } = computeRender();
   if (w !== curW || h !== curH) {   // (re)size the render surfaces only on change
     curW = w; curH = h;
@@ -257,7 +269,7 @@ function frame(now) {
     imgData = octx.createImageData(w, h);
   }
   curZoom = zoomArg;
-  wasm.render_t(sys, bufPtr, w, h, cam.x, cam.y, zoomArg, tOrbit, tSpin, tSun);
+  wasm.render_t(sys, bufPtr, w, h, cam.x, cam.y, zoomArg, bgPanX, bgPanY, tOrbit, tSpin, tSun);
   const view = new Uint8Array(wasm.memory.buffer, bufPtr, w * h * 4);
   imgData.data.set(view);
   octx.putImageData(imgData, 0, 0);
@@ -347,6 +359,7 @@ function liftPointer(e) {
       const [lx, ly] = localPt(e);
       const [cx, cy] = toWorld(lx, ly);
       follow = wasm.nearest_center(sys, curW, curH, cx, cy, curZoom, tOrbit); // -1 = release
+      if (follow >= 0) bgResync = true; // cam will jump to the planet next frame
     }
     panLast = null; gestureCount = 0;
   }
