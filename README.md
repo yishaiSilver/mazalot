@@ -114,7 +114,11 @@ system view needs). The new work is the layer on top:
   system, and the on-screen count stays constant (no wall, no swim). **Star
   density** and **star parallax** controls tune the count and pan scroll rate. Stars are 1px points plotted by iterating the
   visible grid cells — O(cells), not O(pixels). The far layer and the nebula fade
-  out (and are skipped) when you zoom in on a body.
+  out (and are skipped) when you zoom in on a body. The backdrop depends only on
+  the camera + view params (never on animation time), so it's **cached**: on a
+  still camera — the common "watch it orbit" view — the whole background is a
+  `memcpy` and only the bodies re-render. This is why the fit view runs at ~110
+  fps native while orbiting (see Performance).
 - **Click to follow** — click a planet and the camera locks on and tracks it
   around its orbit; drag anywhere to release.
 
@@ -218,6 +222,36 @@ Implications:
 - **One planet live** (the web demo): comfortable — ~2 ms native, ~5–7 ms in WASM at 64 px, well under a 60 fps budget. Tightens above ~200 px.
 - **Many planets / a galaxy map**: don't render live. **Bake the ~30 spin frames once, then blit** (that ~0.0003 ms) — procedural variety at sprite-cheap playback.
 - **Cheaper weather:** dropping domain warp (back to plain fBm) roughly halves the weather cost.
+
+### Profiling the solar system
+
+`cargo run -p solar --release --bin bench` decomposes a frame by rendering the
+same scene under controlled scenarios (bodies culled off-screen → background
+only; density 0 → no stars; zoomed past the nebula fade → base fill only).
+At 1000×640, seed 7 (4 planets), native:
+
+| scenario | per frame | |
+|---|---|---|
+| fit view, moving camera | ~17 ms | 58 fps |
+| **fit view, still camera (cached bg)** | **~9 ms** | **111 fps** |
+| zoomed onto the sun | ~40 ms | 25 fps |
+| zoomed onto a planet | ~37 ms | 27 fps |
+
+Fit-view breakdown: the **background is ~50%** of the frame (nebula bake ~29%,
+base fill ~19%, stars ~2%) and the **bodies ~50%**. The background is O(pixels)
+at a flat ~13 ns/px, and — crucially — it's *time-independent*.
+
+- **Biggest win, shipped: cache the background.** On a still camera the backdrop
+  is byte-identical every frame, so `render_system_cached` keys it on
+  camera+view and `memcpy`s it — halving the still-camera frame (17→9 ms). Any
+  pan/zoom/slider change invalidates the key and repaints once.
+- **Nebula is the costliest sub-pass** (fBm at every 8px cell). Cheaper: bake it
+  once per (zoom, pan) into its own buffer, or drop an octave.
+- **Worst case is a body filling the screen** (sun ~40 ms): the corona/boil
+  shader runs per-pixel over a large tile. The per-body detail cap (`maxr`)
+  already bounds it; lowering the sun's cap trades a little sharpness for fps.
+- **Per-frame heap:** each uncached frame allocates a nebula `Vec` and a
+  draw-order `Vec` — reusable scratch on the `System` would remove that churn.
 
 ## Adding a planet type
 

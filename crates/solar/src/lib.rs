@@ -369,6 +369,10 @@ pub struct System {
     // Background pan-parallax rate multiplier (scales every layer's scroll rate
     // `p`; 0 = stars fixed on pan, 1 = default).
     pub star_parallax: f32,
+    // Cached backdrop (background + orbit paths) + the key it was rendered for,
+    // reused by `render_system_cached` while the camera/view is unchanged.
+    bg_cache: Vec<u8>,
+    bg_key: Option<BgKey>,
 }
 
 /// How much orbits are squashed vertically to fake a tilted, near-top-down view.
@@ -446,6 +450,7 @@ impl System {
             seed, sun_kind, sun_radius, planets,
             spacing: 1.0, planet_size: 1.0, sun_size: 1.0, planet_pixel: 1.0, sun_pixel: 1.0,
             planet_detail: 160.0, sun_detail: 110.0, star_density: 0.5, star_parallax: 1.0,
+            bg_cache: Vec::new(), bg_key: None,
         }
     }
 
@@ -992,11 +997,50 @@ fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, p: &Planet, spacing
 #[allow(clippy::too_many_arguments)]
 pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: f32, t_orbit: f32, t_spin: f32, t_sun: f32, out: &mut [u8]) {
     assert!(out.len() >= (w * h * 4) as usize);
+    draw_bg_orbits(sys, w, h, cam, bgx, bgy, out);
+    draw_bodies(sys, w, h, cam, t_orbit, t_spin, t_sun, out);
+}
+
+/// Cache key for the background + orbit layer: it's fully determined by the
+/// camera + view params (NO animation time), so as long as these are unchanged
+/// the backdrop is byte-for-byte identical frame to frame.
+type BgKey = [f32; 10];
+fn bg_key(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: f32) -> BgKey {
+    [w as f32, h as f32, cam.x, cam.y, cam.zoom, sys.star_density, sys.star_parallax, sys.spacing, bgx, bgy]
+}
+
+/// Like [`render_system`] but caches the (time-independent) background + orbit
+/// layer on the `System`. On a still camera — the common "watch it orbit" view —
+/// the backdrop is a memcpy instead of a full re-render, which is >50% of the
+/// frame. Any pan/zoom/view change invalidates the key and repaints once.
+#[allow(clippy::too_many_arguments)]
+pub fn render_system_cached(sys: &mut System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: f32, t_orbit: f32, t_spin: f32, t_sun: f32, out: &mut [u8]) {
+    let len = (w * h * 4) as usize;
+    assert!(out.len() >= len);
+    let key = bg_key(sys, w, h, cam, bgx, bgy);
+    if sys.bg_key == Some(key) && sys.bg_cache.len() == len {
+        out[..len].copy_from_slice(&sys.bg_cache);
+    } else {
+        draw_bg_orbits(sys, w, h, cam, bgx, bgy, out);
+        sys.bg_cache.clear();
+        sys.bg_cache.extend_from_slice(&out[..len]);
+        sys.bg_key = Some(key);
+    }
+    draw_bodies(sys, w, h, cam, t_orbit, t_spin, t_sun, out);
+}
+
+/// Paint the backdrop: starfield + nebula, then the dashed orbit paths. Depends
+/// only on the camera + view params, never on animation time.
+fn draw_bg_orbits(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: f32, out: &mut [u8]) {
     paint_background(out, w, h, cam, sys.seed, sys.star_density, sys.star_parallax, bgx, bgy);
     for p in &sys.planets {
         paint_orbit(out, w, h, cam, p, sys.spacing);
     }
+}
 
+/// Draw the sun + planets over whatever is already in `out`, depth-sorted.
+#[allow(clippy::too_many_arguments)]
+fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin: f32, t_sun: f32, out: &mut [u8]) {
     // Build a draw list of (depth, is_sun, planet_index). The sun sits at
     // depth 0; planets sort around it by their orbital depth.
     let mut order: Vec<(f32, i32)> = Vec::with_capacity(sys.planets.len() + 1);
