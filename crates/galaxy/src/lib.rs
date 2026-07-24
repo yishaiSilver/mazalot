@@ -988,7 +988,7 @@ mod tests {
     #[test]
     fn scan_anchor_collisions() {
         let mut found = Vec::new();
-        for seed in 0u32..200_000 {
+        for seed in 0u32..400_000 {
             DUP_SEED.with(|c| c.set(None));
             let _g = Galaxy::generate(seed);
             if let Some(s) = DUP_SEED.with(|c| c.get()) {

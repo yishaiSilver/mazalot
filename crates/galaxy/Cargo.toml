@@ -26,3 +26,9 @@ native = ["dep:image"]
 [[bin]]
 name = "galaxy"
 required-features = ["native"]
+
+# Visual R&D: renders several beauty-render variants side by side so a direction
+# can be picked by eye before any of it lands in the shipped renderer.
+[[bin]]
+name = "variants"
+required-features = ["native"]
