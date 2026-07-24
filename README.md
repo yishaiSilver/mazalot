@@ -273,10 +273,25 @@ floor at that size) for a cheaper re-bake. The per-frame draw-order `Vec` and th
 star tile's 577 KB alloc are both gone (reused/cached).
 
 Everything invalidates automatically the moment its key changes. **Remaining
-frontier:** a *planet* zoomed to fill the screen (~34 ms) — planets aren't
-tile-cached because their axial rotation is the visible motion, so quantizing it
-would read as choppy; the fix there is an octave LOD (like the sun's) at the cost
-of a little surface detail.
+frontier:** a *planet* zoomed to fill the screen (~34 ms at a high detail cap).
+Planets aren't tile-cached because their axial rotation is the visible motion, so
+quantizing it (the sun trick) would read as choppy.
+
+The cost scales with the **detail cap** — it bounds the tile resolution, and the
+per-pixel shader runs once per tile pixel. Two ways to keep it cheap:
+
+- **Pin the detail cap low** (~56) — the tile stays small, so the fills-screen
+  case never gets expensive in the first place. This is the intended default and
+  needs no code: the cap is already a live slider (`planet_detail`). At ~56 a
+  full-screen planet is **~6 ms (170 fps)** instead of ~34 ms — the `bench` bin
+  measures both.
+- **Octave LOD** (*option, not implemented for planets*) — if you want a high
+  detail cap *and* a cheap full-screen planet, drop the terrestrial/emissive fBm
+  from 6→3–4 octaves on large tiles, exactly as `render_sun_tile` already does
+  for the star (`lod = size > 200`). The catch: unlike the sun's diffuse boil, a
+  planet's surface *is* the detail, so it trades a little crispness and can
+  "pop" as the LOD threshold is crossed mid-zoom. Left as a deliberate choice
+  since pinning the cap low sidesteps the need.
 
 ## Adding a planet type
 

@@ -75,6 +75,19 @@ fn main() {
         0.0
     };
 
+    // The same full-screen planet with the detail cap pinned LOW (56): the tile
+    // stays small, so the per-pixel surface shader is cheap — the recommended way
+    // to keep a fills-the-screen planet fast (vs the ~34 ms at the 160 cap).
+    let t_planet_lowcap = if let Some(p) = planet {
+        sys.set_view(1.0, 1.0, 1.0, 1.0, 1.0, 56.0, 110.0, 0.5, 1.0); // planet_detail = 56
+        let cam = Camera { x: p.orbit, y: 0.0, zoom: fz * 22.0 };
+        let m = ms(&sys, &cam, &mut buf);
+        sys.set_view(1.0, 1.0, 1.0, 1.0, 1.0, 160.0, 110.0, 0.5, 1.0); // restore default
+        m
+    } else {
+        0.0
+    };
+
     let bodies = (t_full - t_bg).max(0.0);
     let stars = (t_bg - t_bg_nostars).max(0.0);
     let nebula = (t_bg_nostars - t_base).max(0.0);
@@ -97,7 +110,8 @@ fn main() {
     println!("  fit, panning (drag)               {:7.2} ms   ({:.0} fps)", t_full, 1000.0 / t_full);
     println!("  fit, still camera (cached bg)     {:7.2} ms   ({:.0} fps)  <- render_system_cached", t_cached, 1000.0 / t_cached);
     println!("  zoomed onto the sun               {:7.2} ms   ({:.0} fps)", t_sun, 1000.0 / t_sun);
-    println!("  zoomed onto a planet              {:7.2} ms   ({:.0} fps)", t_planet, 1000.0 / t_planet);
+    println!("  zoomed onto a planet (cap 160)    {:7.2} ms   ({:.0} fps)", t_planet, 1000.0 / t_planet);
+    println!("  zoomed onto a planet (cap 56)     {:7.2} ms   ({:.0} fps)  <- low detail cap", t_planet_lowcap, 1000.0 / t_planet_lowcap);
     println!("\n── fit breakdown (panning) ──────────────────");
     println!("  background total                  {:7.2} ms   {:5.1}%", t_bg, 100.0 * t_bg / t_full);
     println!("    ├ base fill + orbit paths       {:7.2} ms   {:5.1}%", t_base, 100.0 * t_base / t_full);
