@@ -2,9 +2,11 @@
 /target
 /core/target
 /web/target
+crates/*/target
 
 # Generated planet/character output (GIFs, PNGs)
 /out
+crates/*/out
 
 # OS cruft
 .DS_Store

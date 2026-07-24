@@ -1,0 +1,27 @@
+[package]
+name = "moon"
+version = "0.1.0"
+edition = "2021"
+
+# Same three-face shape as `solar` and `star`:
+#   • lib.rs   — pure planet+moons render math (rlib for the bin, cdylib for wasm)
+#   • wasm.rs  — a thin C-ABI wrapper over the lib, compiled only for wasm32
+#   • bin/*    — native GIF/PNG generator (needs `image`, the `native` feature)
+# Fully self-contained: carries its own noise/color/tile-render primitives so it
+# shares no code with `solar` or `star` — only third-party deps and the
+# workspace manifest. The pure render path uses NO deps, so the wasm build
+# (`--no-default-features`) stays tiny.
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "gif"], optional = true }
+
+[features]
+default = ["native"]
+native = ["dep:image"]
+
+[[bin]]
+name = "moon"
+required-features = ["native"]

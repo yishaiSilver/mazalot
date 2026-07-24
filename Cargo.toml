@@ -7,11 +7,15 @@
 #   crates/solar     — draggable procedural solar systems (bin: solar) + wasm
 #   crates/bird      — alien/earth-bird creatures (bins: alien, bird) + wasm
 #   crates/character — paper-doll character compositor (native only)
+#   crates/moon      — planets with depth-sorted orbiting moons (bin: moon) + wasm
+#   crates/asteroid  — drifting, perspective-squashed asteroid belts (bin: asteroid) + wasm
+#   crates/comet     — eccentric-orbit comets with anti-sunward tails (bin: comet) + wasm
+#   crates/orbit     — eccentric Keplerian orbits (star at a focus) (bin: orbit) + wasm
 #
 # The "type" crates share no code — only third-party deps and this manifest.
 [workspace]
 resolver = "2"
-members = ["crates/planet", "crates/star", "crates/solar", "crates/bird", "crates/character"]
+members = ["crates/planet", "crates/star", "crates/solar", "crates/bird", "crates/character", "crates/moon", "crates/asteroid", "crates/comet", "crates/orbit"]
 
 [profile.release]
 opt-level = 3
