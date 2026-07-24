@@ -472,6 +472,20 @@ impl Galaxy {
         for (region_idx, &(_, anchor_idx)) in anchor_r.iter().enumerate() {
             anchor_region[anchor_idx] = (region_idx % REGIONS.len()) as u8;
         }
+        #[cfg(test)]
+        {
+            let mut dup = false;
+            for a in 0..anchors.len() {
+                for b in (a + 1)..anchors.len() {
+                    if anchors[a] == anchors[b] {
+                        dup = true;
+                    }
+                }
+            }
+            if dup {
+                DUP_SEED.with(|c| c.set(Some(seed)));
+            }
+        }
 
         // --- degree counts (hub-ness) from the finished edge list.
         let mut degree = vec![0u16; n];
@@ -963,8 +977,38 @@ pub fn node_at(gal: &Galaxy, cam: &Camera, wx: f32, wy: f32) -> i32 {
 mod wasm;
 
 #[cfg(test)]
+thread_local! {
+    static DUP_SEED: std::cell::Cell<Option<u32>> = std::cell::Cell::new(None);
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_anchor_collisions() {
+        let mut found = Vec::new();
+        for seed in 0u32..200_000 {
+            DUP_SEED.with(|c| c.set(None));
+            let _g = Galaxy::generate(seed);
+            if let Some(s) = DUP_SEED.with(|c| c.get()) {
+                found.push(s);
+                if found.len() >= 20 {
+                    break;
+                }
+            }
+        }
+        eprintln!("COLLISION_SEEDS: {:?}", found);
+        // For any collision seed, verify a region name is genuinely missing from nodes.
+        for &s in found.iter().take(5) {
+            let g = Galaxy::generate(s);
+            let mut present = std::collections::HashSet::new();
+            for nd in &g.nodes {
+                present.insert(nd.region);
+            }
+            eprintln!("seed {s}: distinct regions present = {}", present.len());
+        }
+    }
 
     /// Union-Find helper to check the hyperlane graph is fully connected.
     fn connected(n: usize, edges: &[(u32, u32)]) -> bool {
