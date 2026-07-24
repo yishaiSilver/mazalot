@@ -178,6 +178,14 @@ manual overrides:
   zoom) and **star parallax** (scroll-rate multiplier: 0 pins the stars on pan,
   higher makes them scroll faster / feel closer).
 
+A **performance readout** (top-right) shows live, smoothed **FPS**, the **WASM
+render time** (the procedural CPU cost per frame), the whole-frame time, that
+render as a **percent of a 60 fps CPU budget** (with a green→amber→red bar), the
+current render resolution, and whether the **backdrop was cached or redrawn**
+this frame — so you can watch it flip to "cached ✓" the instant you stop dragging
+(see Performance). Click it to collapse to the one-line summary; press **P** to
+hide it.
+
 Sizes/spacing/pixelation/detail-caps are live view params applied to the system
 (`system_set_view`) with no regeneration; only seed and planet count rebuild it.
 Off-screen bodies are culled and each body's tile is bounded, so zoom stays

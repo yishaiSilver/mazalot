@@ -4,6 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
 <title>Procedural Solar System — Rust · WASM</title>
+<link rel="icon" href="data:," />
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -31,6 +32,19 @@
   .hint { position: fixed; top: 18px; right: 20px; z-index: 5; pointer-events: none;
     font-size: 12px; color: #6b7290; text-align: right; text-shadow: 0 1px 3px rgba(0,0,0,.9); letter-spacing: .03em; }
   .hint b { color: #aeb4cd; font-weight: 600; }
+
+  /* Perf readout — live frame/CPU signal. Click (or press P) to cycle detail. */
+  .perf { position: fixed; top: 64px; right: 20px; z-index: 6; pointer-events: auto;
+    font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    color: #9aa0bb; background: rgba(14,15,24,.74); border: 1px solid rgba(255,255,255,.07);
+    border-radius: 9px; padding: 6px 9px; backdrop-filter: blur(6px); cursor: pointer;
+    min-width: 140px; text-shadow: none; }
+  .perf b { color: #eef1f8; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .perf .lbl { color: #6b7290; }
+  .perf .bar { height: 4px; border-radius: 3px; margin-top: 6px; background: rgba(255,255,255,.10); overflow: hidden; }
+  .perf .bar i { display: block; height: 100%; width: 0; background: #57d38c; transition: width .15s linear, background .3s; }
+  .perf.min .detail { display: none; }
+  .perf.off { display: none; }
 
   /* Control dock — docked bottom-right on desktop, collapsible. */
   .dock { position: fixed; right: 16px; bottom: 16px; z-index: 6; width: 268px;
@@ -74,6 +88,7 @@
     .viewing { font-size: 17px; margin-top: 5px; min-height: 22px; }
     .viewing small { font-size: 11px; }
     .hint { display: none; }
+    .perf { top: 10px; right: 12px; min-width: 0; } /* hint is hidden here → reuse the corner */
     .dock { left: 10px; right: 10px; bottom: calc(10px + env(safe-area-inset-bottom)); width: auto; }
     .dock-body { max-height: 46vh; }
   }
@@ -88,6 +103,17 @@
 </div>
 <div class="hint">
   <b>drag</b> to pan · <b>scroll / pinch</b> to zoom<br><b>tap a planet</b> to follow it
+</div>
+
+<div class="perf" id="perf" title="frame performance — click or press P to toggle">
+  <div><b id="pfFps">–</b> fps <span class="lbl">·</span> <b id="pfRender">–</b> ms <span class="lbl">render</span></div>
+  <div class="detail">
+    <div class="lbl" id="pfFrame">frame – ms</div>
+    <div class="lbl" id="pfLoad">CPU – % of 60 fps</div>
+    <div class="lbl" id="pfRes">– × –</div>
+    <div id="pfBg" class="lbl">bg –</div>
+    <div class="bar"><i id="pfBar"></i></div>
+  </div>
 </div>
 
 <div class="dock" id="dock">
@@ -167,6 +193,12 @@ let curW = 0, curH = 0, curZoom = 1;    // last frame's render dims + render-px/
 // the star parallax rate is the same at every zoom and pure zoom moves nothing.
 let bgPanX = 0, bgPanY = 0, camPrevX = 0, camPrevY = 0, bgResync = true;
 
+// Perf readout: exponentially-smoothed FPS / WASM-render ms / whole-frame ms,
+// plus a signal for whether the cached backdrop was reused this frame. DOM text
+// is refreshed a few times a second; the EMAs update every frame.
+let emaFps = 60, emaRender = 0, emaFrame = 0;
+let perfPrev = performance.now(), perfDrawn = 0, bgSig = "", bgRedrewInWindow = false;
+
 // Manual overrides applied to the System without regenerating it (spacing,
 // sizes, per-body pixelation, per-body detail caps), plus the planet count
 // (structural — needs a rebuild). countAuto keeps the seed-derived count until
@@ -242,6 +274,7 @@ function generate(s) {
 }
 
 function frame(now) {
+  const frameStart = performance.now();
   const dt = Math.min(0.05, (now - last) / 1000); last = now;
   tOrbit += dt * orbitSpeed;
   tSpin  += dt * planetRot;
@@ -269,7 +302,17 @@ function frame(now) {
     imgData = octx.createImageData(w, h);
   }
   curZoom = zoomArg;
+  // Does this frame reuse the cached backdrop? Mirror the Rust bg cache key: if
+  // none of (size, camera, zoom, pan, bg view params) changed, only the bodies
+  // re-render and the whole background is a memcpy.
+  const sig = `${w},${h},${cam.x},${cam.y},${cam.zoom},${bgPanX},${bgPanY},${vStarDen},${vStarPar},${vSpacing}`;
+  if (sig !== bgSig) bgRedrewInWindow = true;   // backdrop repainted this frame
+  bgSig = sig;
+
+  // Time the actual WASM procedural render — the CPU cost the profiling targets.
+  const r0 = performance.now();
   wasm.render_t(sys, bufPtr, w, h, cam.x, cam.y, zoomArg, bgPanX, bgPanY, tOrbit, tSpin, tSun);
+  const renderMs = performance.now() - r0;
   const view = new Uint8Array(wasm.memory.buffer, bufPtr, w * h * 4);
   imgData.data.set(view);
   octx.putImageData(imgData, 0, 0);
@@ -281,7 +324,32 @@ function frame(now) {
   const v = $("viewing");
   const kind = near >= 0 ? (PLANET_NAMES[planetKinds[near]] ?? "planet") : (SUN_NAMES[sunKind] ?? "the star");
   v.firstChild.textContent = (follow >= 0 ? "◎ following " : "") + kind + " ";
+
+  updatePerf(now, renderMs, performance.now() - frameStart);
   requestAnimationFrame(frame);
+}
+
+// Smooth the raw per-frame timings and surface them a few times a second.
+const FRAME_BUDGET = 1000 / 60; // ms of CPU one 60 fps frame affords
+function updatePerf(now, renderMs, frameMs) {
+  const iv = now - perfPrev; perfPrev = now;
+  if (iv > 0 && iv < 1000) emaFps += (1000 / iv - emaFps) * 0.1;
+  emaRender += (renderMs - emaRender) * 0.1;
+  emaFrame += (frameMs - emaFrame) * 0.1;
+  if (now - perfDrawn < 220) return;            // throttle DOM writes to ~4.5/s
+  perfDrawn = now;
+  const load = emaRender / FRAME_BUDGET * 100;  // render CPU as % of a 60 fps budget
+  const px = curW * curH;
+  $("pfFps").textContent = emaFps.toFixed(0);
+  $("pfRender").textContent = emaRender.toFixed(1);
+  $("pfFrame").textContent = `frame ${emaFrame.toFixed(1)} ms`;
+  $("pfLoad").textContent = `CPU ${load.toFixed(0)}% of 60 fps`;
+  $("pfRes").textContent = `${curW}×${curH} · ${(px / 1000).toFixed(0)}k px`;
+  $("pfBg").textContent = bgRedrewInWindow ? "backdrop redraw" : "backdrop cached ✓";
+  bgRedrewInWindow = false;                      // reset for the next window
+  const bar = $("pfBar");
+  bar.style.width = Math.min(100, load).toFixed(0) + "%";
+  bar.style.background = load < 60 ? "#57d38c" : load < 100 ? "#f4b74a" : "#ef6a6a";
 }
 
 // ---- interaction: one finger / mouse drags to pan, two fingers pinch to
@@ -377,6 +445,12 @@ canvas.addEventListener("wheel", e => {
 
 // ---- controls --------------------------------------------------------------
 $("dockHead").addEventListener("click", () => $("dock").classList.toggle("collapsed"));
+
+// Perf readout: click to collapse to the one-line summary; press P to hide it.
+$("perf").addEventListener("click", () => $("perf").classList.toggle("min"));
+window.addEventListener("keydown", e => {
+  if ((e.key === "p" || e.key === "P") && e.target.tagName !== "INPUT") $("perf").classList.toggle("off");
+});
 
 // Generate makes a NEW random system each click; the dice does the same. Type a
 // number in the seed field to load a specific system instead.
