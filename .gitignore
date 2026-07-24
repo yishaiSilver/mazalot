@@ -10,3 +10,6 @@ crates/*/out
 
 # OS cruft
 .DS_Store
+
+# Generated standalone artifacts (scripts/make-artifact.sh)
+/dist

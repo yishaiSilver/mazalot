@@ -204,6 +204,16 @@ Kepler ellipse with the star at a focus (solved from the mean anomaly, so worlds
 speed up at perihelion), and an **Eccentricity** slider scales the whole system
 from perfectly circular to exaggerated.
 
+**Bundling a demo into one file.** To turn any demo into a single self-contained
+HTML with its wasm inlined (runs with no server — open it locally, host it
+anywhere, or publish it as a Claude artifact), use:
+
+```bash
+scripts/make-artifact.sh solar    # -> dist/solar.html
+```
+
+See [docs/artifacts.md](docs/artifacts.md) for options and details.
+
 **Web — live creature (the bird half):**
 ```bash
 cargo build -p bird-web --target wasm32-unknown-unknown --release
