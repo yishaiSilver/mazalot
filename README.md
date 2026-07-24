@@ -238,39 +238,45 @@ same scene under controlled scenarios (bodies culled off-screen → background
 only; density 0 → no stars; zoomed past the nebula fade → base fill only).
 At 1000×640, seed 7 (4 planets), native, **after the caching below**:
 
-| scenario | per frame | |
+| scenario | before caching | after |
 |---|---|---|
-| fit view, panning (drag) | ~11 ms | 92 fps |
-| **fit view, still camera** | **~9 ms** | **106 fps** |
-| zoomed onto the sun | ~39 ms | 26 fps |
-| zoomed onto a planet | ~35 ms | 29 fps |
+| fit view, panning (drag) | ~17 ms · 58 fps | **~4 ms · 240 fps** |
+| fit view, still camera | ~17 ms · 58 fps | **~2.6 ms · 385 fps** |
+| zoomed onto the sun | ~39 ms · 26 fps | **~8 ms · 125 fps** |
+| zoomed onto a planet | ~35 ms · 29 fps | ~34 ms · 30 fps |
 
-Profiling the *un*cached renderer showed the **background was ~50% of every
-frame** and O(pixels) — yet it's almost entirely *stable*: it never depends on
-animation time, the nebula scrolls at only 9% of pan and its shape doesn't
-change with zoom at all, and the base navy fill is constant. Only the stars
-(a cheap O(cells) point overlay) genuinely move each frame. So the background is
-cached in **three nested layers**, each keyed on what actually changes it:
+Everything expensive here is **time-quantized cached**: the costly input evolves
+slowly, so it's snapped to a coarse step and reused between re-bakes. The same
+trick is applied at three scales.
 
-- **fBm nebula field** (low-res, the single costliest sub-pass) — keyed on the
-  quantized scroll offset *only*, so a pure **zoom never re-bakes it** (zoom just
-  fades its brightness at composite). Isolated, the bake is ~9 ms/frame at this
-  size; cached, it's ~0.
-- **Base-navy + nebula layer** (full-res, everything except stars/orbits) —
-  keyed on scroll offset **and** the quantized zoom-fade. On a drag between
-  offset ticks it's reused as a `memcpy`, collapsing the ~6.5 ms O(pixels)
-  base-fill + composite to a copy. This is what takes a **drag from ~17→11 ms**.
-- **Whole backdrop** (`render_system_cached`) — on a perfectly still camera even
-  the star overlay is skipped: the entire backdrop is one `memcpy` and only the
-  orbiting bodies re-render (**~9 ms, 106 fps**).
+**Background** — profiling the uncached renderer showed it was ~50% of every
+frame and O(pixels), yet almost entirely *stable*: it never depends on animation
+time, the nebula scrolls at only 9% of pan and its shape is zoom-independent, and
+the base navy is constant. Only the stars (a cheap O(cells) overlay) truly move.
+So it's cached in **three nested layers**, each keyed on what changes it:
+- **fBm nebula field** (low-res, costliest sub-pass) — keyed on the quantized
+  scroll offset *only*, so a pure **zoom never re-bakes it**. ~9 ms → ~0.
+- **Base-navy + nebula layer** (full-res, all but stars/orbits) — keyed on offset
+  **and** zoom-fade. On a drag it's reused as a `memcpy`, collapsing the ~6.5 ms
+  base-fill + composite.
+- **Whole backdrop** (`render_system_cached`) — a still camera skips even the
+  star overlay: the entire backdrop is one `memcpy`, only bodies re-render.
 
-All three invalidate automatically the moment their key changes, and the
-quantized nebula offset (2 px, below perception on a faint low-frequency cloud)
-means a slow drag re-bakes at most every ~7 frames. **Bodies now dominate** a
-moving frame (~84%). The remaining hotspot is a body filling the screen (sun
-~39 ms): the corona/boil shader runs per-pixel over a large tile — the per-body
-detail cap (`maxr`) already bounds it, and lowering the sun's cap trades a little
-sharpness for fps.
+**Bodies** — with the background cached, bodies dominated, and the star's
+convection/corona shader (27-cell worley + fBm per pixel over a large tile) was
+the single worst case at ~39 ms. But the boil evolves slowly, so the **star tile
+is cached** exactly like the nebula: keyed on the render radius + a quantized
+boil clock (`SUN_TQUANT`), it's re-baked every few frames instead of every frame
+(**sun 39 → ~8 ms**), and a still or non-rotating star is essentially free. At
+extreme zoom the tile also drops its secondary-fBm octaves (below the dither
+floor at that size) for a cheaper re-bake. The per-frame draw-order `Vec` and the
+star tile's 577 KB alloc are both gone (reused/cached).
+
+Everything invalidates automatically the moment its key changes. **Remaining
+frontier:** a *planet* zoomed to fill the screen (~34 ms) — planets aren't
+tile-cached because their axial rotation is the visible motion, so quantizing it
+would read as choppy; the fix there is an octave LOD (like the sun's) at the cost
+of a little surface detail.
 
 ## Adding a planet type
 

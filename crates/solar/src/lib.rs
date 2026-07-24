@@ -188,14 +188,25 @@ const SUNS: &[SunKind] = &[
 /// Radius of the corona halo past the disc, in disc radii.
 const CORONA_REACH: f32 = 0.7;
 
+/// Boil-clock quantum for the star-tile cache: `t_sun` is snapped to this step so
+/// the tile is reused between re-bakes. Small enough that the convection looks
+/// continuous (~a dozen steps/sec at the default rotation), large enough that the
+/// costly tile is baked once every several frames instead of every frame.
+const SUN_TQUANT: f32 = 0.08;
+
 /// Emissive photosphere colour at a rotated surface point + limb factor.
-fn sun_surface(sk: &SunKind, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], t: f32, mu: f32) -> Rgb {
+fn sun_surface(sk: &SunKind, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], t: f32, mu: f32, lod: bool) -> Rgb {
     let f = sk.gran;
     let (px, py, pz) = (sx + ofs[0], sy + ofs[1], sz + ofs[2]);
     // Boil the cell field slowly over time; sample a warped worley for lanes.
-    let warp = 0.5 * fbm(px * 1.6 + t * 0.4, py * 1.6, pz * 1.6 - t * 0.3, 2) - 0.25;
+    // `lod` (set for large, zoomed-in tiles) drops the secondary-fBm octaves —
+    // they modulate below the Bayer-dither floor at that size, so it's a free
+    // ~20% off the re-bake with no visible change. Worley stays full (it *is*
+    // the visible cell structure).
+    let (warp_oct, blotch_oct) = if lod { (1, 2) } else { (2, 3) };
+    let warp = 0.5 * fbm(px * 1.6 + t * 0.4, py * 1.6, pz * 1.6 - t * 0.3, warp_oct) - 0.25;
     let w = worley(px * f + warp, py * f + warp, pz * f);
-    let blotch = fbm(px * 0.9, py * 0.9, pz * 0.9 + t * 0.2, 3);
+    let blotch = fbm(px * 0.9, py * 0.9, pz * 0.9 + t * 0.2, blotch_oct);
     let cool_region = smoothstep(0.46, 0.30, blotch);
     let lane = smoothstep(0.55, 0.82, w);
     let dark = clamp01(cool_region * 0.85 + lane * 0.4);
@@ -377,6 +388,23 @@ pub struct System {
     // Cached background layers. Interior-mutable so it memoizes through the
     // shared `&System` render path too. See [`BgCache`] and `paint_background`.
     neb: RefCell<BgCache>,
+    // Cached star tile — the single most expensive body shader (27-cell worley +
+    // fBm per pixel over a large tile when zoomed in). The boil evolves slowly,
+    // so like the nebula its clock is quantized: on a still-ish sun the tile is
+    // reused and only re-baked every few frames. See `draw_bodies`.
+    sun_tile: RefCell<SunCache>,
+    // Reused draw-order scratch (avoids a per-frame Vec alloc in `draw_bodies`).
+    order: RefCell<Vec<(f32, i32)>>,
+}
+
+/// Memoized star tile. The star's convection cells + corona are the costliest
+/// per-pixel shader, but the boil is slow, so we key the tile on the render
+/// radius and a QUANTIZED boil clock and reuse it between re-bakes.
+#[derive(Default)]
+struct SunCache {
+    /// `[quantized rad_render, quantized t_sun]` the `tile` is valid for.
+    key: Option<[i32; 2]>,
+    tile: Option<Tile>,
 }
 
 /// Two nested background caches, both exploiting that the backdrop-minus-stars
@@ -481,6 +509,8 @@ impl System {
             planet_detail: 160.0, sun_detail: 110.0, star_density: 0.5, star_parallax: 1.0,
             bg_cache: Vec::new(), bg_key: None,
             neb: RefCell::new(BgCache::default()),
+            sun_tile: RefCell::new(SunCache::default()),
+            order: RefCell::new(Vec::new()),
         }
     }
 
@@ -578,6 +608,9 @@ fn render_sun_tile(sk: &SunKind, seed: u32, t: f32, rad_px: f32) -> Tile {
     let size = size.max(6);
     let c = size as f32 / 2.0;
     let ofs = seed_offsets(seed);
+    // A2 LOD: on a large (zoomed-in) tile, thin the secondary-fBm octaves.
+    let lod = size > 200;
+    let corona_oct = if lod { 2 } else { 3 };
     let mut px = vec![0u8; (size * size * 4) as usize];
 
     for iy in 0..size {
@@ -590,7 +623,7 @@ fn render_sun_tile(sk: &SunKind, seed: u32, t: f32, rad_px: f32) -> Tile {
             let (mut col, mut a);
             if d2 <= 1.0 {
                 let nz = (1.0 - d2).sqrt();
-                col = sun_surface(sk, nx, ny, nz, ofs, t, nz);
+                col = sun_surface(sk, nx, ny, nz, ofs, t, nz, lod);
                 a = 1.0;
             } else {
                 col = [0.0, 0.0, 0.0];
@@ -601,7 +634,7 @@ fn render_sun_tile(sk: &SunKind, seed: u32, t: f32, rad_px: f32) -> Tile {
             if edge > 0.0 && edge < CORONA_REACH {
                 let theta = ny.atan2(nx);
                 // Ragged flares around the rim + a smooth radial falloff.
-                let flare = 0.6 + 0.5 * fbm(theta.cos() * 5.0, theta.sin() * 5.0, t * 0.6, 3);
+                let flare = 0.6 + 0.5 * fbm(theta.cos() * 5.0, theta.sin() * 5.0, t * 0.6, corona_oct);
                 let fall = smoothstep(CORONA_REACH, 0.0, edge).powf(1.6);
                 let glow = clamp01(fall * flare);
                 let cc = [sk.corona[0] * glow, sk.corona[1] * glow, sk.corona[2] * glow];
@@ -1126,9 +1159,11 @@ fn draw_bg_orbits(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: f32
 /// Draw the sun + planets over whatever is already in `out`, depth-sorted.
 #[allow(clippy::too_many_arguments)]
 fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin: f32, t_sun: f32, out: &mut [u8]) {
-    // Build a draw list of (depth, is_sun, planet_index). The sun sits at
-    // depth 0; planets sort around it by their orbital depth.
-    let mut order: Vec<(f32, i32)> = Vec::with_capacity(sys.planets.len() + 1);
+    // Build a draw list of (depth, is_sun, planet_index) in the System's reused
+    // scratch (no per-frame alloc). The sun sits at depth 0; planets sort around
+    // it by their orbital depth.
+    let mut order = sys.order.borrow_mut();
+    order.clear();
     order.push((0.0, -1)); // sun
     for (i, p) in sys.planets.iter().enumerate() {
         let (_, _, depth) = p.at(t_orbit, sys.spacing);
@@ -1156,7 +1191,8 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
         bx + e < 0.0 || bx - e > wf || by + e < 0.0 || by - e > hf
     };
 
-    for (_, which) in order {
+    for idx in 0..order.len() {
+        let which = order[idx].1;
         if which < 0 {
             // The star. Per-body pixelation: render the tile smaller by
             // `sun_pixel`, then `blit` upsizes it by the same factor, so it
@@ -1166,8 +1202,17 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
                 continue;
             }
             let rad_render = (rad_px / sys.sun_pixel).clamp(2.0, maxr_sun);
-            let tile = render_sun_tile(sun, sys.seed, t_sun, rad_render);
-            blit(out, w, h, &tile, suncx, suncy, rad_px / rad_render);
+            // A1: reuse the cached tile unless the render radius or the quantized
+            // boil clock changed. Re-bake at the QUANTIZED clock so the cached
+            // tile matches its key exactly (same trick as the nebula field).
+            let key = [rad_render.round() as i32, (t_sun / SUN_TQUANT).round() as i32];
+            let mut sc = sys.sun_tile.borrow_mut();
+            if sc.key != Some(key) || sc.tile.is_none() {
+                let tq = key[1] as f32 * SUN_TQUANT;
+                sc.tile = Some(render_sun_tile(sun, sys.seed, tq, rad_render));
+                sc.key = Some(key);
+            }
+            blit(out, w, h, sc.tile.as_ref().unwrap(), suncx, suncy, rad_px / rad_render);
         } else {
             let p = &sys.planets[which as usize];
             let (wx, wy, _depth) = p.at(t_orbit, sys.spacing);
