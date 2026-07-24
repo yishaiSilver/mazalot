@@ -25,3 +25,7 @@ native = ["dep:image"]
 [[bin]]
 name = "solar"
 required-features = ["native"]
+
+[[bin]]
+name = "bench"
+required-features = ["native"]

@@ -114,7 +114,11 @@ system view needs). The new work is the layer on top:
   system, and the on-screen count stays constant (no wall, no swim). **Star
   density** and **star parallax** controls tune the count and pan scroll rate. Stars are 1px points plotted by iterating the
   visible grid cells — O(cells), not O(pixels). The far layer and the nebula fade
-  out (and are skipped) when you zoom in on a body.
+  out (and are skipped) when you zoom in on a body. The backdrop depends only on
+  the camera + view params (never on animation time), so it's **cached**: on a
+  still camera — the common "watch it orbit" view — the whole background is a
+  `memcpy` and only the bodies re-render. This is why the fit view runs at ~110
+  fps native while orbiting (see Performance).
 - **Click to follow** — click a planet and the camera locks on and tracks it
   around its orbit; drag anywhere to release.
 
@@ -175,6 +179,14 @@ manual overrides:
 - **Background** — **star density** (how many background stars, constant across
   zoom) and **star parallax** (scroll-rate multiplier: 0 pins the stars on pan,
   higher makes them scroll faster / feel closer).
+
+A **performance readout** (top-right) shows live, smoothed **FPS**, the **WASM
+render time** (the procedural CPU cost per frame), the whole-frame time, that
+render as a **percent of a 60 fps CPU budget** (with a green→amber→red bar), the
+current render resolution, and whether the **backdrop was cached or redrawn**
+this frame — so you can watch it flip to "cached ✓" the instant you stop dragging
+(see Performance). Click it to collapse to the one-line summary; press **P** to
+hide it.
 
 Sizes/spacing/pixelation/detail-caps are live view params applied to the system
 (`system_set_view`) with no regeneration; only seed and planet count rebuild it.
@@ -252,6 +264,68 @@ Implications:
 - **One planet live** (the web demo): comfortable — ~2 ms native, ~5–7 ms in WASM at 64 px, well under a 60 fps budget. Tightens above ~200 px.
 - **Many planets / a galaxy map**: don't render live. **Bake the ~30 spin frames once, then blit** (that ~0.0003 ms) — procedural variety at sprite-cheap playback.
 - **Cheaper weather:** dropping domain warp (back to plain fBm) roughly halves the weather cost.
+
+### Profiling the solar system
+
+`cargo run -p solar --release --bin bench` decomposes a frame by rendering the
+same scene under controlled scenarios (bodies culled off-screen → background
+only; density 0 → no stars; zoomed past the nebula fade → base fill only).
+At 1000×640, seed 7 (4 planets), native, **after the caching below**:
+
+| scenario | before caching | after |
+|---|---|---|
+| fit view, panning (drag) | ~17 ms · 58 fps | **~4 ms · 240 fps** |
+| fit view, still camera | ~17 ms · 58 fps | **~2.6 ms · 385 fps** |
+| zoomed onto the sun | ~39 ms · 26 fps | **~8 ms · 125 fps** |
+| zoomed onto a planet | ~35 ms · 29 fps | ~34 ms · 30 fps |
+
+Everything expensive here is **time-quantized cached**: the costly input evolves
+slowly, so it's snapped to a coarse step and reused between re-bakes. The same
+trick is applied at three scales.
+
+**Background** — profiling the uncached renderer showed it was ~50% of every
+frame and O(pixels), yet almost entirely *stable*: it never depends on animation
+time, the nebula scrolls at only 9% of pan and its shape is zoom-independent, and
+the base navy is constant. Only the stars (a cheap O(cells) overlay) truly move.
+So it's cached in **three nested layers**, each keyed on what changes it:
+- **fBm nebula field** (low-res, costliest sub-pass) — keyed on the quantized
+  scroll offset *only*, so a pure **zoom never re-bakes it**. ~9 ms → ~0.
+- **Base-navy + nebula layer** (full-res, all but stars/orbits) — keyed on offset
+  **and** zoom-fade. On a drag it's reused as a `memcpy`, collapsing the ~6.5 ms
+  base-fill + composite.
+- **Whole backdrop** (`render_system_cached`) — a still camera skips even the
+  star overlay: the entire backdrop is one `memcpy`, only bodies re-render.
+
+**Bodies** — with the background cached, bodies dominated, and the star's
+convection/corona shader (27-cell worley + fBm per pixel over a large tile) was
+the single worst case at ~39 ms. But the boil evolves slowly, so the **star tile
+is cached** exactly like the nebula: keyed on the render radius + a quantized
+boil clock (`SUN_TQUANT`), it's re-baked every few frames instead of every frame
+(**sun 39 → ~8 ms**), and a still or non-rotating star is essentially free. At
+extreme zoom the tile also drops its secondary-fBm octaves (below the dither
+floor at that size) for a cheaper re-bake. The per-frame draw-order `Vec` and the
+star tile's 577 KB alloc are both gone (reused/cached).
+
+Everything invalidates automatically the moment its key changes. **Remaining
+frontier:** a *planet* zoomed to fill the screen (~34 ms at a high detail cap).
+Planets aren't tile-cached because their axial rotation is the visible motion, so
+quantizing it (the sun trick) would read as choppy.
+
+The cost scales with the **detail cap** — it bounds the tile resolution, and the
+per-pixel shader runs once per tile pixel. Two ways to keep it cheap:
+
+- **Pin the detail cap low** (~56) — the tile stays small, so the fills-screen
+  case never gets expensive in the first place. This is the intended default and
+  needs no code: the cap is already a live slider (`planet_detail`). At ~56 a
+  full-screen planet is **~6 ms (170 fps)** instead of ~34 ms — the `bench` bin
+  measures both.
+- **Octave LOD** (*option, not implemented for planets*) — if you want a high
+  detail cap *and* a cheap full-screen planet, drop the terrestrial/emissive fBm
+  from 6→3–4 octaves on large tiles, exactly as `render_sun_tile` already does
+  for the star (`lod = size > 200`). The catch: unlike the sun's diffuse boil, a
+  planet's surface *is* the detail, so it trades a little crispness and can
+  "pop" as the LOD threshold is crossed mid-zoom. Left as a deliberate choice
+  since pinning the cap low sidesteps the need.
 
 ## Adding a planet type
 

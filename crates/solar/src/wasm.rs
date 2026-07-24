@@ -123,7 +123,7 @@ pub extern "C" fn render(
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn render_t(
-    sys: *const System,
+    sys: *mut System,
     buf: *mut u8,
     w: u32,
     h: u32,
@@ -136,10 +136,11 @@ pub extern "C" fn render_t(
     t_spin: f32,
     t_sun: f32,
 ) {
-    let sys = unsafe { &*sys };
+    let sys = unsafe { &mut *sys };
     let out = unsafe { slice::from_raw_parts_mut(buf, (w * h * 4) as usize) };
     let cam = Camera { x: cam_x, y: cam_y, zoom };
-    crate::render_system(sys, w, h, &cam, bgx, bgy, t_orbit, t_spin, t_sun, out);
+    // Caches the time-independent backdrop; a still camera skips re-rendering it.
+    crate::render_system_cached(sys, w, h, &cam, bgx, bgy, t_orbit, t_spin, t_sun, out);
 }
 
 /// Number of planets in the system.
