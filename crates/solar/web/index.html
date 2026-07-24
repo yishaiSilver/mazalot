@@ -46,6 +46,11 @@
   .perf.min .detail { display: none; }
   .perf.off { display: none; }
 
+  /* Standalone Generate button (lifted out of the Controls dock). Bottom-left on
+     desktop, mirroring the dock; always visible regardless of the dock state. */
+  .genfab { position: fixed; left: 16px; bottom: 16px; z-index: 6; font-size: 13px;
+    padding: 10px 18px; box-shadow: 0 8px 24px rgba(0,0,0,.55); }
+
   /* Control dock — docked bottom-right on desktop, collapsible. */
   .dock { position: fixed; right: 16px; bottom: 16px; z-index: 6; width: 268px;
     max-width: calc(100vw - 32px);
@@ -89,6 +94,8 @@
     .viewing small { font-size: 11px; }
     .hint { display: none; }
     .perf { top: 10px; right: 12px; min-width: 0; } /* hint is hidden here → reuse the corner */
+    /* Bottom is the dock sheet on mobile → sit the button under the title instead. */
+    .genfab { bottom: auto; top: 70px; left: 12px; padding: 8px 14px; font-size: 12px; }
     .dock { left: 10px; right: 10px; bottom: calc(10px + env(safe-area-inset-bottom)); width: auto; }
     .dock-body { max-height: 46vh; }
   }
@@ -101,6 +108,10 @@
   <h1>Procedural Solar System</h1>
   <div class="viewing" id="viewing">loading…<small id="sysinfo">Rust → WebAssembly</small></div>
 </div>
+
+<!-- Primary action, deliberately OUTSIDE the collapsible Controls dock so a new
+     system is always one click away even when settings are closed. -->
+<button class="primary genfab" id="gen" title="new random solar system">✦ Generate</button>
 <div class="hint">
   <b>drag</b> to pan · <b>scroll / pinch</b> to zoom<br><b>tap a planet</b> to follow it
 </div>
@@ -123,8 +134,7 @@
   <div class="dock-body">
     <div class="row">
       <input type="number" id="seed" min="0" value="7" title="seed" />
-      <button id="dice" title="random seed">🎲</button>
-      <button class="primary" id="gen">✦ Generate</button>
+      <button id="dice" title="new random system">🎲</button>
     </div>
 
     <div class="grp">Layout</div>
