@@ -214,6 +214,16 @@ pub struct Node {
     pub twinkle: f32,     // per-node phase so stars don't pulse in lockstep
 }
 
+/// A vivid star-forming nebula cloud placed on a spiral arm (the Kurzgesagt
+/// look): a saturated blob of colour washed into the galactic haze.
+#[derive(Clone, Copy)]
+struct Bloom {
+    x: f32,
+    y: f32,
+    r: f32,
+    col: Rgb,
+}
+
 /// A generated galaxy: nodes + the hyperlane edge list. Deterministic in `seed`.
 /// `node_scale`/`haze` are live view multipliers (do not change identity).
 pub struct Galaxy {
@@ -221,6 +231,8 @@ pub struct Galaxy {
     pub nodes: Vec<Node>,
     pub edges: Vec<(u32, u32)>, // undirected, a < b
     pub arms: u32,
+    pub twist: f32, // log-spiral tightness (shared by placement, haze + blooms)
+    blooms: Vec<Bloom>,
     pub node_scale: f32,
     pub haze: f32,
     // Cached backdrop (haze + territory wash + dust + hyperlanes) keyed on the
@@ -506,11 +518,42 @@ impl Galaxy {
             });
         }
 
+        // --- star-forming nebula blooms: vivid clouds placed ON the arms. Solve
+        // the log-spiral for a point on an arm ridge at a random radius, jitter
+        // it, and give it a saturated tint. These are the pink/cyan pockets.
+        const NEB: &[Rgb] = &[
+            [0.92, 0.26, 0.66], // magenta
+            [0.98, 0.44, 0.60], // pink
+            [0.26, 0.82, 0.92], // cyan
+            [0.60, 0.34, 0.92], // violet
+            [0.96, 0.32, 0.44], // rose
+            [0.22, 0.80, 0.72], // teal
+        ];
+        let bloom_n = 12 + (rng.f() * 8.0) as usize; // 12..=19
+        let mut blooms = Vec::with_capacity(bloom_n);
+        for _ in 0..bloom_n {
+            let r = rng.range(0.18, 0.95) * GALAXY_R;
+            let arm_k = (rng.f() * arms as f32) as u32;
+            // theta on an arm ridge: arms·θ − twist·ln r ≡ 2π·k  (+ jitter).
+            let theta =
+                (TAU * arm_k as f32 + twist * r.max(1.0).ln()) / arms as f32 + rng.range(-0.18, 0.18);
+            let (s, c) = theta.sin_cos();
+            let col = NEB[(rng.f() * NEB.len() as f32) as usize % NEB.len()];
+            blooms.push(Bloom {
+                x: c * r + rng.range(-40.0, 40.0),
+                y: s * r + rng.range(-40.0, 40.0),
+                r: rng.range(70.0, 190.0),
+                col,
+            });
+        }
+
         Galaxy {
             seed,
             nodes,
             edges,
             arms,
+            twist,
+            blooms,
             node_scale: 1.0,
             haze: 1.0,
             bg_cache: Vec::new(),
@@ -646,23 +689,23 @@ fn line(out: &mut [u8], w: u32, h: u32, ax: f32, ay: f32, bx: f32, by: f32, col:
 // Backdrop: haze + territory wash + dust + hyperlanes (time-independent)
 // ===========================================================================
 
-/// Galactic haze colour by fractional radius: warm gold in the core → cool
-/// blue-violet toward the rim.
+/// Galactic haze colour by fractional radius: a bright warm-gold core bulge →
+/// cool blue arms → teal rim (the Kurzgesagt Milky-Way palette).
 fn haze_tint(rr: f32) -> Rgb {
-    let core = [1.00, 0.80, 0.52];
-    let mid = [0.55, 0.52, 0.86];
-    let rim = [0.30, 0.42, 0.78];
-    if rr < 0.5 {
-        mix(core, mid, rr * 2.0)
+    let core = [1.00, 0.80, 0.40]; // warm gold bulge
+    let mid = [0.22, 0.46, 0.86]; // blue arms
+    let rim = [0.28, 0.62, 0.74]; // teal outer
+    if rr < 0.34 {
+        mix(core, mid, rr / 0.34)
     } else {
-        mix(mid, rim, (rr - 0.5) * 2.0)
+        mix(mid, rim, (rr - 0.34) / 0.66)
     }
 }
 
 fn paint_backdrop(out: &mut [u8], w: u32, h: u32, cam: &Camera, gal: &Galaxy) {
     let z = cam.zoom;
     let arms = gal.arms;
-    let twist = 2.3;
+    let twist = gal.twist; // the SAME tightness the systems were placed with
 
     // --- low-res haze buffer (8px cells → pixel-art clouds), world-transformed.
     const CELL: u32 = 8;
@@ -678,7 +721,9 @@ fn paint_backdrop(out: &mut [u8], w: u32, h: u32, cam: &Camera, gal: &Galaxy) {
                 if dens > 0.01 {
                     let rr = (wx * wx + wy * wy).sqrt() / GALAXY_R;
                     let col = haze_tint(rr.min(1.0));
-                    let k = dens * gal.haze * 0.30;
+                    // Contrast curve (dens^1.4) darkens the inter-arm gaps so the
+                    // spiral arms read boldly rather than as an even wash.
+                    let k = dens.powf(1.4) * gal.haze * 0.44;
                     let c = &mut haze[(cy * nw + cx) as usize];
                     c[0] += col[0] * k;
                     c[1] += col[1] * k;
@@ -717,13 +762,43 @@ fn paint_backdrop(out: &mut [u8], w: u32, h: u32, cam: &Camera, gal: &Galaxy) {
                 }
             }
         }
+        // --- star-forming nebula blooms: vivid, saturated colour pockets on the
+        // arms (magenta / pink / cyan). Splatted brighter than the base haze so
+        // they pop, but still under the star glyphs. Radius scales with zoom.
+        for bl in &gal.blooms {
+            let (sx, sy) = to_screen(bl.x, bl.y, cam, w, h);
+            let rpx = (bl.r * z).max(CELL as f32);
+            if sx < -rpx || sy < -rpx || sx > w as f32 + rpx || sy > h as f32 + rpx {
+                continue;
+            }
+            let (ccx, ccy) = ((sx / CELL as f32) as i32, (sy / CELL as f32) as i32);
+            let rc = (rpx / CELL as f32).ceil() as i32;
+            let inv = CELL as f32 / rpx;
+            for dy in -rc..=rc {
+                for dx in -rc..=rc {
+                    let (gx, gy) = (ccx + dx, ccy + dy);
+                    if gx < 0 || gy < 0 || gx >= nw as i32 || gy >= nh as i32 {
+                        continue;
+                    }
+                    let d = ((dx * dx + dy * dy) as f32).sqrt() * inv;
+                    if d >= 1.0 {
+                        continue;
+                    }
+                    let f = (1.0 - d).powi(2) * 0.5 * gal.haze;
+                    let c = &mut haze[(gy as u32 * nw + gx as u32) as usize];
+                    c[0] += bl.col[0] * f;
+                    c[1] += bl.col[1] * f;
+                    c[2] += bl.col[2] * f;
+                }
+            }
+        }
     }
 
     // --- base fill + haze upsample with dither.
     for iy in 0..h {
         let nrow = (iy / CELL) * nw;
         for ix in 0..w {
-            let (mut r, mut g, mut b) = (0.020f32, 0.019, 0.045); // deep-space navy
+            let (mut r, mut g, mut b) = (0.010f32, 0.012, 0.030); // deep near-black
             let c = haze[(nrow + ix / CELL) as usize];
             let d = bayer(ix, iy) * 0.012;
             r += (c[0] + d).max(0.0);
@@ -748,15 +823,15 @@ fn paint_backdrop(out: &mut [u8], w: u32, h: u32, cam: &Camera, gal: &Galaxy) {
         for cy in cy0..=cy1 {
             for cx in cx0..=cx1 {
                 let hh = hash3(cx, cy, 91);
-                if hh < 0.86 {
+                if hh < 0.80 {
                     continue;
                 }
                 let jx = (hh * 137.0).fract();
                 let jy = (hh * 71.3 + 0.37).fract();
                 let (wx, wy) = ((cx as f32 + jx) * dust_sp, (cy as f32 + jy) * dust_sp);
                 let (sx, sy) = to_screen(wx, wy, cam, w, h);
-                let s = 0.10 + 0.16 * (hh - 0.86) / 0.14;
-                add_px(out, w, h, sx as i32, sy as i32, [0.7, 0.78, 0.95], s);
+                let s = 0.12 + 0.28 * (hh - 0.80) / 0.20;
+                add_px(out, w, h, sx as i32, sy as i32, [0.78, 0.84, 1.0], s);
             }
         }
     }
@@ -798,10 +873,22 @@ fn draw_glyphs(out: &mut [u8], w: u32, h: u32, cam: &Camera, gal: &Galaxy, t: f3
         // Gentle twinkle (never fully off).
         let tw = 0.82 + 0.18 * (t * 1.7 + nd.twinkle).sin();
         // Coloured halo.
-        splat(out, w, h, sx, sy, glow, tint, 0.16 * tw, 1.6);
+        splat(out, w, h, sx, sy, glow, tint, 0.22 * tw, 1.6);
         // Bright core → near-white centre for a crisp star.
-        splat(out, w, h, sx, sy, core, tint, 0.9 * tw, 1.2);
-        splat(out, w, h, sx, sy, core * 0.5, [1.0, 1.0, 1.0], 0.8 * tw, 1.0);
+        splat(out, w, h, sx, sy, core, tint, 1.0 * tw, 1.2);
+        splat(out, w, h, sx, sy, core * 0.5, [1.0, 1.0, 1.0], 0.95 * tw, 1.0);
+        // Diffraction glint on the brightest systems — a subtle 4-point star.
+        if nd.importance > 0.55 {
+            let gl = (core * 2.6).min(22.0);
+            let n = gl as i32;
+            for k in 1..=n {
+                let f = (1.0 - k as f32 / gl).max(0.0).powi(2) * 0.5 * tw;
+                add_px(out, w, h, (sx + k as f32) as i32, sy as i32, tint, f);
+                add_px(out, w, h, (sx - k as f32) as i32, sy as i32, tint, f);
+                add_px(out, w, h, sx as i32, (sy + k as f32) as i32, tint, f);
+                add_px(out, w, h, sx as i32, (sy - k as f32) as i32, tint, f);
+            }
+        }
 
         if i as i32 == hover && hover != sel {
             ring(out, w, h, sx, sy, glow + 3.0, [0.75, 0.82, 0.95], 0.5);
