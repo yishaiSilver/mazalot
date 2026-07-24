@@ -304,6 +304,7 @@ pub struct MoonSystem {
     pub parent_radius: f32, // world units
     pub parent_spin: f32,   // parent axial-spin turns per unit time
     pub moons: Vec<Moon>,
+    pub orbit_width: f32,   // dashed orbit line thickness, px (1..=6)
 }
 
 impl MoonSystem {
@@ -350,7 +351,13 @@ impl MoonSystem {
             orbit += radius + rng.range(24.0, 40.0) + i as f32 * 6.0;
         }
 
-        MoonSystem { seed, parent_kind, parent_radius, parent_spin, moons }
+        MoonSystem { seed, parent_kind, parent_radius, parent_spin, moons, orbit_width: 1.0 }
+    }
+
+    /// Set the dashed orbit-line thickness in pixels, clamped to 1..=6 (1 =
+    /// today's single-pixel look).
+    pub fn set_orbit_width(&mut self, px: f32) {
+        self.orbit_width = px.clamp(1.0, 6.0);
     }
 
     /// The outermost extent (world units) — handy for framing / zoom-to-fit.
@@ -373,7 +380,7 @@ impl MoonSystem {
         assert!(out.len() >= (w * h * 4) as usize);
         paint_background(out, w, h, self.seed);
         for m in &self.moons {
-            paint_orbit(out, w, h, cam, m);
+            paint_orbit(out, w, h, cam, m, self.orbit_width);
         }
 
         // Build a draw list of (depth, index). The parent sits at depth 0; the
@@ -725,7 +732,11 @@ fn paint_background(out: &mut [u8], w: u32, h: u32, seed: u32) {
 }
 
 /// Dot in a moon's orbit path as a faint dashed ellipse around the parent.
-fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, m: &Moon) {
+/// `width` (px) thickens each dash by stamping a filled square around every
+/// sampled point; `width == 1.0` collapses to the original single-pixel dot.
+fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, m: &Moon, width: f32) {
+    // Square stamp half-extent: r == 0 at width 1 (pixel-identical to before).
+    let r = (((width - 1.0) * 0.5).round()) as i32;
     let steps = 200;
     for k in 0..steps {
         // Dashed: skip every few samples.
@@ -738,14 +749,20 @@ fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, m: &Moon) {
         let wy = s * m.orbit * ORBIT_FLATTEN * m.tilt;
         let (sx, sy) = to_screen(wx, wy, cam, w, h);
         let (px, py) = (sx as i32, sy as i32);
-        if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
-            continue;
+        // Stamp a filled square centred on the sample, bounds-checked per pixel.
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let (sxp, syp) = (px + dx, py + dy);
+                if sxp < 0 || syp < 0 || sxp >= w as i32 || syp >= h as i32 {
+                    continue;
+                }
+                let idx = ((syp as u32 * w + sxp as u32) * 4) as usize;
+                // Additive faint blue-grey.
+                out[idx] = (out[idx] as u32 + 22).min(84) as u8;
+                out[idx + 1] = (out[idx + 1] as u32 + 26).min(90) as u8;
+                out[idx + 2] = (out[idx + 2] as u32 + 34).min(112) as u8;
+            }
         }
-        let idx = ((py as u32 * w + px as u32) * 4) as usize;
-        // Additive faint blue-grey.
-        out[idx] = (out[idx] as u32 + 22).min(84) as u8;
-        out[idx + 1] = (out[idx + 1] as u32 + 26).min(90) as u8;
-        out[idx + 2] = (out[idx + 2] as u32 + 34).min(112) as u8;
     }
 }
 

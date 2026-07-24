@@ -75,6 +75,13 @@ pub extern "C" fn render(
     sys.render(w, h, &cam, t, out);
 }
 
+/// Set the dashed orbit-line thickness in pixels (clamped 1..=6).
+#[no_mangle]
+pub extern "C" fn moon_set_orbit_width(sys: *mut MoonSystem, px: f32) {
+    let sys = unsafe { &mut *sys };
+    sys.set_orbit_width(px);
+}
+
 /// Number of moons in the system.
 #[no_mangle]
 pub extern "C" fn moon_count(sys: *const MoonSystem) -> u32 {

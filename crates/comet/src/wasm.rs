@@ -95,6 +95,13 @@ pub extern "C" fn scene_extent(scene: *const CometScene) -> f32 {
     scene.extent()
 }
 
+/// Set the dashed orbit ellipse's stroke width in pixels (clamped 1..=6).
+#[no_mangle]
+pub extern "C" fn comet_set_orbit_width(scene: *mut CometScene, px: f32) {
+    let scene = unsafe { &mut *scene };
+    scene.set_orbit_width(px);
+}
+
 /// Write comet `i`'s world position at time `t` into `out` (2 f32: x, y).
 /// Lets a JS camera lock onto and follow the head as it sweeps its orbit.
 #[no_mangle]

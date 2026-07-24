@@ -114,6 +114,9 @@
     <div class="grp">Pixelation</div>
     <div class="ctl"><label>Scene <b id="pixV">1×</b></label><input type="range" id="pix" min="1" max="8" step="1" value="1" /></div>
 
+    <div class="grp">Style</div>
+    <div class="ctl"><label>Orbit thickness <b id="orbitWV">1px</b></label><input type="range" id="orbitW" min="1" max="6" step="1" value="1" /></div>
+
     <button class="wide" id="fit">⤢ Reset view</button>
   </div>
 </div>
@@ -145,6 +148,9 @@ let wasm, sys = 0, bufPtr = 0, bufLen = 0, posPtr = 0, imgData;
 //     rather than magnifying fixed blocks.
 let cam = { x: 0, y: 0, zoom: 1 };
 let seed = 7, pix = 1;
+// Dashed orbit-path stroke thickness in px (1..=6). Kept JS-side and re-applied
+// after every rebuild, since a fresh system defaults back to 1.
+let vOrbitW = 1;
 // One animation clock: orbit's `render` takes a single `t` that drives the
 // Kepler solve (position) and the axial spin together. It accumulates so
 // changing the speed never makes motion jump.
@@ -207,6 +213,8 @@ function buildSystem() {
   for (let i = 0; i < nBodies; i++) bodyKinds.push(wasm.body_kind_at(sys, i));
   if (countAuto) { bodyCount = nBodies; $("count").value = nBodies; }
   $("countV").textContent = nBodies;
+  // A fresh system defaults to width 1 — restore the user's chosen thickness.
+  if (sys) wasm.orbit_set_orbit_width(sys, vOrbitW);
   if (follow >= nBodies) setFollow(-1);       // dropped body we were following
   updateSysInfo();
 }
@@ -376,6 +384,12 @@ $("follow").addEventListener("click", () => {
 $("speed").addEventListener("input", () => { orbitSpeed = parseFloat($("speed").value); $("speedV").textContent = orbitSpeed.toFixed(1) + "×"; });
 // Scene pixelation: the `pix` slider in computeRender.
 $("pix").addEventListener("input", () => { pix = parseInt($("pix").value) || 1; $("pixV").textContent = pix + "×"; });
+// Orbit thickness: how many px wide the dashed eccentric-orbit ellipses draw.
+$("orbitW").addEventListener("input", () => {
+  vOrbitW = parseInt($("orbitW").value) || 1;
+  $("orbitWV").textContent = vOrbitW + "px";
+  if (sys) wasm.orbit_set_orbit_width(sys, vOrbitW);
+});
 window.addEventListener("resize", setupCanvas);
 
 async function main() {

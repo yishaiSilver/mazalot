@@ -113,6 +113,13 @@ pub extern "C" fn system_extent(sys: *const OrbitSystem) -> f32 {
     sys.extent()
 }
 
+/// Set the dashed orbit-path stroke thickness in pixels (clamped to 1..=6).
+#[no_mangle]
+pub extern "C" fn orbit_set_orbit_width(sys: *mut OrbitSystem, px: f32) {
+    let sys = unsafe { &mut *sys };
+    sys.set_orbit_width(px);
+}
+
 /// Write body `i`'s world position at time `t` into `out` (2 f32: x, y).
 /// Lets a JS camera lock onto and follow a body along its ellipse.
 #[no_mangle]

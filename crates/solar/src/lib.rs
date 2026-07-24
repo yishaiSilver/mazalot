@@ -369,6 +369,8 @@ pub struct System {
     // Background pan-parallax rate multiplier (scales every layer's scroll rate
     // `p`; 0 = stars fixed on pan, 1 = default).
     pub star_parallax: f32,
+    // Dashed orbit-path line thickness in pixels (1 = default 1px look).
+    pub orbit_width: f32,
 }
 
 /// How much orbits are squashed vertically to fake a tilted, near-top-down view.
@@ -446,6 +448,7 @@ impl System {
             seed, sun_kind, sun_radius, planets,
             spacing: 1.0, planet_size: 1.0, sun_size: 1.0, planet_pixel: 1.0, sun_pixel: 1.0,
             planet_detail: 160.0, sun_detail: 110.0, star_density: 0.5, star_parallax: 1.0,
+            orbit_width: 1.0,
         }
     }
 
@@ -475,6 +478,11 @@ impl System {
         self.sun_detail = sun_detail.clamp(6.0, 180.0);
         self.star_density = star_density.clamp(0.0, 4.0);
         self.star_parallax = star_parallax.clamp(0.0, 4.0);
+    }
+
+    /// Set the dashed orbit-path line thickness in pixels (1..=6; 1 = default).
+    pub fn set_orbit_width(&mut self, px: f32) {
+        self.orbit_width = px.clamp(1.0, 6.0);
     }
 
     /// The outermost extent (world units) with the current view multipliers —
@@ -956,8 +964,11 @@ fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32, den
 }
 
 /// Dot in a planet's orbit path as a faint dashed ellipse around the sun.
-fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, p: &Planet, spacing: f32) {
+fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, p: &Planet, spacing: f32, width: f32) {
     let steps = 220;
+    // Filled square stamp of half-extent `r`; width == 1 gives r == 0, i.e. the
+    // original single-pixel dot (pixel-identical to the default look).
+    let r = (((width - 1.0) * 0.5).round()) as i32;
     for k in 0..steps {
         // Dashed: skip every few samples.
         if (k / 3) % 2 == 0 {
@@ -969,14 +980,19 @@ fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, p: &Planet, spacing
         let wy = s * p.orbit * ORBIT_FLATTEN * p.tilt * spacing;
         let (sx, sy) = to_screen(wx, wy, cam, w, h);
         let (px, py) = (sx as i32, sy as i32);
-        if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
-            continue;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let (x, y) = (px + dx, py + dy);
+                if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+                    continue;
+                }
+                let idx = ((y as u32 * w + x as u32) * 4) as usize;
+                // Additive faint blue-grey.
+                out[idx] = (out[idx] as u32 + 26).min(90) as u8;
+                out[idx + 1] = (out[idx + 1] as u32 + 30).min(96) as u8;
+                out[idx + 2] = (out[idx + 2] as u32 + 40).min(120) as u8;
+            }
         }
-        let idx = ((py as u32 * w + px as u32) * 4) as usize;
-        // Additive faint blue-grey.
-        out[idx] = (out[idx] as u32 + 26).min(90) as u8;
-        out[idx + 1] = (out[idx + 1] as u32 + 30).min(96) as u8;
-        out[idx + 2] = (out[idx + 2] as u32 + 40).min(120) as u8;
     }
 }
 
@@ -994,7 +1010,7 @@ pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: 
     assert!(out.len() >= (w * h * 4) as usize);
     paint_background(out, w, h, cam, sys.seed, sys.star_density, sys.star_parallax, bgx, bgy);
     for p in &sys.planets {
-        paint_orbit(out, w, h, cam, p, sys.spacing);
+        paint_orbit(out, w, h, cam, p, sys.spacing, sys.orbit_width);
     }
 
     // Build a draw list of (depth, is_sun, planet_index). The sun sits at

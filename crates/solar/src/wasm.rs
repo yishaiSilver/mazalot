@@ -70,6 +70,13 @@ pub extern "C" fn system_set_view(
     );
 }
 
+/// Set the dashed orbit-path line thickness in pixels (clamped to 1..=6).
+#[no_mangle]
+pub extern "C" fn system_set_orbit_width(sys: *mut System, px: f32) {
+    let sys = unsafe { &mut *sys };
+    sys.set_orbit_width(px);
+}
+
 /// Free a system previously returned by [`system_new`].
 #[no_mangle]
 pub extern "C" fn system_free(ptr: *mut System) {

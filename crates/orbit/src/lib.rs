@@ -338,6 +338,7 @@ pub struct OrbitSystem {
     pub sun_kind: usize,
     pub sun_radius: f32, // world units
     pub bodies: Vec<Body>,
+    pub orbit_width: f32, // dashed orbit-path stroke thickness, px (1..=6)
 }
 
 impl OrbitSystem {
@@ -392,7 +393,13 @@ impl OrbitSystem {
             a = a * (1.0 + e) + radius + rng.range(40.0, 72.0) + i as f32 * 6.0;
         }
 
-        OrbitSystem { seed, sun_kind, sun_radius, bodies }
+        OrbitSystem { seed, sun_kind, sun_radius, bodies, orbit_width: 1.0 }
+    }
+
+    /// Set the dashed orbit-path stroke thickness in pixels, clamped to 1..=6
+    /// (1 = the default single-pixel look).
+    pub fn set_orbit_width(&mut self, px: f32) {
+        self.orbit_width = px.clamp(1.0, 6.0);
     }
 
     /// Number of orbiting bodies.
@@ -751,8 +758,11 @@ fn paint_background(out: &mut [u8], w: u32, h: u32, seed: u32) {
 /// ellipse, and mark its perihelion with a small brighter tick. Sampling by
 /// eccentric anomaly `E` traces the *geometry* of the ellipse (not the motion),
 /// so the path is drawn evenly however fast the body actually moves along it.
-fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, b: &Body) {
+fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, b: &Body, width: f32) {
     let steps = 260;
+    // Stroke thickness: stamp a (2r+1)-square at each sample. width 1 -> r 0 ->
+    // a single pixel (identical to the original look).
+    let r = (((width - 1.0) * 0.5).round()) as i32;
     for k in 0..steps {
         // Dashed: skip a couple of samples out of every few.
         if (k / 3) % 2 == 0 {
@@ -761,7 +771,13 @@ fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, b: &Body) {
         let ea = TAU * k as f32 / steps as f32;
         let (wx, wy, _z) = b.project(ea);
         let (sx, sy) = to_screen(wx, wy, cam, w, h);
-        plot(out, w, h, sx as i32, sy as i32, [26, 30, 40], [90, 96, 120]);
+        let (cx, cy) = (sx as i32, sy as i32);
+        for dy in -r..=r {
+            for dx in -r..=r {
+                // `plot` bounds-checks, so no extra guard is needed.
+                plot(out, w, h, cx + dx, cy + dy, [26, 30, 40], [90, 96, 120]);
+            }
+        }
     }
     // Perihelion marker: the closest point, at E = 0. A small brighter plus.
     let (wx, wy, _z) = b.project(0.0);
@@ -786,7 +802,7 @@ impl OrbitSystem {
 
         paint_background(out, w, h, self.seed);
         for b in &self.bodies {
-            paint_orbit(out, w, h, &cam, b);
+            paint_orbit(out, w, h, &cam, b, self.orbit_width);
         }
 
         // Draw list of (depth, index). The star sits at depth 0 (world origin);

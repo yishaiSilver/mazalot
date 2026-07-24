@@ -400,6 +400,8 @@ pub struct CometScene {
     pub star_kind: usize,
     pub star_radius: f32, // world units
     pub comets: Vec<Comet>,
+    /// Stroke width (px) of the dashed orbit ellipse; 1.0 = the original look.
+    pub orbit_width: f32,
 }
 
 impl CometScene {
@@ -446,7 +448,12 @@ impl CometScene {
             comets.push(Comet { a, e, arg, period, phase, tilt, nucleus, tint, seed: cseed });
         }
 
-        CometScene { seed, star_kind, star_radius, comets }
+        CometScene { seed, star_kind, star_radius, comets, orbit_width: 1.0 }
+    }
+
+    /// Set the orbit-ellipse stroke width in pixels, clamped to 1..=6.
+    pub fn set_orbit_width(&mut self, px: f32) {
+        self.orbit_width = px.clamp(1.0, 6.0);
     }
 
     /// Outermost extent (world units) — the largest aphelion — for zoom-to-fit.
@@ -467,7 +474,7 @@ impl CometScene {
         assert!(out.len() >= (w * h * 4) as usize);
         paint_background(out, w, h, cam, self.seed);
         for c in &self.comets {
-            paint_orbit(out, w, h, cam, c);
+            paint_orbit(out, w, h, cam, c, self.orbit_width);
         }
 
         // Star tile at the world origin (the focus).
@@ -588,7 +595,7 @@ fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32) {
 /// Dot in a comet's orbit as a faint dashed ellipse around the star. Samples the
 /// true Keplerian ellipse (uniform in eccentric anomaly), so the drawn path
 /// exactly matches where the comet travels.
-fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, c: &Comet) {
+fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, c: &Comet, width: f32) {
     let steps = 260;
     let (sw, cw) = c.arg.sin_cos();
     let b = c.b();
@@ -605,10 +612,19 @@ fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, c: &Comet) {
         let ry = (ox * sw + oy * cw) * ORBIT_FLATTEN * c.tilt;
         let (sx, sy) = to_screen(rx, ry, cam, w, h);
         let (px, py) = (sx as i32, sy as i32);
-        if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
-            continue;
+        // Stamp a filled square of half-extent `r` centred on the point; each
+        // pixel is bounds-checked here, so the centre needs no separate check.
+        // `width == 1.0` → `r == 0` → a single pixel, identical to before.
+        let r = (((width - 1.0) * 0.5).round()) as i32;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let (sx2, sy2) = (px + dx, py + dy);
+                if sx2 < 0 || sy2 < 0 || sx2 >= w as i32 || sy2 >= h as i32 {
+                    continue;
+                }
+                add_px(out, w, sx2 as u32, sy2 as u32, [0.10, 0.12, 0.18]);
+            }
         }
-        add_px(out, w, px as u32, py as u32, [0.10, 0.12, 0.18]);
     }
 }
 

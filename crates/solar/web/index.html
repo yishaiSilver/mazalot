@@ -106,6 +106,7 @@
     <div class="ctl"><label>Planet spacing <b id="spacingV">1.00×</b></label><input type="range" id="spacing" min="0.4" max="2.5" step="0.05" value="1" /></div>
     <div class="ctl"><label>Planet size <b id="psizeV">1.00×</b></label><input type="range" id="psize" min="0.3" max="3" step="0.05" value="1" /></div>
     <div class="ctl"><label>Sun size <b id="ssizeV">1.00×</b></label><input type="range" id="ssize" min="0.3" max="3" step="0.05" value="1" /></div>
+    <div class="ctl"><label>Orbit thickness <b id="orbwV">1px</b></label><input type="range" id="orbw" min="1" max="6" step="1" value="1" /></div>
 
     <div class="grp">Motion</div>
     <div class="ctl"><label>Orbit speed <b id="speedV">1.0×</b></label><input type="range" id="speed" min="0" max="4" step="0.1" value="1" /></div>
@@ -172,6 +173,7 @@ let bgPanX = 0, bgPanY = 0, camPrevX = 0, camPrevY = 0, bgResync = true;
 // (structural — needs a rebuild). countAuto keeps the seed-derived count until
 // the user sets one.
 let vSpacing = 1, vPsize = 1, vSsize = 1, vPpix = 1, vSpix = 1, vPdetail = 160, vSdetail = 110, vStarDen = 0.5, vStarPar = 1;
+let vOrbitW = 1; // dashed orbit-path line thickness in px
 let planetCount = 6, countAuto = true;
 
 // Per-frame pixel-budget cap (perf): a phone renders far fewer pixels than a
@@ -229,6 +231,9 @@ function buildSystem() {
   if (countAuto) { planetCount = nPlanets; $("count").value = nPlanets; }
   $("countV").textContent = nPlanets;
   applyView();
+  // A rebuild makes a fresh System (orbit width defaults to 1), so re-apply the
+  // stored thickness — keeps the chosen look across seed/planet-count changes.
+  if (sys) wasm.system_set_orbit_width(sys, vOrbitW);
   $("sysinfo").textContent = `${SUN_NAMES[sunKind] ?? "star"} · ${nPlanets} planets · seed ${seed}`;
 }
 
@@ -401,6 +406,13 @@ liveMul("psize", "psizeV", v => vPsize = v, v => v.toFixed(2) + "×");
 liveMul("ssize", "ssizeV", v => vSsize = v, v => v.toFixed(2) + "×");
 liveMul("ppix", "ppixV", v => vPpix = v, v => v + "×");
 liveMul("spix", "spixV", v => vSpix = v, v => v + "×");
+
+// Orbit-path line thickness: pushes straight to wasm (not a set_view param).
+$("orbw").addEventListener("input", () => {
+  vOrbitW = parseInt($("orbw").value) || 1;
+  $("orbwV").textContent = vOrbitW + "px";
+  if (sys) wasm.system_set_orbit_width(sys, vOrbitW);
+});
 
 // Purely JS-side: animation rate and scene render density.
 $("speed").addEventListener("input", () => { orbitSpeed = parseFloat($("speed").value); $("speedV").textContent = orbitSpeed.toFixed(1) + "×"; });

@@ -107,6 +107,9 @@
     <div class="grp">Motion</div>
     <div class="ctl"><label>Orbit speed <b id="speedV">1.0×</b></label><input type="range" id="speed" min="0" max="4" step="0.1" value="1" /></div>
 
+    <div class="grp">Orbits</div>
+    <div class="ctl"><label>Orbit thickness <b id="orbitWV">1px</b></label><input type="range" id="orbitW" min="1" max="6" step="1" value="1" /></div>
+
     <div class="grp">Pixelation</div>
     <div class="ctl"><label>Scene <b id="pixV">1×</b></label><input type="range" id="pix" min="1" max="8" step="1" value="1" /></div>
 
@@ -143,7 +146,7 @@ let cam = { x: 0, y: 0, zoom: 1 };
 let seed = 7, pix = 1;
 // A single animation clock: moon drives orbital motion, axial spin, and surface
 // drift all off one `t`, so there is just one accumulator + one speed here.
-let t = 0, orbitSpeed = 1;
+let t = 0, orbitSpeed = 1, vOrbitW = 1;
 let parentKind = 0, moonKinds = [], nMoons = 0;
 let last = performance.now();
 let curW = 0, curH = 0;               // last frame's render dims
@@ -194,6 +197,9 @@ function fitView() {
 function buildSystem() {
   if (sys) wasm.moon_free(sys);
   sys = wasm.moon_new_params(seed, countAuto ? 0 : moonCount);
+  // A fresh system defaults to width 1 — re-apply the chosen thickness so it
+  // survives seed / moon-count rebuilds.
+  if (sys) wasm.moon_set_orbit_width(sys, vOrbitW);
   nMoons = wasm.moon_count(sys);
   parentKind = wasm.parent_kind_of(sys);
   moonKinds = [];
@@ -328,6 +334,10 @@ $("count").addEventListener("input", () => {
 // Purely JS-side: animation rate and scene render density.
 $("speed").addEventListener("input", () => { orbitSpeed = parseFloat($("speed").value); $("speedV").textContent = orbitSpeed.toFixed(1) + "×"; });
 $("pix").addEventListener("input", () => { pix = parseInt($("pix").value) || 1; $("pixV").textContent = pix + "×"; });
+$("orbitW").addEventListener("input", () => {
+  vOrbitW = parseInt($("orbitW").value) || 1; $("orbitWV").textContent = vOrbitW + "px";
+  if (sys) wasm.moon_set_orbit_width(sys, vOrbitW);
+});
 window.addEventListener("resize", setupCanvas);
 
 async function main() {

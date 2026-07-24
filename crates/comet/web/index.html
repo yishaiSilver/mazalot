@@ -110,6 +110,8 @@
     <div class="ctl"><label>Orbit speed <b id="speedV">1.0×</b></label><input type="range" id="speed" min="0" max="4" step="0.1" value="1" /></div>
     <button class="wide" id="follow">◎ Follow comet: off</button>
 
+    <div class="ctl"><label>Orbit thickness <b id="orbitWV">1px</b></label><input type="range" id="orbitW" min="1" max="6" step="1" value="1" /></div>
+
     <div class="grp">Pixelation</div>
     <div class="ctl"><label>Scene <b id="pixV">1×</b></label><input type="range" id="pix" min="1" max="8" step="1" value="1" /></div>
 
@@ -139,7 +141,7 @@ let wasm, scene = 0, bufPtr = 0, bufLen = 0, posPtr = 0, imgData;
 //     REGARDLESS of zoom, then upscaled crisply — a consistent pixel-art look at
 //     every zoom, while zooming in renders bodies at higher resolution.
 let cam = { x: 0, y: 0, zoom: 1 };
-let seed = 7, pix = 1;
+let seed = 7, pix = 1, vOrbitW = 1;
 // Single animation clock (comet's `render` + `comet_pos` take one time `t`).
 let tClock = 0, orbitSpeed = 1;
 let follow = -1;                        // comet index the camera tracks, or -1
@@ -196,6 +198,8 @@ function buildScene() {
   scene = wasm.comet_new_params(seed, countAuto ? 0 : cometCount);
   nComets = wasm.comet_count(scene);
   starKind = wasm.star_kind_of(scene);
+  // A rebuild yields a fresh scene at the default width — re-apply the chosen one.
+  if (scene) wasm.comet_set_orbit_width(scene, vOrbitW);
   if (countAuto) { cometCount = nComets; $("count").value = nComets; }
   $("countV").textContent = nComets;
   if (follow >= nComets) setFollow(-1);
@@ -349,6 +353,11 @@ $("follow").addEventListener("click", () => {
 // Purely JS-side: animation rate and scene render density.
 $("speed").addEventListener("input", () => { orbitSpeed = parseFloat($("speed").value); $("speedV").textContent = orbitSpeed.toFixed(1) + "×"; });
 $("pix").addEventListener("input", () => { pix = parseInt($("pix").value) || 1; $("pixV").textContent = pix + "×"; });
+// Orbit thickness is a render param on the scene — update the live handle in place.
+$("orbitW").addEventListener("input", () => {
+  vOrbitW = parseInt($("orbitW").value) || 1; $("orbitWV").textContent = vOrbitW + "px";
+  if (scene) wasm.comet_set_orbit_width(scene, vOrbitW);
+});
 window.addEventListener("resize", setupCanvas);
 
 async function main() {
