@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>Eccentric Orbits — Rust · WASM</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #05050b;
+    color: #d7dae6; font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    /* Lock the page so touch gestures drive the canvas, not the browser. */
+    position: fixed; width: 100%; overscroll-behavior: none; touch-action: none;
+    -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  #stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block;
+    cursor: grab; touch-action: none; background: #05050b;
+    /* Upscale the internal buffer as crisp square pixels, not a blur — so the
+       "pixel size" slider reads as chunky pixel-art. */
+    image-rendering: pixelated; image-rendering: crisp-edges; }
+  #stage.drag { cursor: grabbing; }
+
+  .hud { position: fixed; pointer-events: none; z-index: 5;
+    text-shadow: 0 1px 3px rgba(0,0,0,.9); }
+  .topleft { top: 18px; left: 20px; }
+  .topleft h1 { margin: 0; font-size: 12px; font-weight: 600; letter-spacing: .16em;
+    text-transform: uppercase; color: #8790ad; }
+  .viewing { margin-top: 8px; font-size: 22px; font-weight: 700; color: #eef1f8; text-transform: capitalize;
+    min-height: 28px; }
+  .viewing small { display: block; font-size: 12px; font-weight: 500; letter-spacing: .04em;
+    color: #7b83a2; text-transform: none; margin-top: 2px; }
+  .hint { position: fixed; top: 18px; right: 20px; z-index: 5; pointer-events: none;
+    font-size: 12px; color: #6b7290; text-align: right; text-shadow: 0 1px 3px rgba(0,0,0,.9); letter-spacing: .03em; }
+  .hint b { color: #aeb4cd; font-weight: 600; }
+
+  /* Control dock — docked bottom-right on desktop, collapsible. */
+  .dock { position: fixed; right: 16px; bottom: 16px; z-index: 6; width: 268px;
+    max-width: calc(100vw - 32px);
+    background: rgba(14,15,24,.86); border: 1px solid rgba(255,255,255,.08);
+    border-radius: 14px; box-shadow: 0 10px 40px rgba(0,0,0,.6); backdrop-filter: blur(9px); }
+  .dock-head { display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 12px; cursor: pointer; user-select: none; }
+  .dock-head span { font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: #8790ad; }
+  .dock-head .chev { color: #8790ad; transition: transform .18s; }
+  .dock.collapsed .chev { transform: rotate(180deg); }
+  .dock-body { max-height: min(64vh, 560px); overflow-y: auto; overscroll-behavior: contain;
+    padding: 2px 14px 14px; }
+  .dock.collapsed .dock-body { display: none; }
+
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row input[type=number] { flex: 1; }
+  .grp { font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: #565d78;
+    margin: 15px 0 8px; border-top: 1px solid rgba(255,255,255,.07); padding-top: 11px; }
+  .ctl { margin: 0 0 10px; }
+  .ctl label { display: flex; justify-content: space-between; font-size: 12px; color: #9aa0bb; margin-bottom: 4px; }
+  .ctl label b { color: #eef1f8; font-variant-numeric: tabular-nums; font-weight: 600; }
+  input[type=number] { width: 100%; box-sizing: border-box; padding: 8px 9px; font: inherit; font-size: 13px;
+    color: #eef1f8; background: #0e0f18; border: 1px solid rgba(255,255,255,.12); border-radius: 8px; }
+  input[type=range] { width: 100%; accent-color: #f4b74a; cursor: pointer; }
+  button { padding: 8px 12px; font: inherit; font-size: 13px; color: #d7dae6; background: #1a1c2b;
+    border: 1px solid rgba(255,255,255,.12); border-radius: 8px; cursor: pointer; white-space: nowrap;
+    -webkit-tap-highlight-color: transparent; }
+  button:hover { background: #23263a; }
+  button:active { transform: translateY(1px); }
+  button.primary { color: #06060c; font-weight: 700; border: 0;
+    background: linear-gradient(180deg, #ffe8b0, #f4b74a); }
+  button.wide { width: 100%; margin-top: 14px; }
+  button.follow { width: 100%; margin-top: 4px; }
+  button.follow.on { color: #06060c; font-weight: 700; border: 0;
+    background: linear-gradient(180deg, #bfe6ff, #6bb6f4); }
+  .err { position: fixed; inset: 0; display: none; place-items: center; text-align: center;
+    color: #ff9a9a; padding: 40px; z-index: 10; }
+
+  /* Phones / small screens: dock becomes a bottom sheet; drop the desktop hint. */
+  @media (max-width: 700px), (pointer: coarse) {
+    .topleft { top: 10px; left: 12px; }
+    .topleft h1 { font-size: 10px; letter-spacing: .12em; }
+    .viewing { font-size: 17px; margin-top: 5px; min-height: 22px; }
+    .viewing small { font-size: 11px; }
+    .hint { display: none; }
+    .dock { left: 10px; right: 10px; bottom: calc(10px + env(safe-area-inset-bottom)); width: auto; }
+    .dock-body { max-height: 46vh; }
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+
+<div class="hud topleft">
+  <h1>Eccentric Orbits</h1>
+  <div class="viewing" id="viewing">loading…<small id="sysinfo">Rust → WebAssembly</small></div>
+</div>
+<div class="hint">
+  <b>drag</b> to pan · <b>scroll / pinch</b> to zoom<br><b>follow body</b> to ride an ellipse
+</div>
+
+<div class="dock" id="dock">
+  <div class="dock-head" id="dockHead">
+    <span>Controls</span><span class="chev">▾</span>
+  </div>
+  <div class="dock-body">
+    <div class="row">
+      <input type="number" id="seed" min="0" value="7" title="seed" />
+      <button id="dice" title="random seed">🎲</button>
+      <button class="primary" id="gen">✦ Generate</button>
+    </div>
+
+    <div class="grp">Layout</div>
+    <div class="ctl"><label>Bodies <b id="countV">—</b></label><input type="range" id="count" min="1" max="10" step="1" value="5" /></div>
+
+    <div class="grp">Motion</div>
+    <div class="ctl"><label>Orbit speed <b id="speedV">1.0×</b></label><input type="range" id="speed" min="0" max="4" step="0.1" value="1" /></div>
+    <button class="follow" id="follow">◎ Follow body: off</button>
+
+    <div class="grp">Pixelation</div>
+    <div class="ctl"><label>Scene <b id="pixV">1×</b></label><input type="range" id="pix" min="1" max="8" step="1" value="1" /></div>
+
+    <button class="wide" id="fit">⤢ Reset view</button>
+  </div>
+</div>
+
+<div class="err" id="err"></div>
+
+<script type="module">
+// Names must stay index-aligned with the Rust tables (SUNS / BKINDS in lib.rs).
+const SUN_NAMES  = ["amber", "ember", "argent", "azure"];
+const BODY_NAMES = ["rust world", "slate world", "verdant", "rime world", "banded gas", "azure gas", "molten"];
+
+const $ = id => document.getElementById(id);
+const canvas = $("stage");
+const ctx = canvas.getContext("2d", { alpha: false });
+ctx.imageSmoothingEnabled = false;
+const off = document.createElement("canvas");
+const octx = off.getContext("2d");
+
+let wasm, sys = 0, bufPtr = 0, bufLen = 0, posPtr = 0, imgData;
+// Two INDEPENDENT quantities:
+//   • cam.zoom = MAGNIFICATION — display (CSS) px per world unit; wheel / pinch /
+//     fit change it. Bigger = a closer camera: things look larger AND resolve
+//     more detail.
+//   • pix      = PIXEL SIZE — how many display px one rendered pixel spans (the
+//     slider). The render buffer is sized so a rendered pixel is always ~`pix`
+//     display px REGARDLESS of zoom, then upscaled crisply. So the on-screen
+//     block size is constant at every zoom (a consistent pixel-art look), while
+//     zooming in renders bodies at a higher resolution — zoom reveals detail
+//     rather than magnifying fixed blocks.
+let cam = { x: 0, y: 0, zoom: 1 };
+let seed = 7, pix = 1;
+// One animation clock: orbit's `render` takes a single `t` that drives the
+// Kepler solve (position) and the axial spin together. It accumulates so
+// changing the speed never makes motion jump.
+let t = 0;
+let orbitSpeed = 1;
+let follow = -1;                        // body index the camera tracks, or -1
+let bodyKinds = [], sunKind = 0, nBodies = 0;
+let last = performance.now();
+let curW = 0, curH = 0, curZoom = 1;    // last frame's render dims + render-px/world
+
+// Body count is structural (needs a rebuild via orbit_new_params). countAuto
+// keeps the seed-derived count (4..=6) until the user sets one.
+let bodyCount = 5, countAuto = true;
+
+// Per-frame pixel-budget cap (perf): a phone renders far fewer pixels than a
+// desktop. The internal buffer is allocated once at this size and reused.
+const coarse = window.matchMedia("(pointer: coarse)").matches;
+const PIXEL_BUDGET = coarse ? 430_000 : 1_600_000;
+
+// Match the canvas backing store to the display size; the crisp upscale from the
+// (smaller) render buffer happens in drawImage with smoothing off.
+function setupCanvas() {
+  canvas.width = window.innerWidth; canvas.height = window.innerHeight;
+  canvas.style.width = window.innerWidth + "px"; canvas.style.height = window.innerHeight + "px";
+  ctx.imageSmoothingEnabled = false; // reset whenever the backing store resizes
+}
+
+// Resolve this frame's render buffer. Its size follows `pix` (one rendered pixel
+// ≈ `pix` display px) and is INDEPENDENT of zoom, so the on-screen block size is
+// constant. `zoomArg` = render-px-per-world = w·zoom/cssW, which GROWS with zoom,
+// so bodies are rendered at higher resolution as you zoom in (detail, not bigger
+// blocks). The budget cap only makes it chunkier under load.
+function computeRender() {
+  const cssW = canvas.width, cssH = canvas.height;
+  let w = Math.round(cssW / pix);
+  let h = Math.round(cssH / pix);
+  const bs = Math.min(1, Math.sqrt(PIXEL_BUDGET / (w * h)));
+  w = Math.round(w * bs); h = Math.round(h * bs);
+  // Clamp + quantize to 8px steps so the buffer is reallocated rarely.
+  w = Math.max(16, w - (w % 8)); h = Math.max(12, h - (h % 8));
+  return { w, h, zoomArg: w * cam.zoom / cssW };
+}
+
+function fitView() {
+  const ext = wasm.system_extent(sys);
+  // On-screen half-span = ext * zoom; fit it into ~90% of the viewport.
+  const z = Math.min(0.45 * canvas.width / ext, 0.45 * canvas.height / ext);
+  cam = { x: 0, y: 0, zoom: z };
+  setFollow(-1);
+}
+
+// (Re)build the system for the current seed + body count. Does NOT touch the
+// camera — callers decide whether to fit.
+function buildSystem() {
+  if (sys) wasm.orbit_free(sys);
+  sys = wasm.orbit_new_params(seed, countAuto ? 0 : bodyCount);
+  nBodies = wasm.body_count(sys);
+  sunKind = wasm.sun_kind_of(sys);
+  bodyKinds = [];
+  for (let i = 0; i < nBodies; i++) bodyKinds.push(wasm.body_kind_at(sys, i));
+  if (countAuto) { bodyCount = nBodies; $("count").value = nBodies; }
+  $("countV").textContent = nBodies;
+  if (follow >= nBodies) setFollow(-1);       // dropped body we were following
+  updateSysInfo();
+}
+
+function updateSysInfo() {
+  const word = nBodies === 1 ? "world" : "worlds";
+  $("sysinfo").textContent = `${SUN_NAMES[sunKind] ?? "star"} star · ${nBodies} ${word} · seed ${seed}`;
+}
+
+// A new seed: rebuild and re-frame the whole system.
+function generate(s) {
+  seed = s >>> 0;
+  $("seed").value = seed;
+  buildSystem();
+  t = 0;
+  fitView();
+}
+
+// Cycle / set the followed body. -1 = off (free camera).
+function setFollow(i) {
+  follow = i;
+  const btn = $("follow");
+  if (follow >= 0) {
+    btn.classList.add("on");
+    btn.textContent = `◎ Following ${BODY_NAMES[bodyKinds[follow]] ?? "body " + follow}`;
+  } else {
+    btn.classList.remove("on");
+    btn.textContent = "◎ Follow body: off";
+  }
+}
+
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  t += dt * orbitSpeed;
+
+  // Camera follows a body as it sweeps its ellipse — the best way to SEE it
+  // accelerate through perihelion and dawdle at aphelion.
+  if (follow >= 0 && follow < nBodies) {
+    wasm.body_pos(sys, follow, t, posPtr);
+    const p = new Float32Array(wasm.memory.buffer, posPtr, 2);
+    cam.x = p[0]; cam.y = p[1];
+  }
+
+  const { w, h, zoomArg } = computeRender();
+  if (w !== curW || h !== curH) {   // (re)size the render surfaces only on change
+    curW = w; curH = h;
+    off.width = w; off.height = h;
+    imgData = octx.createImageData(w, h);
+  }
+  curZoom = zoomArg;
+  wasm.render(sys, bufPtr, w, h, cam.x, cam.y, zoomArg, t);
+  const view = new Uint8Array(wasm.memory.buffer, bufPtr, w * h * 4);
+  imgData.data.set(view);
+  octx.putImageData(imgData, 0, 0);
+  // Crisp upscale of the small render buffer to the full display (no smoothing).
+  ctx.drawImage(off, 0, 0, w, h, 0, 0, canvas.width, canvas.height);
+
+  // HUD headline: the star, or — while following — the body and its eccentricity,
+  // the headline knob this crate exists to show off.
+  const v = $("viewing");
+  if (follow >= 0 && follow < nBodies) {
+    const e = wasm.body_ecc_at(sys, follow);
+    v.firstChild.textContent = "◎ following " + (BODY_NAMES[bodyKinds[follow]] ?? "body") + " · e=" + e.toFixed(2) + " ";
+  } else {
+    v.firstChild.textContent = (SUN_NAMES[sunKind] ?? "amber") + " star ";
+  }
+  requestAnimationFrame(frame);
+}
+
+// ---- interaction: one finger / mouse drags to pan, two fingers pinch to
+//      zoom + pan, the wheel zooms. Unified over Pointer Events so mouse and
+//      touch share one code path. A drag releases follow. --------------------
+const clampZoom = z => Math.min(60, Math.max(0.04, z));
+// Everything below works in CSS px; cam.zoom is CSS px per world unit, and the
+// canvas backing store is 1:1 with CSS px, so a client-relative point maps to
+// world directly — no render-resolution factor involved (that's the whole point:
+// interaction and framing are independent of how pixelated the render is).
+
+const pointers = new Map();     // active pointerId -> {x, y} in CSS px
+let panLast = null;             // last pos for single-pointer drag
+let pinch = null;               // captured at pinch start
+
+function startPinch() {
+  const [a, b] = [...pointers.values()];
+  pinch = {
+    dist: Math.hypot(a.x - b.x, a.y - b.y) || 1, zoom: cam.zoom,
+    mx0: (a.x + b.x) / 2, my0: (a.y + b.y) / 2, // client-px midpoint at start
+    camx0: cam.x, camy0: cam.y,
+  };
+  panLast = null; setFollow(-1);
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const first = pointers.size === 0;
+  try { canvas.setPointerCapture(e.pointerId); } catch {}
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  canvas.classList.add("drag");
+  if (first) panLast = { x: e.clientX, y: e.clientY };
+  if (pointers.size === 2) startPinch();
+});
+
+canvas.addEventListener("pointermove", e => {
+  if (!pointers.has(e.pointerId)) return;
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+  if (pointers.size >= 2 && pinch) {                 // two-finger pinch: zoom + pan
+    const [a, b] = [...pointers.values()];
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2; // client px
+    const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1;
+    // Zoom about the camera CENTRE (the zoom itself never moves cam); a
+    // two-finger drag pans by the midpoint movement.
+    cam.zoom = clampZoom(pinch.zoom * dist / pinch.dist);
+    cam.x = pinch.camx0 - (mx - pinch.mx0) / cam.zoom;
+    cam.y = pinch.camy0 - (my - pinch.my0) / cam.zoom;
+    return;
+  }
+
+  if (panLast && pointers.size === 1) {              // one-finger / mouse drag: pan
+    const dx = e.clientX - panLast.x, dy = e.clientY - panLast.y;
+    panLast = { x: e.clientX, y: e.clientY };
+    if (follow >= 0 && (Math.abs(dx) + Math.abs(dy) > 2)) setFollow(-1); // grabbing releases follow
+    cam.x -= dx / cam.zoom; cam.y -= dy / cam.zoom;  // world units = CSS px / zoom
+  }
+});
+
+function liftPointer(e) {
+  try { canvas.releasePointerCapture(e.pointerId); } catch {}
+  pointers.delete(e.pointerId);
+  if (pointers.size < 2) pinch = null;
+  if (pointers.size === 1) { const p = [...pointers.values()][0]; panLast = { x: p.x, y: p.y }; }
+  if (pointers.size === 0) { canvas.classList.remove("drag"); panLast = null; }
+}
+canvas.addEventListener("pointerup", liftPointer);
+canvas.addEventListener("pointercancel", liftPointer);
+
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  // Zoom about the camera CENTRE: only the zoom changes, cam stays put.
+  cam.zoom = clampZoom(cam.zoom * Math.exp(-e.deltaY * 0.0015));
+}, { passive: false });
+
+// ---- controls --------------------------------------------------------------
+$("dockHead").addEventListener("click", () => $("dock").classList.toggle("collapsed"));
+
+// Generate makes a NEW random system each click; the dice does the same. Type a
+// number in the seed field to load a specific system instead.
+$("gen").addEventListener("click", () => generate((Math.random() * 0xffffff) >>> 0));
+$("dice").addEventListener("click", () => generate((Math.random() * 0xffffff) >>> 0));
+$("seed").addEventListener("change", () => generate((parseInt($("seed").value) || 0)));
+$("fit").addEventListener("click", fitView);
+
+// Body count is structural → rebuild (keep the camera). Once set, it sticks
+// across new seeds (countAuto stays off).
+$("count").addEventListener("input", () => {
+  bodyCount = parseInt($("count").value) || 1; countAuto = false;
+  $("countV").textContent = bodyCount; buildSystem();
+});
+
+// Follow: cycle the camera target off → 0 → 1 → … → n-1 → off.
+$("follow").addEventListener("click", () => {
+  if (nBodies === 0) return;
+  const next = follow + 1;
+  setFollow(next >= nBodies ? -1 : next);
+});
+
+// Orbit speed: purely JS-side animation rate for the render clock `t`.
+$("speed").addEventListener("input", () => { orbitSpeed = parseFloat($("speed").value); $("speedV").textContent = orbitSpeed.toFixed(1) + "×"; });
+// Scene pixelation: the `pix` slider in computeRender.
+$("pix").addEventListener("input", () => { pix = parseInt($("pix").value) || 1; $("pixV").textContent = pix + "×"; });
+window.addEventListener("resize", setupCanvas);
+
+async function main() {
+  const res = await fetch("./orbit.wasm?v=" + Date.now(), { cache: "no-store" });
+  const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
+  wasm = instance.exports;
+  posPtr = wasm.alloc(2 * 4);              // scratch for body_pos
+  // Sized to the budget once (+ margin to absorb rounding in computeRender, so
+  // w*h*4 can never exceed this and the WASM render stays in bounds).
+  bufLen = (PIXEL_BUDGET + 16384) * 4;
+  bufPtr = wasm.alloc(bufLen);
+  setupCanvas();
+  generate(7);
+  requestAnimationFrame(frame);
+}
+main().catch(e => { $("err").style.display = "grid"; $("err").textContent = "failed to load orbit.wasm — " + e; console.error(e); });
+</script>
+</body>
+</html>

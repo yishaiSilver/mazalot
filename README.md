@@ -180,6 +180,25 @@ Off-screen bodies are culled and each body's tile is bounded, so zoom stays
 responsive. Works on touch/mobile. (`node verify.mjs` renders the system
 headlessly as a build check.)
 
+**Web — the solar-system companion demos (moons, asteroid belt, comet, orbits):**
+```bash
+for c in moon asteroid comet orbit; do
+  cargo build -p $c --target wasm32-unknown-unknown --release --no-default-features
+  cp target/wasm32-unknown-unknown/release/$c.wasm crates/$c/web/$c.wasm
+done
+python3 -m http.server 8000   # open http://localhost:8000/ and pick a demo
+```
+Each is a sibling of the solar demo — drag to pan, scroll / pinch to zoom, a
+collapsible **Controls** dock, and the same constant-block pixel-art scheme:
+- **moon** — a planet with orbiting moons, depth-sorted so they pass in front of
+  and behind it. Sliders: moon count, orbit speed, scene pixelation.
+- **asteroid** — a drifting belt; live `belt_set_view` sliders for rock count,
+  spacing, rock size, star density, and a center-marker toggle.
+- **comet** — a comet on an eccentric orbit with an anti-sunward tail; a **Follow
+  comet** button locks the camera to the head as it whips through perihelion.
+- **orbit** — genuine eccentric, inclined Keplerian orbits (star at a focus); a
+  **Follow body** button tracks a world and shows its eccentricity in the HUD.
+
 **Web — live creature (the bird half):**
 ```bash
 cargo build -p bird-web --target wasm32-unknown-unknown --release

@@ -76,6 +76,39 @@ const DEMOS = [
       ex.render(s, ptr, size, size, 0, 0, zoom, 3.0);
       ex.system_free(s);
     } },
+  { name: "Moons", crate: "moon", sub: "planets with orbiting moons", wasm: "moon.wasm",
+    render: (m, ex, ptr, size) => {
+      // render(sys, buf, w, h, cam_x, cam_y, zoom, t)
+      const s = ex.moon_new((Math.random()*1e9)|0);
+      const ext = ex.system_extent(s);
+      const zoom = Math.min(0.45*size/ext, 0.45*size/(ext*0.55)) * 1.3;
+      ex.render(s, ptr, size, size, 0, 0, zoom, 3.0);
+      ex.moon_free(s);
+    } },
+  { name: "Asteroid Belt", crate: "asteroid", sub: "drifting rock fields", wasm: "asteroid.wasm",
+    render: (m, ex, ptr, size) => {
+      const s = ex.belt_new((Math.random()*1e9)|0);
+      const ext = ex.belt_extent(s);
+      const zoom = Math.min(0.45*size/ext, 0.45*size/(ext*0.55)) * 1.3;
+      ex.render(s, ptr, size, size, 0, 0, zoom, 4.0);
+      ex.belt_free(s);
+    } },
+  { name: "Comet", crate: "comet", sub: "eccentric orbits & tails", wasm: "comet.wasm",
+    render: (m, ex, ptr, size) => {
+      const s = ex.comet_new((Math.random()*1e9)|0);
+      const ext = ex.scene_extent(s);
+      const zoom = Math.min(0.45*size/ext, 0.45*size/(ext*0.55)) * 1.3;
+      ex.render(s, ptr, size, size, 0, 0, zoom, 2.0);
+      ex.comet_free(s);
+    } },
+  { name: "Eccentric Orbits", crate: "orbit", sub: "Keplerian ellipses", wasm: "orbit.wasm",
+    render: (m, ex, ptr, size) => {
+      const s = ex.orbit_new((Math.random()*1e9)|0);
+      const ext = ex.system_extent(s);
+      const zoom = Math.min(0.45*size/ext, 0.45*size/(ext*0.55)) * 1.3;
+      ex.render(s, ptr, size, size, 0, 0, zoom, 3.0);
+      ex.orbit_free(s);
+    } },
   { name: "Aliens", crate: "bird", sub: "hybrid avian creatures", wasm: "bird.wasm",
     render: (m, ex, ptr, size) => {
       // render(ptr, size, seed, phase, energy)
