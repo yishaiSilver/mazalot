@@ -105,6 +105,39 @@ fn main() {
     println!("    └ stars (density 0.5)           {:7.2} ms   {:5.1}%", stars, 100.0 * stars / t_full);
     println!("  bodies (sun + {} planets)          {:7.2} ms   {:5.1}%", sys.planets.len(), bodies, 100.0 * bodies / t_full);
 
+    // Zoomed OUT: the whole system shrinks to a few px, bodies get culled or
+    // render into tiny (cheap, cached) tiles, so the BACKGROUND is ~all the cost.
+    // And every layer is active — the far star layer + nebula fade IN at low
+    // zoom (opposite of zooming onto a body), so the star pass is at its most
+    // expensive here.
+    println!("\n── zoomed out (zoom = fit x0.30) ────────────");
+    let zout = Camera { x: 0.0, y: 0.0, zoom: fz * 0.30 };
+    let zfar = Camera { x: 1.0e7, y: 1.0e7, zoom: fz * 0.30 }; // bodies off-screen
+    set_density(&mut sys, 0.5);
+    let z_full = ms(&sys, &zout, &mut buf);
+    let z_bg = ms(&sys, &zfar, &mut buf); // background only, uncached (panning)
+    set_density(&mut sys, 0.0);
+    let z_nostars = ms(&sys, &zfar, &mut buf);
+    set_density(&mut sys, 0.5);
+    let z_still = {
+        for i in 0..4 {
+            render_system_cached(&mut sys, W, H, &zout, 0.0, 0.0, i as f32, i as f32, i as f32, &mut buf);
+        }
+        let t = Instant::now();
+        for i in 0..FRAMES {
+            let ta = i as f32 * 0.013;
+            render_system_cached(&mut sys, W, H, &zout, 0.0, 0.0, ta, ta * 1.3, ta * 0.7, &mut buf);
+        }
+        t.elapsed().as_secs_f64() * 1000.0 / FRAMES as f64
+    };
+    let z_bodies = (z_full - z_bg).max(0.0);
+    let z_stars = (z_bg - z_nostars).max(0.0);
+    println!("  panning (drag)                    {:7.2} ms   ({:.0} fps)", z_full, 1000.0 / z_full);
+    println!("  still camera (cached bg)          {:7.2} ms   ({:.0} fps)", z_still, 1000.0 / z_still);
+    println!("    ├ background, uncached          {:7.2} ms   {:5.1}%", z_bg, 100.0 * z_bg / z_full);
+    println!("    │   └ stars (all 3 layers on)   {:7.2} ms   (fit: {:.2} ms)", z_stars, stars);
+    println!("    └ bodies (tiny / culled)        {:7.2} ms   {:5.1}%", z_bodies, 100.0 * z_bodies / z_full);
+
     // Nebula cache: the per-cell fBm bake vs reusing it. On a still/zooming
     // camera the offset never ticks (nebula cached); on a slow drag it ticks
     // rarely; only a fast fling re-bakes most frames.
