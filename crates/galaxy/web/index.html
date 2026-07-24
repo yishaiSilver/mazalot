@@ -245,7 +245,7 @@ function buildGalaxy() {
 }
 function fitMap() {
   const ext = G.galaxy_extent(gal);
-  camMap = { x: 0, y: 0, zoom: Math.min(0.46 * canvas.width / ext, 0.46 * canvas.height / ext) };
+  camMap = { x: 0, y: 0, zoom: Math.min(0.46 * canvas.width / ext, 0.46 * canvas.height / (ext * INCLINE)) };
 }
 function generateGalaxy(s) {
   seed = s >>> 0; $("seed").value = seed;
@@ -330,7 +330,11 @@ function frame(now) {
 const clampZoomMap = z => Math.min(14, Math.max(0.06, z));
 const clampZoomSys = z => Math.min(60, Math.max(0.04, z));
 function localPt(e) { const r = canvas.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; }
-function toWorld(lx, ly) { const c = cam(); return [c.x + (lx - canvas.width / 2) / c.zoom, c.y + (ly - canvas.height / 2) / c.zoom]; }
+// The galaxy disc is drawn gently inclined (vertical squash INCLINE, map mode
+// only); mirror that here so cursor→world, panning and fit all stay consistent.
+let INCLINE = 0.86; // set from wasm (galaxy_incline) on load
+const inc = () => (mode === "map" ? INCLINE : 1);
+function toWorld(lx, ly) { const c = cam(); return [c.x + (lx - canvas.width / 2) / c.zoom, c.y + (ly - canvas.height / 2) / (c.zoom * inc())]; }
 
 const pointers = new Map();
 let panLast = null, pinch = null;
@@ -364,14 +368,14 @@ canvas.addEventListener("pointermove", e => {
       const cl = mode === "map" ? clampZoomMap : clampZoomSys;
       const c = cam();
       c.zoom = cl(pinch.zoom * dist / pinch.dist);
-      c.x = pinch.camx0 - (mx - pinch.mx0) / c.zoom; c.y = pinch.camy0 - (my - pinch.my0) / c.zoom;
+      c.x = pinch.camx0 - (mx - pinch.mx0) / c.zoom; c.y = pinch.camy0 - (my - pinch.my0) / (c.zoom * inc());
       gestureMoved = true; return;
     }
     if (panLast && pointers.size === 1) {
       const dx = e.clientX - panLast.x, dy = e.clientY - panLast.y;
       panLast = { x: e.clientX, y: e.clientY };
       if (Math.abs(dx) + Math.abs(dy) > 6) gestureMoved = true;
-      const c = cam(); c.x -= dx / c.zoom; c.y -= dy / c.zoom;
+      const c = cam(); c.x -= dx / c.zoom; c.y -= dy / (c.zoom * inc());
       if (mode === "system") follow = -1;
     }
     return;
@@ -464,6 +468,7 @@ async function loadWasm(url) {
 }
 async function main() {
   [G, S] = await Promise.all([loadWasm("./galaxy.wasm"), loadWasm("./solar.wasm")]);
+  if (G.galaxy_incline) INCLINE = G.galaxy_incline();
   // Sanity: the JS name arrays must match the Rust tables.
   if (G.region_name_count() !== REGION_NAMES.length) console.warn("REGION_NAMES out of sync with Rust");
   gBufLen = (PIXEL_BUDGET + 16384) * 4; gBuf = G.alloc(gBufLen); posPtr = G.alloc(2 * 4);

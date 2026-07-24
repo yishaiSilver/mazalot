@@ -152,3 +152,10 @@ pub extern "C" fn galaxy_extent(gal: *const Galaxy) -> f32 {
 pub extern "C" fn region_name_count() -> u32 {
     crate::region_count_total() as u32
 }
+
+/// The disc-inclination vertical squash applied in the renderer. JS uses it in
+/// `toWorld`/pan/fit so cursor picking and panning match the tilted projection.
+#[no_mangle]
+pub extern "C" fn galaxy_incline() -> f32 {
+    crate::INCLINE
+}

@@ -143,21 +143,28 @@ handed straight to `solar`; the node's star colour on the map is derived with th
 a yellow star when you arrive (`sun_kind_of_seed`, pinned by a unit test).
 
 - **Structured layout** (not random soup) — from a seed:
-  - **Placement** — Mitchell **best-candidate blue-noise** weighted by a
-    spiral-arm + core-bulge **density field**, so systems cluster on arms with
-    even local spacing and thin toward the rim.
+  - **Placement** — Mitchell **best-candidate blue-noise** weighted by an **M101
+    / Pinwheel density field** (multi-armed but *flocculent*: the spiral phase is
+    domain-warped so arms wander and feather, fragmented into patches, and the
+    disc is made **lopsided** around a small nucleus), so systems cluster on the
+    arms with even local spacing.
   - **Hyperlanes** — a Euclidean **minimum spanning tree** (guarantees the galaxy
     is fully traversable) plus a tunable fraction of short nearest-neighbour
     edges. One `link_density` knob spans tree-like-and-chokepointy → dense web.
   - **Regions** — farthest-point faction anchors + **Lloyd-relaxed** Voronoi, so
     territories are contiguous *and* reasonably balanced (not one cell swallowing
     the disc).
-- **Star-map render** — a cached backdrop (galactic **haze** following the arm
-  density, region-tinted territory wash, faint world-anchored dust, and the
-  hyperlane graph) with per-frame **system glyphs** (star-coloured, gently
-  twinkling) plus hover/selection rings. The backdrop is time-independent, so a
-  still camera memcpys it and only the glyphs re-draw — the same cache trick
-  `solar` uses.
+- **Star-map render** — the galaxy *body* is thousands of unresolved **field
+  stars** (precomputed once) scattered by the density field so the arms are
+  traced by real star density, plus bright pink **H II knots**, a small warm
+  nucleus, diffuse haze, and the hyperlane graph — accumulated in an **HDR float
+  buffer** and **tone-mapped** (Reinhard + gamma + vignette, via a LUT) so bright
+  cores roll off warm. The disc is drawn **gently inclined** (a vertical squash,
+  mirrored in `to_world`/picking so clicking stays exact). Interactive **system
+  glyphs** (star-coloured, twinkling) + hover/selection rings draw per frame on
+  top; the whole body is time-independent, so a still camera memcpys the cached
+  bake and only the glyphs re-draw — the same cache trick `solar` uses. (A native
+  `--bin variants` explores alternate looks — barred spiral, cluster, etc.)
 - **Drill-down** — the web page loads **both** `galaxy.wasm` and `solar.wasm`:
   click / double-click a system to drop into the full `solar` view for its seed
   (pan · zoom · tap-a-planet-to-follow), then **← Galaxy** to fly back out.

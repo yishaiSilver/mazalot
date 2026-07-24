@@ -168,9 +168,11 @@ pub fn sun_kind_of_seed(system_seed: u32) -> usize {
 }
 
 /// A faction region: a name (mirrored in the web `REGION_NAMES` array) and a map
-/// tint for its territory wash + capital glyphs.
+/// tint. The tint is retained for a future faction-territory overlay (the M101
+/// body deliberately omits the coloured wash so it doesn't muddy the arms).
 struct Region {
     name: &'static str,
+    #[allow(dead_code)]
     tint: Rgb,
 }
 const REGIONS: &[Region] = &[
@@ -214,50 +216,86 @@ pub struct Node {
     pub twinkle: f32,     // per-node phase so stars don't pulse in lockstep
 }
 
-/// A vivid star-forming nebula cloud placed on a spiral arm (the Kurzgesagt
-/// look): a saturated blob of colour washed into the galactic haze.
+/// One unresolved field star — the galaxy's *body* is thousands of these,
+/// scattered by the density field so the arms are traced by actual star density
+/// (an M101 / Pinwheel look), precomputed once so re-baking the backdrop is cheap.
 #[derive(Clone, Copy)]
-struct Bloom {
+struct FieldStar {
+    x: f32,
+    y: f32,
+    col: Rgb,
+    b: f32,
+}
+
+/// A bright H II star-forming knot strung along an arm (M101's signature pink
+/// pockets); a few are giant + very bright.
+#[derive(Clone, Copy)]
+struct Hii {
     x: f32,
     y: f32,
     r: f32,
     col: Rgb,
+    b: f32,
 }
 
-/// A generated galaxy: nodes + the hyperlane edge list. Deterministic in `seed`.
+/// A generated galaxy: interactive `nodes` + the hyperlane graph, over a
+/// precomputed **M101 body** (field stars + H II knots). Deterministic in `seed`.
 /// `node_scale`/`haze` are live view multipliers (do not change identity).
 pub struct Galaxy {
     pub seed: u32,
     pub nodes: Vec<Node>,
     pub edges: Vec<(u32, u32)>, // undirected, a < b
     pub arms: u32,
-    pub twist: f32, // log-spiral tightness (shared by placement, haze + blooms)
-    blooms: Vec<Bloom>,
+    pub twist: f32,    // log-spiral tightness
+    pub asym_phi: f32, // direction of the m=1 lopsidedness
+    stars: Vec<FieldStar>,
+    hii: Vec<Hii>,
     pub node_scale: f32,
     pub haze: f32,
-    // Cached backdrop (haze + territory wash + dust + hyperlanes) keyed on the
-    // camera + view; reused by `render_map_cached` while the camera is still.
+    // Cached backdrop (the whole baked body + hyperlanes) keyed on camera + view;
+    // reused by `render_map_cached` while the camera is still. `scratch` is the
+    // reusable float HDR buffer the bake accumulates into before tone-mapping.
     bg_cache: Vec<u8>,
     bg_key: Option<BgKey>,
+    scratch: Vec<f32>,
 }
 
-/// Spiral-arm + core-bulge density at world `(x, y)`, in ~[0, 1]. Drives both
-/// where systems are placed and how the background haze glows, so the two agree.
-fn density(x: f32, y: f32, arms: u32, twist: f32) -> f32 {
+/// M101 / **Pinwheel** density at world `(x, y)`, in ~[0, 1]: multi-armed but
+/// *flocculent* — the spiral phase is domain-warped so arms wander and feather,
+/// then fragmented by higher-frequency noise into patches, and the disc is made
+/// lopsided (an m=1 asymmetry) around a small nucleus. Drives both where systems
+/// are placed and how the star-field body glows, so the two agree.
+fn field_density(x: f32, y: f32, arms: u32, twist: f32, asym: f32, asym_phi: f32) -> f32 {
     let r = (x * x + y * y).sqrt();
     let rr = r / GALAXY_R;
-    // Disc falloff: full in the core, →0 at the rim.
-    let radial = smoothstep(1.05, 0.02, rr);
-    // Log-spiral arms: cos of (arms·θ − twist·ln r) peaks on the arm ridges.
     let theta = y.atan2(x);
-    let phase = theta * arms as f32 - twist * r.max(1.0).ln();
-    let ridge = 0.5 + 0.5 * phase.cos();
-    let arm = 0.22 + 0.78 * ridge.powf(2.2); // inter-arm keeps a low floor
-    // Central bulge ignores the arms (a bright dense core).
-    let bulge = smoothstep(0.30, 0.0, rr);
-    // Break the arms up so they aren't clean sine ridges.
-    let n = fbm(x / 190.0, y / 190.0, 3.7, 3);
-    clamp01(radial * arm * (0.5 + 0.95 * n) + bulge * 0.85)
+    // Low-freq domain warp on the spiral phase → arms wander (not clean bands).
+    let wf = (fbm(x / 240.0 + 5.0, y / 240.0, 3.1, 2) - 0.5) * 2.6;
+    let phase = theta * arms as f32 - twist * r.max(1.0).ln() + wf;
+    let ridge = (0.5 + 0.5 * phase.cos()).powf(2.1);
+    // Fragment the arms into patches/knots (the flocculent texture).
+    let patch = fbm(x / 60.0 + 30.0, y / 60.0, 3.1, 3);
+    let arm = clamp01(ridge * (0.28 + 1.45 * patch));
+    // Lopsided m=1 asymmetry: more disc on one side (M101's signature).
+    let asy = (1.0 + asym * (theta - asym_phi).cos()).max(0.0);
+    // Small nucleus, plus the arm annulus.
+    let bulge = smoothstep(0.16, 0.0, rr);
+    let env = smoothstep(0.05, 0.18, rr) * smoothstep(1.08, 0.52, rr);
+    clamp01((0.03 + 0.97 * arm) * env * asy + bulge * 0.7)
+}
+
+/// The m=1 lopsidedness strength used everywhere for a galaxy.
+const ASYM: f32 = 0.36;
+
+/// Field-star colour by galactocentric radius: young **blue** arms, warm core, an
+/// occasional pink H II tint.
+fn field_star_color(x: f32, y: f32, rng: &mut Rng) -> Rgb {
+    let rr = (x * x + y * y).sqrt() / GALAXY_R;
+    let base = mix([1.0, 0.86, 0.62], [0.70, 0.82, 1.0], smoothstep(0.10, 0.42, rr));
+    if rng.f() < 0.07 {
+        return [1.0, 0.52, 0.66];
+    }
+    base
 }
 
 impl Galaxy {
@@ -278,8 +316,9 @@ impl Galaxy {
             180 + (rng.f() * 90.0) as usize // ~180..=270
         };
         let link_density = if link_density < 0.0 { 0.35 } else { link_density.clamp(0.0, 1.0) };
-        let arms = if arms > 0 { arms.clamp(1, 6) } else { 2 + (rng.f() * 3.0) as u32 }; // 2..=4
+        let arms = if arms > 0 { arms.clamp(1, 6) } else { 3 + (rng.f() * 3.0) as u32 }; // 3..=5
         let twist = rng.range(1.8, 2.8);
+        let asym_phi = rng.f() * TAU; // which way the disc is lopsided
 
         // --- 1. placement: Mitchell best-candidate weighted by the density field.
         let mut pos: Vec<(f32, f32)> = Vec::with_capacity(n);
@@ -293,7 +332,7 @@ impl Galaxy {
                 let rad = GALAXY_R * u.sqrt();
                 let ang = rng.f() * TAU;
                 let (cx, cy) = (rad * ang.cos(), rad * ang.sin());
-                let dens = density(cx, cy, arms, twist);
+                let dens = field_density(cx, cy, arms, twist, ASYM, asym_phi);
                 // Distance to the nearest already-placed system.
                 let mut md = f32::MAX;
                 for &(px, py) in &pos {
@@ -532,33 +571,47 @@ impl Galaxy {
             });
         }
 
-        // --- star-forming nebula blooms: vivid clouds placed ON the arms. Solve
-        // the log-spiral for a point on an arm ridge at a random radius, jitter
-        // it, and give it a saturated tint. These are the pink/cyan pockets.
-        const NEB: &[Rgb] = &[
-            [0.92, 0.26, 0.66], // magenta
-            [0.98, 0.44, 0.60], // pink
-            [0.26, 0.82, 0.92], // cyan
-            [0.60, 0.34, 0.92], // violet
-            [0.96, 0.32, 0.44], // rose
-            [0.22, 0.80, 0.72], // teal
+        // --- the M101 body: thousands of unresolved field stars scattered by the
+        // density field (so the arms are traced by real star density), plus a
+        // scatter of bright H II knots on the arms. Precomputed once so re-baking
+        // the backdrop on pan/zoom only *projects* them (cheap).
+        let star_n = 9000usize;
+        let mut stars = Vec::with_capacity(star_n);
+        let mut tries = 0usize;
+        while stars.len() < star_n && tries < star_n * 40 {
+            tries += 1;
+            let rad = GALAXY_R * rng.f().sqrt();
+            let ang = rng.f() * TAU;
+            let (sx, sy) = (rad * ang.cos(), rad * ang.sin());
+            // Concentrate onto the arms (gamma > 1 → fewer inter-arm stars).
+            if rng.f() > field_density(sx, sy, arms, twist, ASYM, asym_phi).powf(1.15) {
+                continue;
+            }
+            let col = field_star_color(sx, sy, &mut rng);
+            let b = rng.range(0.10, 0.55);
+            stars.push(FieldStar { x: sx, y: sy, col, b });
+        }
+
+        const HTINT: &[Rgb] = &[
+            [1.0, 0.42, 0.52], [1.0, 0.55, 0.42], [0.95, 0.35, 0.60],
+            [1.0, 0.48, 0.48], [0.72, 0.86, 1.0], // an occasional blue OB knot
         ];
-        let bloom_n = 12 + (rng.f() * 8.0) as usize; // 12..=19
-        let mut blooms = Vec::with_capacity(bloom_n);
-        for _ in 0..bloom_n {
-            let r = rng.range(0.18, 0.95) * GALAXY_R;
-            let arm_k = (rng.f() * arms as f32) as u32;
-            // theta on an arm ridge: arms·θ − twist·ln r ≡ 2π·k  (+ jitter).
-            let theta =
-                (TAU * arm_k as f32 + twist * r.max(1.0).ln()) / arms as f32 + rng.range(-0.18, 0.18);
-            let (s, c) = theta.sin_cos();
-            let col = NEB[(rng.f() * NEB.len() as f32) as usize % NEB.len()];
-            blooms.push(Bloom {
-                x: c * r + rng.range(-40.0, 40.0),
-                y: s * r + rng.range(-40.0, 40.0),
-                r: rng.range(70.0, 190.0),
-                col,
-            });
+        let hii_n = 52usize;
+        let mut hii = Vec::with_capacity(hii_n);
+        let mut tries = 0usize;
+        while hii.len() < hii_n && tries < hii_n * 60 {
+            tries += 1;
+            let rad = GALAXY_R * rng.range(0.12, 1.0);
+            let ang = rng.f() * TAU;
+            let (hx, hy) = (rad * ang.cos(), rad * ang.sin());
+            if rng.f() > field_density(hx, hy, arms, twist, ASYM, asym_phi).powf(0.7) {
+                continue;
+            }
+            let giant = rng.f() < 0.10;
+            let r = if giant { rng.range(40.0, 78.0) } else { rng.range(14.0, 34.0) };
+            let col = HTINT[(rng.f() * HTINT.len() as f32) as usize % HTINT.len()];
+            let b = if giant { 0.6 } else { 0.38 };
+            hii.push(Hii { x: hx, y: hy, r, col, b });
         }
 
         Galaxy {
@@ -567,11 +620,14 @@ impl Galaxy {
             edges,
             arms,
             twist,
-            blooms,
+            asym_phi,
+            stars,
+            hii,
             node_scale: 1.0,
             haze: 1.0,
             bg_cache: Vec::new(),
             bg_key: None,
+            scratch: Vec::new(),
         }
     }
 
@@ -609,18 +665,23 @@ impl Camera {
     }
 }
 
+/// Vertical squash for the gentle ~28° disc inclination. Applied to screen-Y
+/// only (no perspective), so `to_world` inverts it exactly and picking/panning
+/// stay precise. JS reads this via `galaxy_incline()` to match.
+pub const INCLINE: f32 = 0.86;
+
 #[inline]
 fn to_screen(wx: f32, wy: f32, cam: &Camera, w: u32, h: u32) -> (f32, f32) {
     (
         w as f32 * 0.5 + (wx - cam.x) * cam.zoom,
-        h as f32 * 0.5 + (wy - cam.y) * cam.zoom,
+        h as f32 * 0.5 + (wy - cam.y) * cam.zoom * INCLINE,
     )
 }
 #[inline]
 fn to_world(sx: f32, sy: f32, cam: &Camera, w: u32, h: u32) -> (f32, f32) {
     (
         cam.x + (sx - w as f32 * 0.5) / cam.zoom,
-        cam.y + (sy - h as f32 * 0.5) / cam.zoom,
+        cam.y + (sy - h as f32 * 0.5) / (cam.zoom * INCLINE),
     )
 }
 
@@ -681,34 +742,65 @@ fn ring(out: &mut [u8], w: u32, h: u32, sx: f32, sy: f32, rad: f32, col: Rgb, br
     }
 }
 
-/// A faint additive line between two screen points (DDA) — a hyperlane.
-fn line(out: &mut [u8], w: u32, h: u32, ax: f32, ay: f32, bx: f32, by: f32, col: Rgb, bright: f32) {
-    let dx = bx - ax;
-    let dy = by - ay;
-    let steps = (dx.abs().max(dy.abs())).ceil() as i32;
-    if steps <= 0 {
-        add_px(out, w, h, ax as i32, ay as i32, col, bright);
+// --- float-buffer (HDR) helpers for the backdrop bake. The M101 body is built
+// up additively in a linear f32 buffer, then tone-mapped to RGBA8 once, so bright
+// cores/knots roll off warm instead of clipping to flat white. ----------------
+
+#[inline]
+fn addf(buf: &mut [f32], w: u32, h: u32, x: i32, y: i32, c: Rgb, a: f32) {
+    if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 || a <= 0.0 {
         return;
     }
-    let (sx, sy) = (dx / steps as f32, dy / steps as f32);
+    let i = ((y as u32 * w + x as u32) * 3) as usize;
+    buf[i] += c[0] * a;
+    buf[i + 1] += c[1] * a;
+    buf[i + 2] += c[2] * a;
+}
+/// Soft additive disc into the float buffer.
+fn splatf(buf: &mut [f32], w: u32, h: u32, sx: f32, sy: f32, rad: f32, c: Rgb, bright: f32, pow: f32) {
+    if rad <= 0.0 || bright <= 0.0 {
+        return;
+    }
+    let r = rad.ceil() as i32;
+    let inv = 1.0 / rad;
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let d = ((dx * dx + dy * dy) as f32).sqrt() * inv;
+            if d >= 1.0 {
+                continue;
+            }
+            let f = (1.0 - d).powf(pow);
+            addf(buf, w, h, sx as i32 + dx, sy as i32 + dy, c, bright * f);
+        }
+    }
+}
+/// Faint additive line (DDA) into the float buffer — a hyperlane.
+fn linef(buf: &mut [f32], w: u32, h: u32, ax: f32, ay: f32, bx: f32, by: f32, c: Rgb, bright: f32) {
+    let steps = ((bx - ax).abs().max((by - ay).abs())).ceil() as i32;
+    if steps <= 0 {
+        addf(buf, w, h, ax as i32, ay as i32, c, bright);
+        return;
+    }
+    let (sx, sy) = ((bx - ax) / steps as f32, (by - ay) / steps as f32);
     let (mut x, mut y) = (ax, ay);
     for _ in 0..=steps {
-        add_px(out, w, h, x as i32, y as i32, col, bright);
+        addf(buf, w, h, x as i32, y as i32, c, bright);
         x += sx;
         y += sy;
     }
 }
 
 // ===========================================================================
-// Backdrop: haze + territory wash + dust + hyperlanes (time-independent)
+// Backdrop bake: the M101 body (haze + H II knots + nucleus + star-field +
+// hyperlanes) accumulated in HDR, then tone-mapped. Time-independent → cached.
 // ===========================================================================
 
-/// Galactic haze colour by fractional radius: a bright warm-gold core bulge →
-/// cool blue arms → teal rim (the Kurzgesagt Milky-Way palette).
+/// Galactic haze colour by fractional radius: a warm-gold core → cool blue arms
+/// → teal rim.
 fn haze_tint(rr: f32) -> Rgb {
-    let core = [1.00, 0.80, 0.40]; // warm gold bulge
-    let mid = [0.22, 0.46, 0.86]; // blue arms
-    let rim = [0.28, 0.62, 0.74]; // teal outer
+    let core = [1.00, 0.80, 0.42];
+    let mid = [0.24, 0.48, 0.88]; // blue arms
+    let rim = [0.30, 0.64, 0.76]; // teal outer
     if rr < 0.34 {
         mix(core, mid, rr / 0.34)
     } else {
@@ -716,28 +808,40 @@ fn haze_tint(rr: f32) -> Rgb {
     }
 }
 
-fn paint_backdrop(out: &mut [u8], w: u32, h: u32, cam: &Camera, gal: &Galaxy) {
+/// Bake the galaxy body into `out` (RGBA8), accumulating in the reusable float
+/// `buf` (w*h*3) and tone-mapping at the end. `to_world`/`to_screen` carry the
+/// disc inclination, so every layer shares the same tilted projection.
+fn paint_backdrop(out: &mut [u8], w: u32, h: u32, cam: &Camera, gal: &Galaxy, buf: &mut Vec<f32>) {
+    let n = (w * h) as usize;
+    buf.clear();
+    buf.resize(n * 3, 0.0);
+    for p in buf.chunks_mut(3) {
+        p[0] = 0.005;
+        p[1] = 0.007;
+        p[2] = 0.020; // deep near-black base
+    }
     let z = cam.zoom;
-    let arms = gal.arms;
-    let twist = gal.twist; // the SAME tightness the systems were placed with
+    let (arms, twist, asym_phi) = (gal.arms, gal.twist, gal.asym_phi);
+    let hz = gal.haze;
+    let hz_lo = hz.max(0.3); // knots/nucleus stay lit even with haze turned down
 
-    // --- low-res haze buffer (8px cells → pixel-art clouds), world-transformed.
-    const CELL: u32 = 8;
-    let nw = (w + CELL - 1) / CELL;
-    let nh = (h + CELL - 1) / CELL;
-    let mut haze: Vec<[f32; 3]> = vec![[0.0; 3]; (nw * nh) as usize];
-    if gal.haze > 0.01 {
+    // --- diffuse haze: sample the M101 density per 8px SCREEN cell (to_world
+    // inverts the incline), colour by radius, add with dither. ---
+    if hz > 0.01 {
+        const CELL: u32 = 8;
+        let nw = (w + CELL - 1) / CELL;
+        let nh = (h + CELL - 1) / CELL;
+        let mut haze = vec![[0.0f32; 3]; (nw * nh) as usize];
         for cy in 0..nh {
             for cx in 0..nw {
                 let (sxp, syp) = ((cx * CELL + CELL / 2) as f32, (cy * CELL + CELL / 2) as f32);
                 let (wx, wy) = to_world(sxp, syp, cam, w, h);
-                let dens = density(wx, wy, arms, twist);
-                if dens > 0.01 {
+                let d = field_density(wx, wy, arms, twist, ASYM, asym_phi);
+                if d > 0.01 {
                     let rr = (wx * wx + wy * wy).sqrt() / GALAXY_R;
                     let col = haze_tint(rr.min(1.0));
-                    // Contrast curve (dens^1.4) darkens the inter-arm gaps so the
-                    // spiral arms read boldly rather than as an even wash.
-                    let k = dens.powf(1.4) * gal.haze * 0.44;
+                    // Higher power → sharper arms + less diffuse boxy spread.
+                    let k = d.powf(1.7) * hz * 0.34;
                     let c = &mut haze[(cy * nw + cx) as usize];
                     c[0] += col[0] * k;
                     c[1] += col[1] * k;
@@ -745,126 +849,116 @@ fn paint_backdrop(out: &mut [u8], w: u32, h: u32, cam: &Camera, gal: &Galaxy) {
                 }
             }
         }
-        // --- territory wash: splat each node's region tint into the haze buffer
-        // so faction space reads as a soft colour field. Influence radius grows
-        // with zoom (constant world size), clamped so it stays cheap.
-        let infl_px = (90.0 * z).clamp(CELL as f32, 240.0);
-        let infl_c = (infl_px / CELL as f32).ceil() as i32;
-        for nd in &gal.nodes {
-            let (sx, sy) = to_screen(nd.x, nd.y, cam, w, h);
-            if sx < -infl_px || sy < -infl_px || sx > w as f32 + infl_px || sy > h as f32 + infl_px {
-                continue;
-            }
-            let (ccx, ccy) = ((sx / CELL as f32) as i32, (sy / CELL as f32) as i32);
-            let tint = REGIONS[nd.region as usize % REGIONS.len()].tint;
-            let inv = CELL as f32 / infl_px;
-            for dy in -infl_c..=infl_c {
-                for dx in -infl_c..=infl_c {
-                    let (gx, gy) = (ccx + dx, ccy + dy);
-                    if gx < 0 || gy < 0 || gx >= nw as i32 || gy >= nh as i32 {
-                        continue;
+        // Blur the low-res haze (3×3) so the 8px cells don't read as hard blocks.
+        let mut sm = haze.clone();
+        for cy in 0..nh {
+            for cx in 0..nw {
+                let mut acc = [0.0f32; 3];
+                let mut wsum = 0.0f32;
+                for dy in -1..=1i32 {
+                    for dx in -1..=1i32 {
+                        let (gx, gy) = (cx as i32 + dx, cy as i32 + dy);
+                        if gx < 0 || gy < 0 || gx >= nw as i32 || gy >= nh as i32 {
+                            continue;
+                        }
+                        let c = haze[(gy as u32 * nw + gx as u32) as usize];
+                        acc[0] += c[0];
+                        acc[1] += c[1];
+                        acc[2] += c[2];
+                        wsum += 1.0;
                     }
-                    let d = ((dx * dx + dy * dy) as f32).sqrt() * inv;
-                    if d >= 1.0 {
-                        continue;
-                    }
-                    let f = (1.0 - d) * (1.0 - d) * 0.05 * gal.haze;
-                    let c = &mut haze[(gy as u32 * nw + gx as u32) as usize];
-                    c[0] += tint[0] * f;
-                    c[1] += tint[1] * f;
-                    c[2] += tint[2] * f;
                 }
+                sm[(cy * nw + cx) as usize] = [acc[0] / wsum, acc[1] / wsum, acc[2] / wsum];
             }
         }
-        // --- star-forming nebula blooms: vivid, saturated colour pockets on the
-        // arms (magenta / pink / cyan). Splatted brighter than the base haze so
-        // they pop, but still under the star glyphs. Radius scales with zoom.
-        for bl in &gal.blooms {
-            let (sx, sy) = to_screen(bl.x, bl.y, cam, w, h);
-            let rpx = (bl.r * z).max(CELL as f32);
-            if sx < -rpx || sy < -rpx || sx > w as f32 + rpx || sy > h as f32 + rpx {
-                continue;
-            }
-            let (ccx, ccy) = ((sx / CELL as f32) as i32, (sy / CELL as f32) as i32);
-            let rc = (rpx / CELL as f32).ceil() as i32;
-            let inv = CELL as f32 / rpx;
-            for dy in -rc..=rc {
-                for dx in -rc..=rc {
-                    let (gx, gy) = (ccx + dx, ccy + dy);
-                    if gx < 0 || gy < 0 || gx >= nw as i32 || gy >= nh as i32 {
-                        continue;
-                    }
-                    let d = ((dx * dx + dy * dy) as f32).sqrt() * inv;
-                    if d >= 1.0 {
-                        continue;
-                    }
-                    let f = (1.0 - d).powi(2) * 0.5 * gal.haze;
-                    let c = &mut haze[(gy as u32 * nw + gx as u32) as usize];
-                    c[0] += bl.col[0] * f;
-                    c[1] += bl.col[1] * f;
-                    c[2] += bl.col[2] * f;
-                }
+        for iy in 0..h {
+            let nrow = (iy / CELL) * nw;
+            for ix in 0..w {
+                let c = sm[(nrow + ix / CELL) as usize];
+                let dth = bayer(ix, iy) * 0.008;
+                let i = ((iy * w + ix) * 3) as usize;
+                buf[i] += (c[0] + dth).max(0.0);
+                buf[i + 1] += (c[1] + dth).max(0.0);
+                buf[i + 2] += (c[2] + dth).max(0.0);
             }
         }
     }
 
-    // --- base fill + haze upsample with dither.
-    for iy in 0..h {
-        let nrow = (iy / CELL) * nw;
-        for ix in 0..w {
-            let (mut r, mut g, mut b) = (0.010f32, 0.012, 0.030); // deep near-black
-            let c = haze[(nrow + ix / CELL) as usize];
-            let d = bayer(ix, iy) * 0.012;
-            r += (c[0] + d).max(0.0);
-            g += (c[1] + d).max(0.0);
-            b += (c[2] + d).max(0.0);
-            let idx = ((iy * w + ix) * 4) as usize;
-            out[idx] = (clamp01(r) * 255.0) as u8;
-            out[idx + 1] = (clamp01(g) * 255.0) as u8;
-            out[idx + 2] = (clamp01(b) * 255.0) as u8;
-            out[idx + 3] = 255;
-        }
-    }
-
-    // --- faint background dust: hashed points on a world grid, so they belong to
-    // the galaxy (pan with it) and thin out as you zoom (constant world density).
-    let dust_sp = 46.0f32; // world units between candidate dust cells
-    let (w0, h0) = to_world(0.0, 0.0, cam, w, h);
-    let (w1, h1) = to_world(w as f32, h as f32, cam, w, h);
-    let (cx0, cx1) = ((w0.min(w1) / dust_sp).floor() as i32 - 1, (w0.max(w1) / dust_sp).floor() as i32 + 1);
-    let (cy0, cy1) = ((h0.min(h1) / dust_sp).floor() as i32 - 1, (h0.max(h1) / dust_sp).floor() as i32 + 1);
-    if (cx1 - cx0) as i64 * (cy1 - cy0) as i64 <= 400_000 {
-        for cy in cy0..=cy1 {
-            for cx in cx0..=cx1 {
-                let hh = hash3(cx, cy, 91);
-                if hh < 0.80 {
-                    continue;
-                }
-                let jx = (hh * 137.0).fract();
-                let jy = (hh * 71.3 + 0.37).fract();
-                let (wx, wy) = ((cx as f32 + jx) * dust_sp, (cy as f32 + jy) * dust_sp);
-                let (sx, sy) = to_screen(wx, wy, cam, w, h);
-                let s = 0.12 + 0.28 * (hh - 0.80) / 0.20;
-                add_px(out, w, h, sx as i32, sy as i32, [0.78, 0.84, 1.0], s);
-            }
-        }
-    }
-
-    // --- hyperlanes: faint additive lines. Skip edges fully off-screen.
     let (wf, hf) = (w as f32, h as f32);
+
+    // --- H II knots: bright pink star-forming pockets strung along the arms. ---
+    for k in &gal.hii {
+        let (sx, sy) = to_screen(k.x, k.y, cam, w, h);
+        let rpx = k.r * z;
+        if sx + rpx < 0.0 || sy + rpx < 0.0 || sx - rpx > wf || sy - rpx > hf {
+            continue;
+        }
+        splatf(buf, w, h, sx, sy, rpx.max(1.5), k.col, k.b * hz_lo, 1.7);
+        splatf(buf, w, h, sx, sy, (rpx * 0.4).max(1.0), [1.0, 0.9, 0.9], k.b * 0.7 * hz_lo, 1.3);
+    }
+
+    // --- small bright nucleus + a soft halo (a cheap stand-in for bloom). ---
+    {
+        let (sx, sy) = to_screen(0.0, 0.0, cam, w, h);
+        let rc = 0.11 * GALAXY_R * z;
+        splatf(buf, w, h, sx, sy, (0.32 * GALAXY_R * z).max(rc), [1.0, 0.82, 0.5], 0.16 * hz_lo, 2.4);
+        splatf(buf, w, h, sx, sy, rc.max(2.0), [1.0, 0.88, 0.62], 0.85, 2.2);
+        splatf(buf, w, h, sx, sy, (rc * 0.45).max(1.5), [1.0, 0.94, 0.80], 1.05, 1.6);
+    }
+
+    // --- the star-field body: project each precomputed star + splat it. Most are
+    // 1px points; the brightest get a tiny glow. ---
+    for s in &gal.stars {
+        let (sx, sy) = to_screen(s.x, s.y, cam, w, h);
+        if sx < 0.0 || sy < 0.0 || sx >= wf || sy >= hf {
+            continue;
+        }
+        if s.b > 0.48 {
+            splatf(buf, w, h, sx, sy, 1.7, s.col, s.b * 1.1, 1.0);
+        } else {
+            addf(buf, w, h, sx as i32, sy as i32, s.col, s.b * 0.7);
+        }
+    }
+
+    // --- hyperlanes: faint lines under the glyphs. ---
     for &(a, b) in &gal.edges {
         let na = &gal.nodes[a as usize];
         let nb = &gal.nodes[b as usize];
         let (ax, ay) = to_screen(na.x, na.y, cam, w, h);
         let (bx, by) = to_screen(nb.x, nb.y, cam, w, h);
-        let minx = ax.min(bx);
-        let maxx = ax.max(bx);
-        let miny = ay.min(by);
-        let maxy = ay.max(by);
-        if maxx < 0.0 || minx > wf || maxy < 0.0 || miny > hf {
+        if ax.max(bx) < 0.0 || ax.min(bx) > wf || ay.max(by) < 0.0 || ay.min(by) > hf {
             continue;
         }
-        line(out, w, h, ax, ay, bx, by, [0.34, 0.40, 0.62], 0.16);
+        linef(buf, w, h, ax, ay, bx, by, [0.30, 0.38, 0.60], 0.05);
+    }
+
+    // --- tone-map HDR → RGBA8 (Reinhard roll-off + gamma + vignette). A small LUT
+    // folds exposure·Reinhard·gamma so the hot per-pixel path avoids `powf`. ---
+    const LN: usize = 512;
+    let exposure = 1.15f32;
+    let mut lut = [0u16; LN]; // maps (value*exposure) bucket → 0..=1000 (fixed-point)
+    for (i, l) in lut.iter_mut().enumerate() {
+        let e = i as f32 / 64.0; // covers 0..8
+        let m = e / (1.0 + e);
+        *l = (m.powf(1.0 / 2.2) * 1000.0) as u16;
+    }
+    let (ccx, ccy) = (wf * 0.5, hf * 0.5);
+    let maxr2 = ccx * ccx + ccy * ccy;
+    for iy in 0..h {
+        let vy = (iy as f32 - ccy).powi(2);
+        for ix in 0..w {
+            let vig = 1.0 - 0.30 * (((ix as f32 - ccx).powi(2) + vy) / maxr2);
+            let i = ((iy * w + ix) * 3) as usize;
+            let map = |v: f32| -> u8 {
+                let idx = ((v * exposure * 64.0) as usize).min(LN - 1);
+                ((lut[idx] as f32) * vig * 0.255).clamp(0.0, 255.0) as u8
+            };
+            let o = ((iy * w + ix) * 4) as usize;
+            out[o] = map(buf[i]);
+            out[o + 1] = map(buf[i + 1]);
+            out[o + 2] = map(buf[i + 2]);
+            out[o + 3] = 255;
+        }
     }
 }
 
@@ -925,7 +1019,8 @@ fn draw_glyphs(out: &mut [u8], w: u32, h: u32, cam: &Camera, gal: &Galaxy, t: f3
 #[allow(clippy::too_many_arguments)]
 pub fn render_map(gal: &Galaxy, w: u32, h: u32, cam: &Camera, t: f32, sel: i32, hover: i32, out: &mut [u8]) {
     assert!(out.len() >= (w * h * 4) as usize);
-    paint_backdrop(out, w, h, cam, gal);
+    let mut buf = Vec::new();
+    paint_backdrop(out, w, h, cam, gal, &mut buf);
     draw_glyphs(out, w, h, cam, gal, t, sel, hover);
 }
 
@@ -947,7 +1042,10 @@ pub fn render_map_cached(gal: &mut Galaxy, w: u32, h: u32, cam: &Camera, t: f32,
     if gal.bg_key == Some(key) && gal.bg_cache.len() == len {
         out[..len].copy_from_slice(&gal.bg_cache);
     } else {
-        paint_backdrop(out, w, h, cam, gal);
+        // Reuse the HDR scratch buffer across bakes (no per-bake realloc churn).
+        let mut buf = std::mem::take(&mut gal.scratch);
+        paint_backdrop(out, w, h, cam, &*gal, &mut buf);
+        gal.scratch = buf;
         gal.bg_cache.clear();
         gal.bg_cache.extend_from_slice(&out[..len]);
         gal.bg_key = Some(key);
@@ -961,10 +1059,13 @@ pub fn node_at(gal: &Galaxy, cam: &Camera, wx: f32, wy: f32) -> i32 {
     let mut best = -1i32;
     let mut best_d = f32::MAX;
     for (i, nd) in gal.nodes.iter().enumerate() {
-        let d = (nd.x - wx).powi(2) + (nd.y - wy).powi(2);
-        // Screen-space tolerance so picking feels consistent at any zoom.
-        let tol_world = (16.0 + 10.0 * nd.importance) / cam.zoom.max(1e-4);
-        if d < best_d && d < tol_world * tol_world {
+        // Compare in SCREEN space (the w/2,h/2 offsets cancel), so the incline's
+        // vertical squash is accounted for and picking matches what's drawn.
+        let ddx = (nd.x - wx) * cam.zoom;
+        let ddy = (nd.y - wy) * cam.zoom * INCLINE;
+        let d = ddx * ddx + ddy * ddy;
+        let tol = 16.0 + 10.0 * nd.importance; // px
+        if d < best_d && d < tol * tol {
             best_d = d;
             best = i as i32;
         }
