@@ -129,6 +129,47 @@ whole scene stays cheap enough to render live *while you drag*.
 **Add a planet archetype** = add a row to `PKINDS`; **add a star** = add a row to
 `SUNS` — both in `crates/solar/src/lib.rs`.
 
+## The galaxy
+
+Where `solar` renders *one* star system, `galaxy` (`crates/galaxy`) is the layer
+*above* it: a whole galaxy of **hundreds of systems** you drag around and zoom
+into, then **click a star to fly into its living `solar` system**. Same seed =>
+the same galaxy, forever — ~4 billion of them, each ~65 KB of WASM, zero art.
+
+Like every other "type" crate it is **self-contained** (shares no code — it
+carries its own noise/color/graph primitives). Each node holds a `system_seed`
+handed straight to `solar`; the node's star colour on the map is derived with the
+*same* RNG draw `solar` uses for its central star, so the yellow dot you click is
+a yellow star when you arrive (`sun_kind_of_seed`, pinned by a unit test).
+
+- **Structured layout** (not random soup) — from a seed:
+  - **Placement** — Mitchell **best-candidate blue-noise** weighted by a
+    spiral-arm + core-bulge **density field**, so systems cluster on arms with
+    even local spacing and thin toward the rim.
+  - **Hyperlanes** — a Euclidean **minimum spanning tree** (guarantees the galaxy
+    is fully traversable) plus a tunable fraction of short nearest-neighbour
+    edges. One `link_density` knob spans tree-like-and-chokepointy → dense web.
+  - **Regions** — farthest-point faction anchors + **Lloyd-relaxed** Voronoi, so
+    territories are contiguous *and* reasonably balanced (not one cell swallowing
+    the disc).
+- **Star-map render** — a cached backdrop (galactic **haze** following the arm
+  density, region-tinted territory wash, faint world-anchored dust, and the
+  hyperlane graph) with per-frame **system glyphs** (star-coloured, gently
+  twinkling) plus hover/selection rings. The backdrop is time-independent, so a
+  still camera memcpys it and only the glyphs re-draw — the same cache trick
+  `solar` uses.
+- **Drill-down** — the web page loads **both** `galaxy.wasm` and `solar.wasm`:
+  click / double-click a system to drop into the full `solar` view for its seed
+  (pan · zoom · tap-a-planet-to-follow), then **← Galaxy** to fly back out.
+
+Deterministic + closed-form: nothing is simulated for systems you aren't looking
+at, so it scales to the whole galaxy on one machine — the groundwork for a
+market-driven economy layer later.
+
+**Add a faction region** = add a row to `REGIONS`; **tune the spiral** = the
+`arms`/`link_density`/count knobs on `Galaxy::generate_params` — all in
+`crates/galaxy/src/lib.rs`.
+
 ## Running it
 
 **Native — generate GIFs + PNG into `out/`:**
@@ -136,6 +177,7 @@ whole scene stays cheap enough to render live *while you drag*.
 cargo run --release --bin planet            # planets
 cargo run --release --bin sun               # stars
 cargo run --release -p solar --bin solar    # solar systems (orbit + pan GIFs, posters)
+cargo run --release -p galaxy --bin galaxy  # galaxy maps (posters + a zoom-in GIF)
 cargo run --release --bin sprite-compositor # characters
 cargo run --release --bin bench             # feature-cost benchmark
 cargo run --release -p bird --bin alien     # alien creatures  (disjoint half)
@@ -162,6 +204,21 @@ cargo build -p solar --target wasm32-unknown-unknown --release --no-default-feat
 cp target/wasm32-unknown-unknown/release/solar.wasm crates/solar/web/solar.wasm
 cd crates/solar/web && python3 -m http.server 8000   # open http://localhost:8000/
 ```
+**Web — live, draggable galaxy (with drill-down into a system):**
+```bash
+cargo build -p galaxy --target wasm32-unknown-unknown --release --no-default-features
+cp target/wasm32-unknown-unknown/release/galaxy.wasm crates/galaxy/web/galaxy.wasm
+# the drill-down needs solar's wasm alongside it:
+cargo build -p solar --target wasm32-unknown-unknown --release --no-default-features
+cp target/wasm32-unknown-unknown/release/solar.wasm crates/galaxy/web/solar.wasm
+cd crates/galaxy/web && python3 -m http.server 8000   # open http://localhost:8000/
+```
+Drag to pan · scroll / pinch to zoom · click a star to inspect it · double-click
+(or **Enter system**) to fly in · **← Galaxy** to fly back out. (`node verify.mjs`
+renders the galaxy headlessly as a build check.)
+
+---
+
 Drag to pan · scroll / pinch to zoom · tap a planet to follow it. Zoom reveals
 detail rather than magnifying fixed pixels — the render buffer is sized so a
 rendered pixel is a constant on-screen block at every zoom, while bodies are

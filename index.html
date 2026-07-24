@@ -76,6 +76,16 @@ const DEMOS = [
       ex.render(s, ptr, size, size, 0, 0, zoom, 3.0);
       ex.system_free(s);
     } },
+  { name: "Galaxy", crate: "galaxy", sub: "map of star systems", wasm: "galaxy.wasm",
+    render: (m, ex, ptr, size) => {
+      // Galaxy is stateful too: build one, fit it, render the map into the thumb.
+      // render_map(gal, buf, w, h, cam_x, cam_y, zoom, t, sel, hover)
+      const g = ex.galaxy_new((Math.random()*1e9)>>>0);
+      const ext = ex.galaxy_extent(g);
+      const zoom = 0.46*size/ext;
+      ex.render_map(g, ptr, size, size, 0, 0, zoom, 3.0, -1, -1);
+      ex.galaxy_free(g);
+    } },
   { name: "Aliens", crate: "bird", sub: "hybrid avian creatures", wasm: "bird.wasm",
     render: (m, ex, ptr, size) => {
       // render(ptr, size, seed, phase, energy)
