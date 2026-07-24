@@ -66,7 +66,7 @@ const DEMOS = [
     render: (m, ex, ptr, size) => {
       ex.render(ptr, size, (Math.random()*6)|0, (Math.random()*1e9)|0, 0.0);
     } },
-  { name: "Solar System", crate: "solar", sub: "draggable systems", wasm: "solar.wasm",
+  { name: "Solar System", crate: "solar", sub: "draggable · eccentric orbits", wasm: "solar.wasm",
     render: (m, ex, ptr, size) => {
       // Solar is stateful: build a System, frame it, render into the thumb buffer.
       // render(sys, buf, w, h, cam_x, cam_y, zoom, t)
@@ -100,14 +100,6 @@ const DEMOS = [
       const zoom = Math.min(0.45*size/ext, 0.45*size/(ext*0.55)) * 1.3;
       ex.render(s, ptr, size, size, 0, 0, zoom, 2.0);
       ex.comet_free(s);
-    } },
-  { name: "Eccentric Orbits", crate: "orbit", sub: "Keplerian ellipses", wasm: "orbit.wasm",
-    render: (m, ex, ptr, size) => {
-      const s = ex.orbit_new((Math.random()*1e9)|0);
-      const ext = ex.system_extent(s);
-      const zoom = Math.min(0.45*size/ext, 0.45*size/(ext*0.55)) * 1.3;
-      ex.render(s, ptr, size, size, 0, 0, zoom, 3.0);
-      ex.orbit_free(s);
     } },
   { name: "Aliens", crate: "bird", sub: "hybrid avian creatures", wasm: "bird.wasm",
     render: (m, ex, ptr, size) => {

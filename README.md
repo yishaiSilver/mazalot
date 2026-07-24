@@ -163,7 +163,9 @@ detail rather than magnifying fixed pixels — the render buffer is sized so a
 rendered pixel is a constant on-screen block at every zoom, while bodies are
 rendered at a resolution that grows as you zoom in. A **Controls** dock exposes
 manual overrides:
-- **Layout** — planet count, planet spacing, planet size, sun size.
+- **Layout** — planet count, planet spacing, planet size, sun size, **orbit
+  thickness** (dashed-path line weight), and **eccentricity** (0 = circular
+  orbits, 1 = as generated, up to 2 = exaggerated ellipses).
 - **Motion** — orbit speed, and separate **planet** and **star rotation** speeds
   (three independent clocks; each accumulates so changing a speed never jumps).
 - **Pixelation** — scene / planet / sun pixel size, plus per-body **detail caps**
@@ -180,9 +182,9 @@ Off-screen bodies are culled and each body's tile is bounded, so zoom stays
 responsive. Works on touch/mobile. (`node verify.mjs` renders the system
 headlessly as a build check.)
 
-**Web — the solar-system companion demos (moons, asteroid belt, comet, orbits):**
+**Web — the solar-system companion demos (moons, asteroid belt, comet):**
 ```bash
-for c in moon asteroid comet orbit; do
+for c in moon asteroid comet; do
   cargo build -p $c --target wasm32-unknown-unknown --release --no-default-features
   cp target/wasm32-unknown-unknown/release/$c.wasm crates/$c/web/$c.wasm
 done
@@ -196,8 +198,11 @@ collapsible **Controls** dock, and the same constant-block pixel-art scheme:
   spacing, rock size, star density, and a center-marker toggle.
 - **comet** — a comet on an eccentric orbit with an anti-sunward tail; a **Follow
   comet** button locks the camera to the head as it whips through perihelion.
-- **orbit** — genuine eccentric, inclined Keplerian orbits (star at a focus); a
-  **Follow body** button tracks a world and shows its eccentricity in the HUD.
+
+Eccentric orbits themselves live in the **solar** demo: each planet travels a
+Kepler ellipse with the star at a focus (solved from the mean anomaly, so worlds
+speed up at perihelion), and an **Eccentricity** slider scales the whole system
+from perfectly circular to exaggerated.
 
 **Web — live creature (the bird half):**
 ```bash

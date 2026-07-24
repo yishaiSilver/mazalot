@@ -323,25 +323,56 @@ pub fn sun_kind_name(i: usize) -> &'static str {
 #[derive(Clone, Copy)]
 pub struct Planet {
     pub kind: usize,     // index into PKINDS
-    pub orbit: f32,      // orbital radius, world units
+    pub orbit: f32,      // semi-major axis, world units
     pub radius: f32,     // body radius, world units
-    pub speed: f32,      // angular speed, radians per unit time
-    pub phase: f32,      // angle at time 0
+    pub speed: f32,      // mean motion, radians of mean anomaly per unit time
+    pub phase: f32,      // mean anomaly at time 0
     pub tilt: f32,       // orbit foreshortening (0 = edge-on line, 1 = face-on circle)
     pub spin: f32,       // axial-spin turns per unit time (self rotation)
+    pub e: f32,          // eccentricity (0 = circle, ..<1 = ellipse); star sits at a focus
+    pub arg: f32,        // argument of periapsis — rotates the ellipse's long axis in-plane
     pub seed: u32,       // this body's noise seed
 }
 
 impl Planet {
-    /// World-space position + a depth key at time `t`. `spacing` scales the
-    /// orbit radius (a live UI multiplier). Depth > 0 means the planet is on the
-    /// near side of its orbit (drawn in front of the sun).
-    fn at(&self, t: f32, spacing: f32) -> (f32, f32, f32) {
-        let a = self.phase + self.speed * t;
-        let (s, c) = a.sin_cos();
-        let x = c * self.orbit * spacing;
-        let y = s * self.orbit * ORBIT_FLATTEN * self.tilt * spacing;
-        (x, y, s) // depth = sin(a): +1 at the front of the ellipse
+    /// Effective eccentricity with the system's live `ecc` multiplier applied,
+    /// clamped short of a parabola. `ecc == 0` forces perfect circles.
+    #[inline]
+    fn ecc(&self, ecc: f32) -> f32 {
+        (self.e * ecc).clamp(0.0, 0.9)
+    }
+
+    /// In-plane point (focus at origin) at eccentric anomaly `ea`, rotated by the
+    /// argument of periapsis. Returns `(x1, y1)` before the view squash. At `e ==
+    /// 0` this is a circle of radius `orbit` about the sun (the old behaviour).
+    #[inline]
+    fn plane_point(&self, ea: f32, e: f32) -> (f32, f32) {
+        let b = self.orbit * (1.0 - e * e).max(0.0).sqrt();
+        let ox = self.orbit * (ea.cos() - e); // perihelion at ea=0; focus at origin
+        let oy = b * ea.sin();
+        let (sw, cw) = self.arg.sin_cos();
+        (ox * cw - oy * sw, ox * sw + oy * cw)
+    }
+
+    /// World-space position + a depth key at time `t`. `spacing` scales the orbit,
+    /// `ecc` scales eccentricity (both live UI multipliers). The mean anomaly
+    /// `M = phase + speed·t` advances uniformly; the eccentric anomaly `E` is
+    /// recovered from `M = E − e·sin E` by a few Newton steps (Kepler's 2nd law —
+    /// the planet sweeps faster near perihelion). Depth > 0 means the near side of
+    /// the orbit (drawn in front of the sun).
+    fn at(&self, t: f32, spacing: f32, ecc: f32) -> (f32, f32, f32) {
+        let e = self.ecc(ecc);
+        let m = (self.phase + self.speed * t).rem_euclid(TAU);
+        let mut ea = m;
+        for _ in 0..6 {
+            let f = ea - e * ea.sin() - m;
+            let fp = 1.0 - e * ea.cos();
+            ea -= f / fp;
+        }
+        let (x1, y1) = self.plane_point(ea, e);
+        let x = x1 * spacing;
+        let y = y1 * ORBIT_FLATTEN * self.tilt * spacing;
+        (x, y, y1 / self.orbit) // depth ~ near/far side, normalised by the orbit size
     }
 }
 
@@ -371,6 +402,9 @@ pub struct System {
     pub star_parallax: f32,
     // Dashed orbit-path line thickness in pixels (1 = default 1px look).
     pub orbit_width: f32,
+    // Eccentricity multiplier (scales every planet's generated `e`; 0 = force
+    // perfect circles, 1 = as generated, higher = exaggerate the ellipses).
+    pub ecc: f32,
 }
 
 /// How much orbits are squashed vertically to fake a tilted, near-top-down view.
@@ -429,6 +463,11 @@ impl System {
             let phase = rng.range(0.0, TAU);
             let tilt = rng.range(0.8, 1.0); // near face-on, a touch of variety
             let spin = rng.range(0.15, 0.6) * if rng.below(0.15) { -1.0 } else { 1.0 };
+            // A gentle spread of eccentricity so orbits read as ellipses with the
+            // sun at a focus, not perfect circles — inner worlds a touch rounder,
+            // the odd outer world more elongated. The `ecc` view knob scales this.
+            let e = (rng.range(0.03, 0.24) + frac * rng.range(0.0, 0.18)).min(0.42);
+            let arg = rng.range(0.0, TAU); // point each ellipse's long axis its own way
             let bseed = seed.wrapping_mul(2_654_435_761).wrapping_add(i as u32 * 40_503 + 1);
             planets.push(Planet {
                 kind,
@@ -438,6 +477,8 @@ impl System {
                 phase,
                 tilt,
                 spin,
+                e,
+                arg,
                 seed: bseed,
             });
             // Next orbit: leave room for this body + a growing gap.
@@ -448,7 +489,7 @@ impl System {
             seed, sun_kind, sun_radius, planets,
             spacing: 1.0, planet_size: 1.0, sun_size: 1.0, planet_pixel: 1.0, sun_pixel: 1.0,
             planet_detail: 160.0, sun_detail: 110.0, star_density: 0.5, star_parallax: 1.0,
-            orbit_width: 1.0,
+            orbit_width: 1.0, ecc: 1.0,
         }
     }
 
@@ -485,12 +526,19 @@ impl System {
         self.orbit_width = px.clamp(1.0, 6.0);
     }
 
+    /// Live eccentricity multiplier: 0 forces circular orbits, 1 keeps each
+    /// planet's generated eccentricity, higher exaggerates the ellipses.
+    pub fn set_eccentricity(&mut self, scale: f32) {
+        self.ecc = scale.clamp(0.0, 2.5);
+    }
+
     /// The outermost extent (world units) with the current view multipliers —
     /// handy for framing / zoom-fit.
     pub fn extent(&self) -> f32 {
         self.planets
             .last()
-            .map(|p| p.orbit * self.spacing + p.radius * self.planet_size)
+            // Aphelion (the far point) is a·(1 + e); frame against that.
+            .map(|p| p.orbit * (1.0 + p.ecc(self.ecc)) * self.spacing + p.radius * self.planet_size)
             .unwrap_or(self.sun_radius * self.sun_size)
             + 40.0
     }
@@ -964,20 +1012,23 @@ fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32, den
 }
 
 /// Dot in a planet's orbit path as a faint dashed ellipse around the sun.
-fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, p: &Planet, spacing: f32, width: f32) {
+fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, p: &Planet, spacing: f32, ecc: f32, width: f32) {
     let steps = 220;
     // Filled square stamp of half-extent `r`; width == 1 gives r == 0, i.e. the
     // original single-pixel dot (pixel-identical to the default look).
     let r = (((width - 1.0) * 0.5).round()) as i32;
+    // Sample the ellipse by eccentric anomaly so the dashed path traces the exact
+    // curve the planet travels (uniform in E draws the geometry, not the motion).
+    let e = p.ecc(ecc);
     for k in 0..steps {
         // Dashed: skip every few samples.
         if (k / 3) % 2 == 0 {
             continue;
         }
-        let a = TAU * k as f32 / steps as f32;
-        let (s, c) = a.sin_cos();
-        let wx = c * p.orbit * spacing;
-        let wy = s * p.orbit * ORBIT_FLATTEN * p.tilt * spacing;
+        let ea = TAU * k as f32 / steps as f32;
+        let (x1, y1) = p.plane_point(ea, e);
+        let wx = x1 * spacing;
+        let wy = y1 * ORBIT_FLATTEN * p.tilt * spacing;
         let (sx, sy) = to_screen(wx, wy, cam, w, h);
         let (px, py) = (sx as i32, sy as i32);
         for dy in -r..=r {
@@ -1010,7 +1061,7 @@ pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: 
     assert!(out.len() >= (w * h * 4) as usize);
     paint_background(out, w, h, cam, sys.seed, sys.star_density, sys.star_parallax, bgx, bgy);
     for p in &sys.planets {
-        paint_orbit(out, w, h, cam, p, sys.spacing, sys.orbit_width);
+        paint_orbit(out, w, h, cam, p, sys.spacing, sys.ecc, sys.orbit_width);
     }
 
     // Build a draw list of (depth, is_sun, planet_index). The sun sits at
@@ -1018,7 +1069,7 @@ pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: 
     let mut order: Vec<(f32, i32)> = Vec::with_capacity(sys.planets.len() + 1);
     order.push((0.0, -1)); // sun
     for (i, p) in sys.planets.iter().enumerate() {
-        let (_, _, depth) = p.at(t_orbit, sys.spacing);
+        let (_, _, depth) = p.at(t_orbit, sys.spacing, sys.ecc);
         order.push((depth, i as i32));
     }
     order.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -1057,7 +1108,7 @@ pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: 
             blit(out, w, h, &tile, suncx, suncy, rad_px / rad_render);
         } else {
             let p = &sys.planets[which as usize];
-            let (wx, wy, _depth) = p.at(t_orbit, sys.spacing);
+            let (wx, wy, _depth) = p.at(t_orbit, sys.spacing, sys.ecc);
             let (sx, sy) = to_screen(wx, wy, cam, w, h);
             let rad_px = p.radius * sys.planet_size * cam.zoom;
             // Rings reach ~2 radii; pad generously so a ringed giant isn't clipped.
@@ -1088,7 +1139,7 @@ pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: 
 pub fn planet_world_pos(sys: &System, i: usize, t: f32) -> (f32, f32) {
     match sys.planets.get(i) {
         Some(p) => {
-            let (x, y, _) = p.at(t, sys.spacing);
+            let (x, y, _) = p.at(t, sys.spacing, sys.ecc);
             (x, y)
         }
         None => (0.0, 0.0),
@@ -1102,7 +1153,7 @@ pub fn planet_nearest_center(sys: &System, w: u32, h: u32, cam: &Camera, t: f32)
     let mut best = -1i32;
     let mut best_d = f32::MAX;
     for (i, p) in sys.planets.iter().enumerate() {
-        let (wx, wy, _) = p.at(t, sys.spacing);
+        let (wx, wy, _) = p.at(t, sys.spacing, sys.ecc);
         let (sx, sy) = to_screen(wx, wy, cam, w, h);
         let d = (sx - ccx).powi(2) + (sy - ccy).powi(2);
         // Only count it if the centre is within ~2.5 body radii on screen.

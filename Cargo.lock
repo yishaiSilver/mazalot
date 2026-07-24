@@ -183,13 +183,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "orbit"
-version = "0.1.0"
-dependencies = [
- "image",
-]
-
-[[package]]
 name = "planet"
 version = "0.1.0"
 dependencies = [
