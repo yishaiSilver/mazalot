@@ -62,6 +62,28 @@ stretching, and a full 360° spin loops seamlessly.
 - **Limited palettes** — swap any planet into a duotone: `Natural`, `Game Boy`, `Ice`, `Sunset`.
 - **Crisp dark rim** — a 1-px outline on every disc (and every moon) for sprite readability.
 
+### Per-seed genome (individuality)
+A planet TYPE is an *archetype* (green terran, tan gas giant, …), not a fixed
+sprite. On its own the seed only offsets **where** the noise is sampled, so
+every terran wears the same green-and-blue clay with its continents shuffled.
+The **genome** turns the seed into an **identity** — the planet-side analogue of
+the bird crate's genus→individual model — by perturbing a type *before*
+rendering, all bounded so the world still reads as a member of its family:
+- **Pigment / "chloroplast" hue** — a luminance-preserving hue rotation (±~126°)
+  of the surface palette. One swamp world's vegetation reflects amber, another's
+  violet, another's teal — brightness (and so the day/night terminator) is
+  untouched. Applied on **every** render path, so the seed always picks a color
+  while the sliders keep full control of structure.
+- **Structural jitter** — bounded swings on terrain frequency, contrast, cloud
+  cover, ice-cap extent, band count, and turbulence. Applied on the canonical
+  render path (system / galaxy views, native sheets) where many planets of one
+  type appear together and must be told apart at a glance.
+
+Two limits by construction: near-neutral rock (barren/moon) has no chroma to
+spin, so those families vary in terrain, not color; and the hue lever lives in
+`crates/planet` — the `solar` and `moon` crates carry their own planet tables
+(they share no code) and would each need the same one-function pass to match.
+
 ## The star system
 
 A star is the **inverse of a planet**: self-luminous, so there is *no* day/night

@@ -120,6 +120,28 @@ fn ramp(stops: &[(f32, Rgb)], h: f32) -> Rgb {
     stops[stops.len() - 1].1
 }
 
+/// Luminance-preserving hue rotation (Rec.601 weights). Spins the chroma of a
+/// color by `a` radians while leaving its brightness alone — so shading and the
+/// day/night terminator survive untouched, but a green-vegetation world can
+/// wear amber, violet or red "chloroplast" pigment instead. This is the single
+/// biggest lever for making two same-type planets read as different individuals.
+fn hue_rotate(c: Rgb, a: f32) -> Rgb {
+    if a == 0.0 {
+        return c;
+    }
+    let (s, k) = a.sin_cos();
+    let m = [
+        0.213 + k * 0.787 - s * 0.213, 0.715 - k * 0.715 - s * 0.715, 0.072 - k * 0.072 + s * 0.928,
+        0.213 - k * 0.213 + s * 0.143, 0.715 + k * 0.285 + s * 0.140, 0.072 - k * 0.072 - s * 0.283,
+        0.213 - k * 0.213 - s * 0.787, 0.715 - k * 0.715 + s * 0.715, 0.072 + k * 0.928 + s * 0.072,
+    ];
+    [
+        clamp01(c[0] * m[0] + c[1] * m[1] + c[2] * m[2]),
+        clamp01(c[0] * m[3] + c[1] * m[4] + c[2] * m[5]),
+        clamp01(c[0] * m[6] + c[1] * m[7] + c[2] * m[8]),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Planet type table
 // ---------------------------------------------------------------------------
@@ -166,6 +188,8 @@ pub struct PType {
     lightning: f32,   // storm-flash intensity (cloudy/storm worlds)
     aurora: f32,      // polar aurora intensity
     storm_cells: f32, // rotating hurricane swirls in the cloud layer
+    // per-individual genome (set from the seed, not the type table)
+    hue: f32,         // surface hue rotation in radians — the "chloroplast" knob
 }
 
 const fn base() -> PType {
@@ -200,6 +224,7 @@ const fn base() -> PType {
         lightning: 0.0,
         aurora: 0.0,
         storm_cells: 0.0,
+        hue: 0.0,
     }
 }
 
@@ -322,6 +347,65 @@ fn seed_offsets(seed: u32) -> [f32; 3] {
         hash3(seed as i32, 2, 7) * 256.0 + 4.0,
         hash3(seed as i32, 3, 7) * 256.0 + 4.0,
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Per-seed genome — what makes two same-type planets distinct *individuals*
+// rather than the same clay with the continents shuffled.
+//
+// A planet TYPE is a fixed archetype (green terran, tan gas giant, ...). On its
+// own the seed only offsets *where* noise is sampled, so every terran wears the
+// same pigment. The genome turns the seed into an *identity*: it re-rolls the
+// pieces that make a world recognizable — its pigment (hue), how contrasty and
+// finely-detailed its terrain runs, how cloudy/icy it is, its band count and
+// turbulence — all bounded so the world still reads as a member of its family.
+// This is the planet-side analogue of the bird crate's genus→individual model.
+// ---------------------------------------------------------------------------
+
+/// How far the surface pigment may swing, in radians (~126°). Big enough for
+/// green→amber, green→teal, green→violet vegetation; short of a full inversion.
+const GENOME_HUE: f32 = 2.2;
+
+/// A decorrelated 0..1 sample for genome trait `k` from a seed.
+fn gene(seed: u32, k: i32) -> f32 {
+    hash3(seed as i32, k, 101)
+}
+
+/// Record the individual's hue and rotate the colors that bypass `surface`, so
+/// the atmosphere rim and ring tint track the surface pigment. Everything the
+/// surface shader builds (`light`/`dark`/`rock`/`glow_*` and the static ramps)
+/// is rotated once, per-pixel, via `ct.hue` in `surface` — so it must NOT be
+/// pre-rotated here, or it would spin twice.
+fn tint_type(ct: &mut PType, a: f32) {
+    ct.hue = a;
+    ct.atmo = hue_rotate(ct.atmo, a);
+    ct.ring_col = hue_rotate(ct.ring_col, a);
+}
+
+/// Chromatic genome: pigment only. Applied on *every* render path (including the
+/// slider playground) so the seed always chooses a world's color, while the
+/// sliders keep full control of structure.
+fn genome_chroma(ct: &mut PType, seed: u32) {
+    tint_type(ct, (gene(seed, 1) * 2.0 - 1.0) * GENOME_HUE);
+}
+
+/// Full genome: pigment + bounded structural jitter. Applied on the canonical
+/// `render_rgba` path (system/galaxy views, native sheets) where many planets of
+/// one type appear together and must be told apart at a glance.
+fn genome_full(ct: &mut PType, seed: u32) {
+    genome_chroma(ct, seed);
+    // Multiplicative, symmetric jitters keep each world a plausible member of
+    // its family: never zeroing a trait, never exploding it.
+    ct.freq *= 0.78 + gene(seed, 2) * 0.5; //  ~0.78..1.28  detail scale
+    ct.contrast *= 0.82 + gene(seed, 3) * 0.42; // land/sea sharpness
+    if ct.clouds > 0.03 {
+        ct.clouds = clamp01(ct.clouds * (0.45 + gene(seed, 4) * 1.15)); // overcast vs clear
+    }
+    if ct.caps > 0.0 {
+        ct.caps = clamp01(ct.caps * (0.35 + gene(seed, 5) * 1.25)); // ice-cap extent
+    }
+    ct.bands *= 0.82 + gene(seed, 6) * 0.5; // stripe count on banded worlds
+    ct.turb *= 0.6 + gene(seed, 7) * 0.85; // band/cloud churn
 }
 
 /// Palette cycling: loop through a 3-stop gradient by phase, lo→mid→hi→lo.
@@ -482,6 +566,12 @@ fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32) -> 
         }
     };
 
+    // Genome pigment: spin the base surface color to this individual's hue,
+    // BEFORE the self-colored overlays (aurora/lightning keep their own hues).
+    if ct.hue != 0.0 {
+        col = hue_rotate(col, ct.hue);
+    }
+
     // Aurora — shimmering polar curtains, hue palette-cycled over time/latitude
     // (green → cyan → violet). Glows on the night side via emis.
     if ct.aurora > 0.0 {
@@ -544,7 +634,9 @@ pub fn param(type_idx: usize, which: u32) -> f32 {
 /// Render one planet frame as RGBA into `out` (must be >= size*size*4 bytes).
 /// `angle` is the rotation in radians; a full 2π loop is seamless.
 pub fn render_rgba(size: u32, type_idx: usize, seed: u32, angle: f32, out: &mut [u8]) {
-    render_ct(size, &TYPES[type_idx % TYPES.len()], seed, angle, &Style::natural(), out);
+    let mut ct = TYPES[type_idx % TYPES.len()];
+    genome_full(&mut ct, seed);
+    render_ct(size, &ct, seed, angle, &Style::natural(), out);
 }
 
 /// Same as [`render_rgba`] but with a few parameters overridden (web sliders).
@@ -565,6 +657,7 @@ pub fn render_rgba_custom(
     ct.freq = freq;
     ct.specular = specular;
     ct.shininess = shininess;
+    genome_chroma(&mut ct, seed);
     render_ct(size, &ct, seed, angle, &Style::natural(), out);
 }
 
@@ -604,6 +697,7 @@ pub fn render_rgba_styled(
         ct.turb = p[11];
         ct.spec_albedo = p[12];
     }
+    genome_chroma(&mut ct, seed);
     let style = Style { palette, dither, moons: moons != 0 };
     render_ct(size, &ct, seed, angle, &style, out);
 }
