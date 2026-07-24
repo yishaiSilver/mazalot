@@ -473,9 +473,6 @@ impl CometScene {
     pub fn render(&self, w: u32, h: u32, cam: &Camera, t: f32, out: &mut [u8]) {
         assert!(out.len() >= (w * h * 4) as usize);
         paint_background(out, w, h, cam, self.seed);
-        for c in &self.comets {
-            paint_orbit(out, w, h, cam, c, self.orbit_width);
-        }
 
         // Star tile at the world origin (the focus).
         let sk = &STARS[self.star_kind];
@@ -487,6 +484,31 @@ impl CometScene {
             blit(out, w, h, &tile, starx, stary, rad_px / rad_render);
         }
 
+        self.draw_comets(w, h, cam, t, out);
+    }
+
+    /// Render ONLY the comets — their dashed orbit paths, tails, coma and nuclei —
+    /// onto a zeroed (transparent-black) buffer, with NO background and NO star.
+    /// Lets the comets be composited over another scene that already draws the
+    /// star at the focus (e.g. the solar-system view). The anti-sunward tail
+    /// direction still points away from that shared focus at the world origin.
+    pub fn render_overlay(&self, w: u32, h: u32, cam: &Camera, t: f32, out: &mut [u8]) {
+        let len = (w * h * 4) as usize;
+        assert!(out.len() >= len);
+        for b in out[..len].iter_mut() {
+            *b = 0;
+        }
+        self.draw_comets(w, h, cam, t, out);
+    }
+
+    /// The orbit-paths + comets pass, shared by [`render`](Self::render) and
+    /// [`render_overlay`](Self::render_overlay). Tails point away from the focus
+    /// (the world origin), which is where the star sits in both paths.
+    fn draw_comets(&self, w: u32, h: u32, cam: &Camera, t: f32, out: &mut [u8]) {
+        for c in &self.comets {
+            paint_orbit(out, w, h, cam, c, self.orbit_width);
+        }
+        let (starx, stary) = to_screen(0.0, 0.0, cam, w, h);
         for c in &self.comets {
             draw_comet(out, w, h, cam, c, starx, stary, t);
         }

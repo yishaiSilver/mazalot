@@ -89,6 +89,26 @@ pub extern "C" fn render(
     crate::render_belt(belt, w, h, &cam, t, out);
 }
 
+/// Render ONLY the rocks onto a zeroed buffer (no starfield, no centre marker),
+/// for compositing the belt over another scene. Same args as [`render`].
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn render_overlay(
+    belt: *const Belt,
+    buf: *mut u8,
+    w: u32,
+    h: u32,
+    cam_x: f32,
+    cam_y: f32,
+    zoom: f32,
+    t: f32,
+) {
+    let belt = unsafe { &*belt };
+    let out = unsafe { slice::from_raw_parts_mut(buf, (w * h * 4) as usize) };
+    let cam = Camera { x: cam_x, y: cam_y, zoom };
+    crate::render_belt_overlay(belt, w, h, &cam, t, out);
+}
+
 /// Number of rocks in the belt.
 #[no_mangle]
 pub extern "C" fn rock_count(belt: *const Belt) -> u32 {

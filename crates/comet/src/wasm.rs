@@ -74,6 +74,27 @@ pub extern "C" fn render(
     scene.render(w, h, &cam, t, out);
 }
 
+/// Render ONLY the comets (orbit paths, tails, coma, nuclei) onto a zeroed
+/// buffer — no background, no star — for compositing over another scene. Same
+/// args as [`render`].
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn render_overlay(
+    scene: *const CometScene,
+    buf: *mut u8,
+    w: u32,
+    h: u32,
+    cam_x: f32,
+    cam_y: f32,
+    zoom: f32,
+    t: f32,
+) {
+    let scene = unsafe { &*scene };
+    let out = unsafe { slice::from_raw_parts_mut(buf, (w * h * 4) as usize) };
+    let cam = Camera { x: cam_x, y: cam_y, zoom };
+    scene.render_overlay(w, h, &cam, t, out);
+}
+
 /// Number of comets in the scene.
 #[no_mangle]
 pub extern "C" fn comet_count(scene: *const CometScene) -> u32 {

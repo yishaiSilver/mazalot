@@ -631,7 +631,24 @@ pub fn render_belt(belt: &Belt, w: u32, h: u32, cam: &Camera, t: f32, out: &mut 
     if belt.show_center {
         paint_center(out, w, h, cam);
     }
+    draw_rocks(belt, w, h, cam, t, out);
+}
 
+/// Render ONLY the rocks onto a zeroed (transparent-black) buffer — no starfield,
+/// no centre marker — so the belt can be composited over another scene (e.g. the
+/// solar-system view) that already owns the background and the star at the focus.
+pub fn render_belt_overlay(belt: &Belt, w: u32, h: u32, cam: &Camera, t: f32, out: &mut [u8]) {
+    let len = (w * h * 4) as usize;
+    assert!(out.len() >= len);
+    for b in out[..len].iter_mut() {
+        *b = 0;
+    }
+    draw_rocks(belt, w, h, cam, t, out);
+}
+
+/// The depth-sorted rock pass, shared by [`render_belt`] and
+/// [`render_belt_overlay`]. Draws over whatever is already in `out`.
+fn draw_rocks(belt: &Belt, w: u32, h: u32, cam: &Camera, t: f32, out: &mut [u8]) {
     let (wf, hf) = (w as f32, h as f32);
     // Depth-sort a lightweight (depth, index) list back-to-front. Hundreds of
     // entries — trivially cheap next to the per-pixel sprite work.
