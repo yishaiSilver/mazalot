@@ -228,30 +228,41 @@ Implications:
 `cargo run -p solar --release --bin bench` decomposes a frame by rendering the
 same scene under controlled scenarios (bodies culled off-screen → background
 only; density 0 → no stars; zoomed past the nebula fade → base fill only).
-At 1000×640, seed 7 (4 planets), native:
+At 1000×640, seed 7 (4 planets), native, **after the caching below**:
 
 | scenario | per frame | |
 |---|---|---|
-| fit view, moving camera | ~17 ms | 58 fps |
-| **fit view, still camera (cached bg)** | **~9 ms** | **111 fps** |
-| zoomed onto the sun | ~40 ms | 25 fps |
-| zoomed onto a planet | ~37 ms | 27 fps |
+| fit view, panning (drag) | ~11 ms | 92 fps |
+| **fit view, still camera** | **~9 ms** | **106 fps** |
+| zoomed onto the sun | ~39 ms | 26 fps |
+| zoomed onto a planet | ~35 ms | 29 fps |
 
-Fit-view breakdown: the **background is ~50%** of the frame (nebula bake ~29%,
-base fill ~19%, stars ~2%) and the **bodies ~50%**. The background is O(pixels)
-at a flat ~13 ns/px, and — crucially — it's *time-independent*.
+Profiling the *un*cached renderer showed the **background was ~50% of every
+frame** and O(pixels) — yet it's almost entirely *stable*: it never depends on
+animation time, the nebula scrolls at only 9% of pan and its shape doesn't
+change with zoom at all, and the base navy fill is constant. Only the stars
+(a cheap O(cells) point overlay) genuinely move each frame. So the background is
+cached in **three nested layers**, each keyed on what actually changes it:
 
-- **Biggest win, shipped: cache the background.** On a still camera the backdrop
-  is byte-identical every frame, so `render_system_cached` keys it on
-  camera+view and `memcpy`s it — halving the still-camera frame (17→9 ms). Any
-  pan/zoom/slider change invalidates the key and repaints once.
-- **Nebula is the costliest sub-pass** (fBm at every 8px cell). Cheaper: bake it
-  once per (zoom, pan) into its own buffer, or drop an octave.
-- **Worst case is a body filling the screen** (sun ~40 ms): the corona/boil
-  shader runs per-pixel over a large tile. The per-body detail cap (`maxr`)
-  already bounds it; lowering the sun's cap trades a little sharpness for fps.
-- **Per-frame heap:** each uncached frame allocates a nebula `Vec` and a
-  draw-order `Vec` — reusable scratch on the `System` would remove that churn.
+- **fBm nebula field** (low-res, the single costliest sub-pass) — keyed on the
+  quantized scroll offset *only*, so a pure **zoom never re-bakes it** (zoom just
+  fades its brightness at composite). Isolated, the bake is ~9 ms/frame at this
+  size; cached, it's ~0.
+- **Base-navy + nebula layer** (full-res, everything except stars/orbits) —
+  keyed on scroll offset **and** the quantized zoom-fade. On a drag between
+  offset ticks it's reused as a `memcpy`, collapsing the ~6.5 ms O(pixels)
+  base-fill + composite to a copy. This is what takes a **drag from ~17→11 ms**.
+- **Whole backdrop** (`render_system_cached`) — on a perfectly still camera even
+  the star overlay is skipped: the entire backdrop is one `memcpy` and only the
+  orbiting bodies re-render (**~9 ms, 106 fps**).
+
+All three invalidate automatically the moment their key changes, and the
+quantized nebula offset (2 px, below perception on a faint low-frequency cloud)
+means a slow drag re-bakes at most every ~7 frames. **Bodies now dominate** a
+moving frame (~84%). The remaining hotspot is a body filling the screen (sun
+~39 ms): the corona/boil shader runs per-pixel over a large tile — the per-body
+detail cap (`maxr`) already bounds it, and lowering the sun's cap trades a little
+sharpness for fps.
 
 ## Adding a planet type
 

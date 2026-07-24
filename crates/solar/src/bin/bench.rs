@@ -16,15 +16,19 @@ const W: u32 = 1000;
 const H: u32 = 640;
 const FRAMES: u32 = 80;
 
-/// Mean ms/frame for `render_system` over `FRAMES` (after a short warm-up).
+/// Mean ms/frame for `render_system` over `FRAMES` (after a short warm-up),
+/// with the camera PANNING (`bgx` advances) so it reflects the interactive drag
+/// cost — the full-frame cache never hits, and the nebula cache re-bakes only
+/// when the quantized scroll offset ticks (a realistic ~3 px/frame drag).
 fn ms(sys: &System, cam: &Camera, buf: &mut [u8]) -> f64 {
     for i in 0..4 {
-        render_system(sys, W, H, cam, 0.0, 0.0, i as f32 * 0.1, i as f32 * 0.1, i as f32 * 0.1, buf);
+        render_system(sys, W, H, cam, i as f32 * 3.0, 0.0, i as f32 * 0.1, i as f32 * 0.1, i as f32 * 0.1, buf);
     }
     let t = Instant::now();
     for i in 0..FRAMES {
         let ta = i as f32 * 0.013; // advance clocks so nothing is cached away
-        render_system(sys, W, H, cam, 0.0, 0.0, ta, ta * 1.3, ta * 0.7, buf);
+        let bg = 12.0 + i as f32 * 3.0; // pan -> full-frame cache miss every frame
+        render_system(sys, W, H, cam, bg, 0.0, ta, ta * 1.3, ta * 0.7, buf);
     }
     t.elapsed().as_secs_f64() * 1000.0 / FRAMES as f64
 }
@@ -90,16 +94,41 @@ fn main() {
     };
 
     println!("── whole frame ──────────────────────────────");
-    println!("  fit (typical view)                {:7.2} ms   ({:.0} fps)", t_full, 1000.0 / t_full);
-    println!("  fit, cached bg (still camera)     {:7.2} ms   ({:.0} fps)  <- render_system_cached", t_cached, 1000.0 / t_cached);
+    println!("  fit, panning (drag)               {:7.2} ms   ({:.0} fps)", t_full, 1000.0 / t_full);
+    println!("  fit, still camera (cached bg)     {:7.2} ms   ({:.0} fps)  <- render_system_cached", t_cached, 1000.0 / t_cached);
     println!("  zoomed onto the sun               {:7.2} ms   ({:.0} fps)", t_sun, 1000.0 / t_sun);
     println!("  zoomed onto a planet              {:7.2} ms   ({:.0} fps)", t_planet, 1000.0 / t_planet);
-    println!("\n── fit breakdown ────────────────────────────");
+    println!("\n── fit breakdown (panning) ──────────────────");
     println!("  background total                  {:7.2} ms   {:5.1}%", t_bg, 100.0 * t_bg / t_full);
     println!("    ├ base fill + orbit paths       {:7.2} ms   {:5.1}%", t_base, 100.0 * t_base / t_full);
-    println!("    ├ nebula bake + composite       {:7.2} ms   {:5.1}%", nebula, 100.0 * nebula / t_full);
+    println!("    ├ nebula (bake amortized)       {:7.2} ms   {:5.1}%", nebula, 100.0 * nebula / t_full);
     println!("    └ stars (density 0.5)           {:7.2} ms   {:5.1}%", stars, 100.0 * stars / t_full);
     println!("  bodies (sun + {} planets)          {:7.2} ms   {:5.1}%", sys.planets.len(), bodies, 100.0 * bodies / t_full);
+
+    // Nebula cache: the per-cell fBm bake vs reusing it. On a still/zooming
+    // camera the offset never ticks (nebula cached); on a slow drag it ticks
+    // rarely; only a fast fling re-bakes most frames.
+    println!("\n── nebula cache (bg only, density 0) ────────");
+    set_density(&mut sys, 0.0);
+    let bgcam = Camera { x: 1.0e7, y: 1.0e7, zoom: fz };
+    let bake_ms = |sys: &System, step: f32, buf: &mut [u8]| -> f64 {
+        for i in 0..4 {
+            render_system(sys, W, H, &bgcam, i as f32 * step, 0.0, 0.0, 0.0, 0.0, buf);
+        }
+        let t = Instant::now();
+        for i in 0..FRAMES {
+            render_system(sys, W, H, &bgcam, 40.0 + i as f32 * step, 0.0, 0.0, 0.0, 0.0, buf);
+        }
+        t.elapsed().as_secs_f64() * 1000.0 / FRAMES as f64
+    };
+    let neb_still = bake_ms(&sys, 0.0, &mut buf); // never ticks -> cache always hit
+    let neb_drag = bake_ms(&sys, 3.0, &mut buf); // ~3 px/frame -> ticks ~1/7 frames
+    let neb_fling = bake_ms(&sys, 5000.0, &mut buf); // re-bakes every frame (old cost)
+    println!("  still / zooming (cache hit)       {:7.2} ms", neb_still);
+    println!("  slow drag (~1 bake / 7 frames)    {:7.2} ms", neb_drag);
+    println!("  re-bake every frame (was: always) {:7.2} ms", neb_fling);
+    println!("  => fBm bake saved when cached      {:6.2} ms/frame", (neb_fling - neb_still).max(0.0));
+    set_density(&mut sys, 0.5);
 
     // Resolution scaling (background is O(pixels)).
     println!("\n── background vs resolution (bodies off) ────");
@@ -127,7 +156,7 @@ fn main() {
     set_density(&mut sys, 0.5);
 
     // Per-frame heap allocations in the hot path (informational).
-    println!("\nnote: render_system allocates a per-frame nebula Vec (~{} KB) and a",
+    println!("\nnote: the nebula field (~{} KB) is now cached on the System and reused",
         ((W + 7) / 8) * ((H + 7) / 8) * 12 / 1024);
-    println!("      draw-order Vec each call — candidates for reuse.");
+    println!("      across frames; render_system still allocates a small draw-order Vec.");
 }

@@ -24,6 +24,7 @@
 //! scene stays cheap enough to render live while the user drags — exactly the
 //! "bake-or-stay-small" guidance in the workspace README.
 
+use std::cell::RefCell;
 use std::f32::consts::TAU;
 
 // ===========================================================================
@@ -373,6 +374,34 @@ pub struct System {
     // reused by `render_system_cached` while the camera/view is unchanged.
     bg_cache: Vec<u8>,
     bg_key: Option<BgKey>,
+    // Cached background layers. Interior-mutable so it memoizes through the
+    // shared `&System` render path too. See [`BgCache`] and `paint_background`.
+    neb: RefCell<BgCache>,
+}
+
+/// Two nested background caches, both exploiting that the backdrop-minus-stars
+/// "barely changes":
+///   • `neb_field` — the low-res per-cell fBm nebula, the most expensive single
+///     sub-pass. Keyed on the scroll offset ONLY (not zoom), so a pure zoom
+///     never re-bakes it.
+///   • `layer` — the full-res base-navy + nebula composite (everything except
+///     the moving stars and orbit paths). Keyed on scroll offset AND zoom-fade.
+///     This is the big one: on a drag it's reused as a `memcpy`, so the O(pixels)
+///     base-fill + nebula composite (~6.5 ms at 1000×640) collapses to a copy,
+///     and only the cheap star/orbit overlay redraws.
+/// The stars scroll every frame (they're the parallax), so they're never cached
+/// here — they're drawn on top of the (copied) layer each frame.
+#[derive(Default)]
+struct BgCache {
+    /// `[nw, nh, qx, qy]` the `neb_field` is valid for (zoom excluded).
+    neb_key: Option<[i32; 4]>,
+    /// Low-res (8px-cell) RGB nebula at full strength (density premultiplied,
+    /// NO zoom-fade — that's applied at composite) — `nw * nh` entries.
+    neb_field: Vec<[f32; 3]>,
+    /// `[w, h, qx, qy, quantized zoom-fade]` the `layer` is valid for.
+    layer_key: Option<[i32; 5]>,
+    /// Full-res RGBA base-navy + nebula (no stars, no orbits) — `w * h * 4` bytes.
+    layer: Vec<u8>,
 }
 
 /// How much orbits are squashed vertically to fake a tilted, near-top-down view.
@@ -451,6 +480,7 @@ impl System {
             spacing: 1.0, planet_size: 1.0, sun_size: 1.0, planet_pixel: 1.0, sun_pixel: 1.0,
             planet_detail: 160.0, sun_detail: 110.0, star_density: 0.5, star_parallax: 1.0,
             bg_cache: Vec::new(), bg_key: None,
+            neb: RefCell::new(BgCache::default()),
         }
     }
 
@@ -841,6 +871,47 @@ fn star_tint(hh: f32) -> Rgb {
     }
 }
 
+/// Nebula bake resolution: one fBm sample per 8×8-px block → pixel-art clouds.
+const NEB_CELL: u32 = 8;
+/// The nebula scroll offset is snapped to this many pixels, so small pans (and
+/// all zooms) reuse the previous bake instead of re-running the per-cell fBm.
+/// The nebula is faint and low-frequency, so 2-px steps are imperceptible.
+const NEB_QUANT: f32 = 2.0;
+
+/// Ensure the cached nebula field matches `[nw, nh, qx, qy]`, re-baking the
+/// per-cell fBm only on a miss. Stores the field at FULL strength (density
+/// premultiplied, but no zoom-fade — that's applied per-pixel at composite),
+/// which is why the key excludes zoom: a pure zoom never invalidates the bake.
+fn ensure_nebula(cache: &RefCell<BgCache>, si: i32, nw: u32, nh: u32, qx: i32, qy: i32) {
+    let key = [nw as i32, nh as i32, qx, qy];
+    if let Ok(c) = cache.try_borrow() {
+        if c.neb_key == Some(key) && c.neb_field.len() == (nw * nh) as usize {
+            return; // hit — the clouds barely moved (or only the zoom changed)
+        }
+    }
+    let mut c = cache.borrow_mut();
+    let ta = NEB_TINTS[(hash3(si, 1, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
+    let tb = NEB_TINTS[(hash3(si, 2, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
+    let (nox, noy) = (qx as f32 * NEB_QUANT, qy as f32 * NEB_QUANT);
+    let f = 1.0 / 240.0;
+    c.neb_field.clear();
+    c.neb_field.resize((nw * nh) as usize, [0.0; 3]);
+    for cy in 0..nh {
+        for cx in 0..nw {
+            let gx = ((cx * NEB_CELL) as f32 + nox) * f;
+            let gy = ((cy * NEB_CELL) as f32 + noy) * f;
+            let dens = smoothstep(0.50, 0.74, fbm(gx, gy, 4.2, 3)); // patchy -> not crowded
+            if dens > 0.0 {
+                let n2 = fbm(gx * 1.8 + 40.0, gy * 1.8 + 7.0, 1.5, 2);
+                let col = mix(ta, tb, clamp01((n2 - 0.35) * 2.2));
+                let k = dens * 0.34; // faint; zoom-fade applied later at composite
+                c.neb_field[(cy * nw + cx) as usize] = [col[0] * k, col[1] * k, col[2] * k];
+            }
+        }
+    }
+    c.neb_key = Some(key);
+}
+
 /// Paint the space background: a faint colored nebula plus parallax star layers.
 ///
 /// The background is a fixed SCREEN-SPACE backdrop. Each layer scrolls at its own
@@ -856,57 +927,71 @@ fn star_tint(hh: f32) -> Rgb {
 /// the visible grid cells (O(cells)); the far layer + nebula fade out when you
 /// zoom in on a body.
 #[allow(clippy::too_many_arguments)]
-fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32, density: f32, parallax: f32, bgx: f32, bgy: f32) {
+fn paint_background(
+    out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32, density: f32, parallax: f32,
+    bgx: f32, bgy: f32, cache: &RefCell<BgCache>,
+) {
     let z = cam.zoom;
     let si = seed as i32;
     let far_amt = 1.0 - smoothstep(3.0, 9.0, z);
     let neb_amt = 1.0 - smoothstep(2.5, 7.0, z);
+    let len = (w * h * 4) as usize;
 
-    // --- nebula: baked at low res each frame (8px blocks => pixel-art clouds) ---
-    const CELL: u32 = 8;
-    let nw = (w + CELL - 1) / CELL;
-    let nh = (h + CELL - 1) / CELL;
-    let mut neb: Vec<[f32; 3]> = Vec::new();
-    if neb_amt > 0.02 {
-        let ta = NEB_TINTS[(hash3(si, 1, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
-        let tb = NEB_TINTS[(hash3(si, 2, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
-        let np = 0.09 * parallax; // nebula scroll rate (slowest, pan only)
-        let (nox, noy) = (bgx * np + hash3(si, 5, 2) * 500.0, bgy * np + hash3(si, 6, 2) * 500.0);
-        let f = 1.0 / 240.0;
-        neb = vec![[0.0f32; 3]; (nw * nh) as usize];
-        for cy in 0..nh {
-            for cx in 0..nw {
-                let gx = ((cx * CELL) as f32 + nox) * f;
-                let gy = ((cy * CELL) as f32 + noy) * f;
-                let dens = smoothstep(0.50, 0.74, fbm(gx, gy, 4.2, 3)); // patchy -> not crowded
-                if dens > 0.0 {
-                    let n2 = fbm(gx * 1.8 + 40.0, gy * 1.8 + 7.0, 1.5, 2);
-                    let col = mix(ta, tb, clamp01((n2 - 0.35) * 2.2));
-                    let k = dens * neb_amt * 0.34; // faint
-                    neb[(cy * nw + cx) as usize] = [col[0] * k, col[1] * k, col[2] * k];
+    // The nebula scrolls at 9% of pan and its shape is zoom-independent (zoom
+    // only fades brightness), so we quantize the scroll offset — a small drag,
+    // and every zoom, reuses the bake.
+    let nw = (w + NEB_CELL - 1) / NEB_CELL;
+    let nh = (h + NEB_CELL - 1) / NEB_CELL;
+    let np = 0.09 * parallax; // nebula scroll rate (slowest, pan only)
+    let (qx, qy) = (
+        ((bgx * np + hash3(si, 5, 2) * 500.0) / NEB_QUANT).round() as i32,
+        ((bgy * np + hash3(si, 6, 2) * 500.0) / NEB_QUANT).round() as i32,
+    );
+    let show_neb = neb_amt > 0.02;
+
+    // --- base-navy + nebula LAYER, cached. Keyed on the scroll offset AND the
+    // (quantized) zoom-fade, this is everything except the moving stars/orbits.
+    // On a drag between offset ticks it's a memcpy; only a large pan or a zoom
+    // step rebuilds it. This is the O(pixels) part of the background. ---
+    let layer_key = [w as i32, h as i32, qx, qy, if show_neb { (neb_amt * 40.0).round() as i32 } else { -1 }];
+    let hit = {
+        let c = cache.borrow();
+        c.layer_key == Some(layer_key) && c.layer.len() == len
+    };
+    if hit {
+        out[..len].copy_from_slice(&cache.borrow().layer);
+    } else {
+        // Rebuild the layer. The per-cell fBm bake is itself cached (survives
+        // zoom), so a zoom-only rebuild skips it and just re-composites.
+        if show_neb {
+            ensure_nebula(cache, si, nw, nh, qx, qy);
+        }
+        let c = cache.borrow();
+        let field: &[[f32; 3]] = if show_neb { &c.neb_field } else { &[] };
+        let has_neb = !field.is_empty();
+        for iy in 0..h {
+            let nrow = (iy / NEB_CELL) * nw;
+            for ix in 0..w {
+                let (mut r, mut g, mut b) = (0.031f32, 0.027, 0.068); // base navy
+                if has_neb {
+                    let c = field[(nrow + ix / NEB_CELL) as usize];
+                    let d = bayer(ix, iy) * 0.015; // dither -> pixel-art gradient
+                    r += (c[0] * neb_amt + d).max(0.0);
+                    g += (c[1] * neb_amt + d).max(0.0);
+                    b += (c[2] * neb_amt + d).max(0.0);
                 }
+                let idx = ((iy * w + ix) * 4) as usize;
+                out[idx] = (clamp01(r) * 255.0) as u8;
+                out[idx + 1] = (clamp01(g) * 255.0) as u8;
+                out[idx + 2] = (clamp01(b) * 255.0) as u8;
+                out[idx + 3] = 255;
             }
         }
-    }
-
-    // --- pass 1: base navy + nebula (cheap: no per-pixel hashing) ---
-    for iy in 0..h {
-        let nrow = (iy / CELL) * nw;
-        for ix in 0..w {
-            let (mut r, mut g, mut b) = (0.031f32, 0.027, 0.068); // base navy
-            if !neb.is_empty() {
-                let c = neb[(nrow + ix / CELL) as usize];
-                let d = bayer(ix, iy) * 0.015; // dither -> pixel-art gradient
-                r += (c[0] + d).max(0.0);
-                g += (c[1] + d).max(0.0);
-                b += (c[2] + d).max(0.0);
-            }
-            let idx = ((iy * w + ix) * 4) as usize;
-            out[idx] = (clamp01(r) * 255.0) as u8;
-            out[idx + 1] = (clamp01(g) * 255.0) as u8;
-            out[idx + 2] = (clamp01(b) * 255.0) as u8;
-            out[idx + 3] = 255;
-        }
+        drop(c);
+        let mut c = cache.borrow_mut();
+        c.layer.clear();
+        c.layer.extend_from_slice(&out[..len]);
+        c.layer_key = Some(layer_key);
     }
 
     // --- pass 2: stars. Each layer is a fixed screen-space grid (spacing `sp`
@@ -1032,7 +1117,7 @@ pub fn render_system_cached(sys: &mut System, w: u32, h: u32, cam: &Camera, bgx:
 /// Paint the backdrop: starfield + nebula, then the dashed orbit paths. Depends
 /// only on the camera + view params, never on animation time.
 fn draw_bg_orbits(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: f32, out: &mut [u8]) {
-    paint_background(out, w, h, cam, sys.seed, sys.star_density, sys.star_parallax, bgx, bgy);
+    paint_background(out, w, h, cam, sys.seed, sys.star_density, sys.star_parallax, bgx, bgy, &sys.neb);
     for p in &sys.planets {
         paint_orbit(out, w, h, cam, p, sys.spacing);
     }
