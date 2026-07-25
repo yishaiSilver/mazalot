@@ -101,6 +101,15 @@ const DEMOS = [
       ex.render(s, ptr, size, size, 0, 0, zoom, 2.0);
       ex.comet_free(s);
     } },
+  { name: "Spaceships", crate: "ship", sub: "64 classes across 8 roles", wasm: "ship.wasm",
+    render: (m, ex, ptr, size) => {
+      // Ships are stateful too: roll a hull, frame it, render, free it.
+      // render(ship, buf, w, h, zoom, heading, pan_x, pan_y, thrust, dither, stars, t)
+      const s = ex.ship_new((Math.random()*ex.class_count())|0, (Math.random()*1e9)|0);
+      ex.render(s, ptr, size, size, ex.ship_fit_zoom_spin(s, size, size) * 0.86,
+                0, 0, -size * 0.10, 1.0, 0.7, 0.6, 1.4);
+      ex.ship_free(s);
+    } },
   { name: "Aliens", crate: "bird", sub: "hybrid avian creatures", wasm: "bird.wasm",
     render: (m, ex, ptr, size) => {
       // render(ptr, size, seed, phase, energy)

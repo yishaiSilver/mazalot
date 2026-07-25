@@ -32,7 +32,7 @@ scripts/make-artifact.sh <crate> [--out FILE] [--no-build]
 
 | Argument      | Meaning                                                             |
 | ------------- | ------------------------------------------------------------------- |
-| `<crate>`     | a demo under `crates/<crate>/web/` — `solar`, `moon`, `asteroid`, `comet`, `star` |
+| `<crate>`     | a demo under `crates/<crate>/web/` — `solar`, `moon`, `asteroid`, `comet`, `star`, `ship` |
 | `--out FILE`  | output path (default `dist/<crate>.html`)                           |
 | `--no-build`  | skip the wasm rebuild; reuse the committed `crates/<crate>/web/<crate>.wasm` |
 
@@ -41,7 +41,7 @@ Examples:
 ```bash
 scripts/make-artifact.sh comet --out /tmp/comet.html
 scripts/make-artifact.sh moon --no-build          # use the checked-in wasm as-is
-for c in solar moon asteroid comet; do scripts/make-artifact.sh "$c"; done
+for c in solar moon asteroid comet ship; do scripts/make-artifact.sh "$c"; done
 ```
 
 Output lands in `dist/` (git-ignored).
@@ -100,7 +100,7 @@ You'll get a private `claude.ai/code/artifact/…` URL you can open or share.
 - **Size.** The HTML grows by ~4/3 of the wasm size (base64). The demos are
   ~45–91 KB of wasm, so artifacts land around 60–150 KB — trivial.
 - **Only the `crates/<name>/web/` demos** follow the layout this script expects
-  (`solar`, `moon`, `asteroid`, `comet`, `star`). The `planet` and `bird` web
+  (`solar`, `moon`, `asteroid`, `comet`, `star`, `ship`). The `planet` and `bird` web
   builds use different package names and directories and aren't wired in here.
 - **The landing page (`index.html`) is not artifact-able as-is** — it links to
   each demo's own page and loads several wasm modules for thumbnails, none of

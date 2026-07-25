@@ -7,8 +7,9 @@ and a ~42 KB WebAssembly module from **one shared codebase**.
 
 There's also a companion **star** generator (a sibling of the planet renderer),
 a draggable **solar-system** view that composes a star with orbiting planets, a
-paper-doll **character** compositor, and a fully separate **creature** generator
-(alien + earth birds) — see below.
+**spaceship** generator (64 hull classes across 8 roles), a paper-doll
+**character** compositor, and a fully separate **creature** generator (alien +
+earth birds) — see below.
 
 ## Crate layout
 
@@ -129,6 +130,64 @@ whole scene stays cheap enough to render live *while you drag*.
 **Add a planet archetype** = add a row to `PKINDS`; **add a star** = add a row to
 `SUNS` — both in `crates/solar/src/lib.rs`.
 
+## The spaceship system
+
+`ship` (`crates/ship`) rolls **spaceships**: a plan-view (nose-up) hull built
+from a class blueprint plus per-ship structural randomness, then shaded,
+panelled, liveried, lit and dithered. Same seed + same class => the same ship,
+forever. Like every other "type" crate it is **self-contained** — it carries its
+own noise/color/dither primitives and its own part rasterizer.
+
+### 64 classes across 8 roles
+
+| Role | Classes |
+|------|---------|
+| `drone` (7) | swarm, recon, strike, sentry, courier, repair, mining drones |
+| `fighter` (7) | interceptor, fighter, strike fighter, heavy fighter, bomber, torpedo boat, gunship |
+| `warship` (14) | escort cutter, corvette, flak frigate, frigate, destroyer, monitor, light cruiser, missile cruiser, heavy cruiser, railgun lance, battlecruiser, command ship, battleship, dreadnought |
+| `carrier` (6) | drone tender, escort / light / assault / fleet carrier, supercarrier |
+| `freighter` (10) | tug, courier, light freighter, box hauler, heavy lifter, bulk freighter, ore hauler, tanker, container barge, megafreighter |
+| `industrial` (7) | survey scout, science vessel, salvager, repair tender, mining rig, constructor, refinery ship |
+| `civilian` (7) | shuttle, yacht, system ferry, hospital ship, liner, colony ship, generation ship |
+| `covert` (6) | stealth scout, raider, blockade runner, privateer, Q-ship, shadow frigate |
+
+Hulls span **3 m** (a swarm drone) to **3.4 km** (a generation ship), and
+`--bin ship` draws a lineup at *true relative scale* to prove it.
+
+### Structural randomness, not recolor
+
+A class is a **family**, not a ship. Each seed independently rolls the hull
+profile, beam, length, engine count and bell splay, nacelles, wing span / sweep /
+taper, fins, turret count and placement, missile-cell grids, flight-deck angle
+and overhang, cargo pods (containers / tanks / ore hoppers / mission modules),
+truss spines, habitat rings, sensor dishes, radiator panels, superstructure
+stacks, porthole density, armour belts, greebles, livery hue and stripe scheme,
+drive-plume tint — and a naval designation like `CA-275 Red Prospect`. The full
+table is in the `lib.rs` header.
+
+### How a hull is drawn
+
+The **silhouette** is a 9-stop half-width curve down the length, from one of 12
+named families (needle, dart, wedge, blade, spindle, slab, hammerhead, chevron,
+stub, keel, saucer, brick), jittered per ship. Everything else is welded on as
+**parts**: 7 primitives (profiled hull, lozenge pod, rounded slab, swept wing,
+disc, ring, engine bell), each with an **analytic normal** — a hull is shaded as
+a generalized cylinder (`n ∝ (k·sinθ, −hw′·k, cosθ)`), so it reads as a rounded
+tube with no height-field lookups.
+
+Per pixel: rotate into ship space, resolve the topmost part through a **24×24
+uniform grid** (so a ~110-part capital ship costs a handful of tests, not 110),
+shade it (Lambert + Blinn-Phong + rim + a dome-height AO term), then layer on
+procedural detail — hashed hull plating with darkened seams, fBm weathering,
+livery stripes, lit portholes, flight-deck markings, container manifest colours,
+launcher cell grids. Finally the **drive plumes** go on additively (turbulent,
+`1/r` flared, with shock diamonds) plus blinking red/green/white **navigation
+lights**, and the whole thing is ordered-dithered.
+
+**Add a spaceship class** = add a row to `CLASSES` in `crates/ship/src/lib.rs` —
+the web picker, the contact sheets, the scale lineup and the naval prefixes all
+pick it up automatically.
+
 ## Running it
 
 **Native — generate GIFs + PNG into `out/`:**
@@ -136,6 +195,7 @@ whole scene stays cheap enough to render live *while you drag*.
 cargo run --release --bin planet            # planets
 cargo run --release --bin sun               # stars
 cargo run --release -p solar --bin solar    # solar systems (orbit + pan GIFs, posters)
+cargo run --release -p ship  --bin ship     # spaceships (turn/burn GIFs, class posters)
 cargo run --release --bin sprite-compositor # characters
 cargo run --release --bin bench             # feature-cost benchmark
 cargo run --release -p bird --bin alien     # alien creatures  (disjoint half)
@@ -226,6 +286,20 @@ scripts/make-artifact.sh solar    # -> dist/solar.html
 
 See [docs/artifacts.md](docs/artifacts.md) for options and details.
 
+**Web — live spaceship yard:**
+```bash
+cargo build -p ship --target wasm32-unknown-unknown --release --no-default-features
+cp target/wasm32-unknown-unknown/release/ship.wasm crates/ship/web/ship.wasm
+cd crates/ship/web && python3 -m http.server 8000   # open http://localhost:8000/
+```
+Pick a class (grouped by role) or hit **Generate** for a random hull. Ten
+**structural** sliders re-roll the ship live — hull width, wing span, armour,
+engines, turrets, cargo pods, flight decks, greebles, portholes, livery — and
+separate view controls drive throttle, turn rate, heading, pixel size, dither and
+starfield. Press **F** for a **fleet view** that renders *every* class at once,
+**G** for a new ship, **P** to hide the UI. (`node web/verify.mjs` renders all 64
+classes headlessly as a build check.)
+
 **Web — live creature (the bird half):**
 ```bash
 cargo build -p bird-web --target wasm32-unknown-unknown --release
@@ -264,6 +338,40 @@ Implications:
 - **One planet live** (the web demo): comfortable — ~2 ms native, ~5–7 ms in WASM at 64 px, well under a 60 fps budget. Tightens above ~200 px.
 - **Many planets / a galaxy map**: don't render live. **Bake the ~30 spin frames once, then blit** (that ~0.0003 ms) — procedural variety at sprite-cheap playback.
 - **Cheaper weather:** dropping domain warp (back to plain fBm) roughly halves the weather cost.
+
+### Spaceship cost
+
+A ship is *shape* work, not noise work, so it is far cheaper per pixel than a
+planet — but it covers a whole viewport instead of a 64 px disc. Measured at
+**320x420** (134k pixels) on this machine:
+
+| hull | parts | native | WASM |
+|---|---|---|---|
+| interceptor | 20 | 9.6 ms | ~15 ms |
+| destroyer | 39 | 9.0 ms | ~14 ms |
+| megafreighter | 34 | 13.4 ms | ~24 ms |
+| dreadnought | 87 | 15.1 ms | ~25 ms |
+| generation ship | 52 | 18.3 ms | ~31 ms |
+
+That's **~0.07 us/pixel** for a destroyer versus ~0.48 us/pixel for a
+full-weather planet — about 7x cheaper per pixel. **Rolling** a hull (profile,
+part list, uniform grid) costs **~11 us**, so slider changes can re-roll the
+whole ship every keystroke without a hitch.
+
+Three things keep it there, and they're worth knowing if you extend it:
+- **Parts resolve through a 24x24 uniform grid**, so an 87-part dreadnought
+  tests a handful of primitives per pixel, not 87. Cost tracks *covered area*,
+  not part count — which is why the 52-part generation ship (a full-width brick)
+  is dearer than the 87-part dreadnought.
+- **The backdrop is baked once** and re-read every frame (it's screen-space and
+  time-independent) — exactly the trick `solar` uses. Before caching it, the
+  starfield alone was two thirds of the frame.
+- **The hull pays for shading only where it's covered**: the part trace runs
+  first, so a background pixel never enters the shader.
+
+Cheap levers if you need more: raise the demo's **pixel size** (quadratic — the
+buffer is `screen / pix` on a side), drop **greebles**, or bake spin frames and
+blit them, exactly as with planets.
 
 ### Profiling the solar system
 
@@ -332,3 +440,10 @@ per-pixel shader runs once per tile pixel. Two ways to keep it cheap:
 Add one row to `TYPES` in `core/src/lib.rs` — palette, thresholds, flags. Both
 the native GIFs and the web demo pick it up automatically; there is only one copy
 of the algorithm.
+
+## Adding a spaceship class
+
+Add one row to `CLASSES` in `crates/ship/src/lib.rs` — role, length, beam,
+silhouette family, and whichever fit-out counts differ from `base()`. The class
+picker, the per-role posters, the true-scale lineup and the naval prefix all
+derive from that table, so there is nothing else to touch.

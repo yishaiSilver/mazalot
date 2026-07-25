@@ -10,11 +10,12 @@
 #   crates/moon      — planets with depth-sorted orbiting moons (bin: moon) + wasm
 #   crates/asteroid  — drifting, perspective-squashed asteroid belts (bin: asteroid) + wasm
 #   crates/comet     — eccentric-orbit comets with anti-sunward tails (bin: comet) + wasm
+#   crates/ship      — procedural spaceships, 63 classes across 8 roles (bin: ship) + wasm
 #
 # The "type" crates share no code — only third-party deps and this manifest.
 [workspace]
 resolver = "2"
-members = ["crates/planet", "crates/star", "crates/solar", "crates/bird", "crates/character", "crates/moon", "crates/asteroid", "crates/comet"]
+members = ["crates/planet", "crates/star", "crates/solar", "crates/bird", "crates/character", "crates/moon", "crates/asteroid", "crates/comet", "crates/ship"]
 
 [profile.release]
 opt-level = 3

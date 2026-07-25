@@ -8,7 +8,7 @@
 # Usage:
 #   scripts/make-artifact.sh <crate> [--out FILE] [--no-build]
 #
-#   <crate>       a demo under crates/<crate>/web/ (solar, moon, asteroid, comet, star)
+#   <crate>       a demo under crates/<crate>/web/ (solar, moon, asteroid, comet, star, ship)
 #   --out FILE    output path (default: dist/<crate>.html)
 #   --no-build    skip the wasm rebuild; use the committed crates/<crate>/web/<crate>.wasm
 #
@@ -41,7 +41,7 @@ done
 
 HTML="$ROOT/crates/$CRATE/web/index.html"
 WASM="$ROOT/crates/$CRATE/web/$CRATE.wasm"
-[ -f "$HTML" ] || die "no demo at crates/$CRATE/web/index.html (try: solar, moon, asteroid, comet, star)"
+[ -f "$HTML" ] || die "no demo at crates/$CRATE/web/index.html (try: solar, moon, asteroid, comet, star, ship)"
 
 OUT="${OUT:-$ROOT/dist/$CRATE.html}"
 

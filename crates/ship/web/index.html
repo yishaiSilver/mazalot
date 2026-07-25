@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>Procedural Spaceships — Rust · WASM</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #05050b;
+    color: #d7dae6; font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    /* Lock the page so touch gestures drive the canvas, not the browser. */
+    position: fixed; width: 100%; overscroll-behavior: none; touch-action: none;
+    -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  #stage { position: fixed; inset: 0; width: 100%; height: 100%; display: block;
+    touch-action: none; background: #05050b;
+    /* Upscale the internal buffer as crisp square pixels, not a blur — so the
+       "pixel size" slider reads as chunky pixel-art. */
+    image-rendering: pixelated; image-rendering: crisp-edges; }
+
+  .hud { position: fixed; pointer-events: none; z-index: 5;
+    text-shadow: 0 1px 3px rgba(0,0,0,.9); }
+  .topleft { top: 18px; left: 20px; }
+  .topleft h1 { margin: 0; font-size: 12px; font-weight: 600; letter-spacing: .16em;
+    text-transform: uppercase; color: #8790ad; }
+  .viewing { margin-top: 8px; font-size: 22px; font-weight: 700; color: #eef1f8; min-height: 28px; }
+  .viewing small { display: block; font-size: 12px; font-weight: 500; letter-spacing: .04em;
+    color: #7b83a2; text-transform: none; margin-top: 2px; }
+  .hint { position: fixed; top: 18px; right: 20px; z-index: 5; pointer-events: none;
+    font-size: 12px; color: #6b7290; text-align: right; text-shadow: 0 1px 3px rgba(0,0,0,.9); letter-spacing: .03em; }
+  .hint b { color: #aeb4cd; font-weight: 600; }
+
+  /* Control dock — docked bottom-right on desktop, collapsible. */
+  .dock { position: fixed; right: 16px; bottom: 16px; z-index: 6; width: 280px;
+    max-width: calc(100vw - 32px);
+    background: rgba(14,15,24,.86); border: 1px solid rgba(255,255,255,.08);
+    border-radius: 14px; box-shadow: 0 10px 40px rgba(0,0,0,.6); backdrop-filter: blur(9px); }
+  .dock-head { display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 12px; cursor: pointer; user-select: none; }
+  .dock-head span { font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: #8790ad; }
+  .dock-head .chev { color: #8790ad; transition: transform .18s; }
+  .dock.collapsed .chev { transform: rotate(180deg); }
+  .dock-body { max-height: min(66vh, 620px); overflow-y: auto; overscroll-behavior: contain;
+    padding: 2px 14px 14px; }
+  .dock.collapsed .dock-body { display: none; }
+
+  .row { display: flex; gap: 8px; align-items: center; }
+  .row input[type=number] { flex: 1; }
+  .grp { font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: #565d78;
+    margin: 15px 0 8px; border-top: 1px solid rgba(255,255,255,.07); padding-top: 11px; }
+  .ctl { margin: 0 0 10px; }
+  .ctl label { display: flex; justify-content: space-between; font-size: 12px; color: #9aa0bb; margin-bottom: 4px; }
+  .ctl label b { color: #eef1f8; font-variant-numeric: tabular-nums; font-weight: 600; }
+  select, input[type=number] { width: 100%; padding: 8px 9px; font: inherit; font-size: 13px;
+    color: #eef1f8; background: #0e0f18; border: 1px solid rgba(255,255,255,.12); border-radius: 8px; }
+  input[type=range] { width: 100%; accent-color: #8fb7ff; cursor: pointer; }
+  button { padding: 8px 12px; font: inherit; font-size: 13px; color: #d7dae6; background: #1a1c2b;
+    border: 1px solid rgba(255,255,255,.12); border-radius: 8px; cursor: pointer; white-space: nowrap;
+    -webkit-tap-highlight-color: transparent; }
+  button:hover { background: #23263a; }
+  button:active { transform: translateY(1px); }
+  button.primary { color: #06060c; font-weight: 700; border: 0;
+    background: linear-gradient(180deg, #dfe9ff, #8fb7ff); }
+  button.wide { width: 100%; margin-top: 10px; }
+  button.toggle { width: 100%; }
+  button.toggle.on { color: #06060c; font-weight: 700; border: 0;
+    background: linear-gradient(180deg, #dfe9ff, #8fb7ff); }
+  .err { position: fixed; inset: 0; display: none; place-items: center; text-align: center;
+    color: #ff9a9a; padding: 40px; z-index: 10; }
+
+  /* Phones / small screens: dock becomes a bottom sheet; drop the desktop hint. */
+  @media (max-width: 700px), (pointer: coarse) {
+    .topleft { top: 10px; left: 12px; }
+    .topleft h1 { font-size: 10px; letter-spacing: .12em; }
+    .viewing { font-size: 17px; margin-top: 5px; min-height: 22px; }
+    .viewing small { font-size: 11px; }
+    .hint { display: none; }
+    .dock { left: 10px; right: 10px; bottom: calc(10px + env(safe-area-inset-bottom)); width: auto; }
+    .dock-body { max-height: 46vh; }
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+
+<div class="hud topleft">
+  <h1>Procedural Spaceships</h1>
+  <div class="viewing" id="viewing">loading…<small id="sub">Rust → WebAssembly</small></div>
+</div>
+<div class="hint">
+  <b>F</b> fleet view · <b>G</b> new ship · <b>P</b> hide UI
+</div>
+
+<div class="dock" id="dock">
+  <div class="dock-head" id="dockHead">
+    <span>Controls</span><span class="chev">▾</span>
+  </div>
+  <div class="dock-body">
+    <div class="ctl"><label>Class</label><select id="cls"></select></div>
+    <div class="row">
+      <input type="number" id="seed" min="0" value="7" title="seed" />
+      <button id="dice" title="random seed">🎲</button>
+      <button class="primary" id="gen">✦ Generate</button>
+    </div>
+
+    <div id="sliders"></div>
+
+    <div class="grp">Flight</div>
+    <div class="ctl"><label>Throttle <b id="thrV">1.00</b></label><input type="range" id="thr" min="0" max="2" step="0.05" value="1" /></div>
+    <div class="ctl"><label>Turn rate <b id="turnV">0.00</b></label><input type="range" id="turn" min="-1.5" max="1.5" step="0.05" value="0" /></div>
+    <div class="ctl"><label>Heading <b id="hdgV">0°</b></label><input type="range" id="hdg" min="0" max="360" step="1" value="0" /></div>
+
+    <div class="grp">Render</div>
+    <div class="ctl"><label>Pixel size <b id="pixV">4×</b></label><input type="range" id="pix" min="1" max="8" step="1" value="4" /></div>
+    <div class="ctl"><label>Dither <b id="dthV">0.70</b></label><input type="range" id="dth" min="0" max="1" step="0.05" value="0.7" /></div>
+    <div class="ctl"><label>Starfield <b id="starV">0.60</b></label><input type="range" id="star" min="0" max="2" step="0.05" value="0.6" /></div>
+
+    <div class="grp">View</div>
+    <div class="ctl"><button class="toggle" id="fleet">◫ Fleet view — all classes</button></div>
+    <button class="wide" id="reset">↺ reset sliders to class defaults</button>
+  </div>
+</div>
+
+<div class="err" id="err"></div>
+
+<script type="module">
+const $ = id => document.getElementById(id);
+const canvas = $("stage");
+const ctx = canvas.getContext("2d", { alpha: false });
+ctx.imageSmoothingEnabled = false;
+const off = document.createElement("canvas");
+const octx = off.getContext("2d");
+const dec = new TextDecoder();
+
+let wasm;
+let ship = 0;                 // the single-ship handle
+let bufPtr = 0, bufLen = 0;   // the shared pixel buffer (cell-sized in fleet view)
+let paramsPtr = 0, NUM = 0;
+let fitPtr = 0;               // 2 f32 scratch for ship_fit_with_plume
+let imgData = null;
+let bw = 0, bh = 0;           // render-buffer size in "big pixels"
+let classIdx = 0, seed = 7;
+let heading = 0, clock = 0;
+let fleetMode = false, fleetShips = [], fleetSeed = 1;
+let CLASSES = [], ROLES = [], LIVERIES = [];
+
+// Slider defs in DISPLAY order; `pi` is the parameter index into the wasm
+// params array (MUST match ship::param). `g` starts a new group header.
+// Every one of these is STRUCTURAL: changing it re-rolls the hull, which is
+// cheap (a part list + a 24x24 grid), so it happens on `input`.
+const PARAMS = [
+  { g: "Hull",    pi: 0, label: "Hull width",   min: 0.4, max: 2.2, step: 0.05, fix: 2 },
+  {               pi: 1, label: "Wing span",    min: 0,   max: 2.5, step: 0.05, fix: 2 },
+  {               pi: 8, label: "Armour",       min: 0,   max: 1,   step: 0.02, fix: 2 },
+  { g: "Fit-out", pi: 2, label: "Engines",      min: 0,   max: 10,  step: 1,    fix: 0 },
+  {               pi: 3, label: "Turrets",      min: 0,   max: 20,  step: 1,    fix: 0 },
+  {               pi: 4, label: "Cargo pods",   min: 0,   max: 8,   step: 1,    fix: 0 },
+  {               pi: 5, label: "Flight decks", min: 0,   max: 8,   step: 1,    fix: 0 },
+  { g: "Finish",  pi: 6, label: "Greebles",     min: 0,   max: 1,   step: 0.02, fix: 2 },
+  {               pi: 7, label: "Portholes",    min: 0,   max: 1,   step: 0.02, fix: 2 },
+  {               pi: 9, label: "Livery",       min: 0,   max: 9,   step: 1,    fix: 0, names: () => LIVERIES },
+];
+const sliders = {}; // pi -> { input, val, def }
+
+// ---- wasm string helpers ---------------------------------------------------
+// `memory.buffer` can be replaced when wasm memory grows, so never cache it.
+function wstr(ptr, len) {
+  return dec.decode(new Uint8Array(wasm.memory.buffer, ptr, len));
+}
+function table(count, ptrFn, lenFn) {
+  const out = [];
+  for (let i = 0; i < count; i++) out.push(wstr(ptrFn(i), lenFn(i)));
+  return out;
+}
+
+// ---- buffers ---------------------------------------------------------------
+function allocPixels(w, h) {
+  if (bufPtr) wasm.dealloc(bufPtr, bufLen);
+  bufLen = w * h * 4;
+  bufPtr = wasm.alloc(bufLen);
+  imgData = octx.createImageData(w, h);
+}
+
+/// Size the internal buffer so one rendered pixel is a constant on-screen
+/// block — the same scheme the solar/asteroid/comet demos use.
+function resize() {
+  const pix = parseInt($("pix").value);
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const cw = Math.max(1, Math.floor(window.innerWidth * dpr));
+  const ch = Math.max(1, Math.floor(window.innerHeight * dpr));
+  canvas.width = cw; canvas.height = ch;
+  bw = Math.max(32, Math.floor(cw / pix));
+  bh = Math.max(32, Math.floor(ch / pix));
+  off.width = bw; off.height = bh;
+  // In fleet view we render one CELL at a time into the shared buffer, so the
+  // buffer only needs to be cell-sized; in single view it's the whole frame.
+  if (fleetMode) {
+    const g = fleetGeom();
+    allocPixels(g.cw, g.ch);
+  } else {
+    allocPixels(bw, bh);
+  }
+}
+
+// ---- ship lifecycle --------------------------------------------------------
+function readParams() {
+  const pv = new Float32Array(wasm.memory.buffer, paramsPtr, NUM);
+  for (const p of PARAMS) pv[p.pi] = parseFloat(sliders[p.pi].input.value);
+  return pv;
+}
+
+function rebuild() {
+  if (ship) wasm.ship_free(ship);
+  readParams();
+  ship = wasm.ship_new_params(classIdx, seed, paramsPtr, NUM);
+  updateReadout();
+}
+
+const nameBuf = new Uint8Array(96);
+let namePtr = 0;
+function designation(s) {
+  const n = wasm.ship_designation(s, namePtr, 96);
+  return n ? wstr(namePtr, n) : "—";
+}
+
+function updateReadout() {
+  if (fleetMode) {
+    $("viewing").firstChild.nodeValue = "Fleet";
+    $("sub").textContent = `${CLASSES.length} classes · one hull each · seed ${fleetSeed}`;
+    return;
+  }
+  const m = wasm.ship_length_m(ship);
+  const role = ROLES[wasm.class_role(classIdx)];
+  $("viewing").firstChild.nodeValue = designation(ship);
+  $("sub").textContent =
+    `${CLASSES[classIdx].replace(/_/g, " ")} · ${role} · ${m.toFixed(0)} m · ${wasm.ship_part_count(ship)} parts`;
+}
+
+function loadDefaults(ci) {
+  for (const p of PARAMS) {
+    const v = wasm.param(ci, p.pi);
+    sliders[p.pi].input.value = v;
+    showValue(p, v);
+  }
+}
+function showValue(p, v) {
+  sliders[p.pi].val.textContent = p.names ? p.names()[Math.round(v)] ?? v : parseFloat(v).toFixed(p.fix);
+}
+
+function setClass(ci) {
+  classIdx = ci;
+  $("cls").value = String(ci);
+  loadDefaults(ci);
+  rebuild();
+}
+
+function randomize() {
+  seed = (Math.random() * 0xffffff) >>> 0;
+  $("seed").value = seed;
+  if (fleetMode) { fleetSeed = seed; buildFleet(); }
+  else setClass(Math.floor(Math.random() * CLASSES.length));
+}
+
+// ---- fleet view ------------------------------------------------------------
+// Cells want to be TALL (ships are drawn nose-up, so length runs down the
+// cell). For a target cell aspect `A = cw/ch`, cols*cw = W and rows*ch = H give
+// cols >= sqrt(n*W/(A*H)); `top` keeps the grid clear of the HUD.
+const CELL_ASPECT = 0.74;
+function fleetGeom() {
+  const n = CLASSES.length;
+  const top = Math.round(bh * 0.11);
+  const h = Math.max(16, bh - top);
+  const cols = Math.max(1, Math.ceil(Math.sqrt((n * bw) / (CELL_ASPECT * h))));
+  const rows = Math.ceil(n / cols);
+  return { cols, rows, top, cw: Math.max(8, Math.floor(bw / cols)), ch: Math.max(8, Math.floor(h / rows)) };
+}
+function buildFleet() {
+  for (const s of fleetShips) wasm.ship_free(s);
+  fleetShips = CLASSES.map((_, i) => wasm.ship_new(i, (fleetSeed + i * 2654435761) >>> 0));
+  updateReadout();
+}
+
+// ---- frame -----------------------------------------------------------------
+function frame(ms) {
+  clock = ms / 1000;
+  const turn = parseFloat($("turn").value);
+  if (turn !== 0) {
+    heading = (heading + turn * 0.016 + Math.PI * 2) % (Math.PI * 2);
+    $("hdg").value = String(Math.round(heading * 180 / Math.PI));
+    $("hdgV").textContent = Math.round(heading * 180 / Math.PI) + "°";
+  }
+  const thrust = parseFloat($("thr").value);
+  const dither = parseFloat($("dth").value);
+  const stars = parseFloat($("star").value);
+
+  octx.clearRect(0, 0, bw, bh);
+  if (fleetMode) {
+    const g = fleetGeom();
+    if (imgData.width !== g.cw || imgData.height !== g.ch) allocPixels(g.cw, g.ch);
+    // A flat backdrop once, then each hull blitted over it with no starfield —
+    // per-cell starfields would tile visibly.
+    octx.fillStyle = "#05060c";
+    octx.fillRect(0, 0, bw, bh);
+    for (let i = 0; i < fleetShips.length; i++) {
+      const s = fleetShips[i];
+      wasm.ship_fit_with_plume(s, g.cw, g.ch, 0.26, fitPtr);
+      const f = new Float32Array(wasm.memory.buffer, fitPtr, 2);
+      wasm.render(s, bufPtr, g.cw, g.ch, f[0], heading, 0, f[1], thrust, dither, 0, clock);
+      imgData.data.set(new Uint8Array(wasm.memory.buffer, bufPtr, g.cw * g.ch * 4));
+      octx.putImageData(imgData, (i % g.cols) * g.cw, g.top + Math.floor(i / g.cols) * g.ch);
+    }
+  } else {
+    if (imgData.width !== bw || imgData.height !== bh) allocPixels(bw, bh);
+    // A rotation-stable fit (the bounding CIRCLE, not the box), so the hull
+    // doesn't pulse as it turns; nudged forward so the exhaust has room when
+    // the ship is pointing straight up.
+    const zoom = wasm.ship_fit_zoom_spin(ship, bw, bh) * 0.88;
+    wasm.render(ship, bufPtr, bw, bh, zoom, heading, 0, -bh * 0.10, thrust, dither, stars, clock);
+    imgData.data.set(new Uint8Array(wasm.memory.buffer, bufPtr, bw * bh * 4));
+    octx.putImageData(imgData, 0, 0);
+  }
+  ctx.drawImage(off, 0, 0, canvas.width, canvas.height);
+  requestAnimationFrame(frame);
+}
+
+// ---- setup -----------------------------------------------------------------
+function buildSliders() {
+  const host = $("sliders");
+  for (const p of PARAMS) {
+    if (p.g) { const h = document.createElement("div"); h.className = "grp"; h.textContent = p.g; host.appendChild(h); }
+    const wrap = document.createElement("div"); wrap.className = "ctl";
+    const lab = document.createElement("label");
+    const val = document.createElement("b");
+    lab.textContent = p.label + " "; lab.appendChild(val);
+    const inp = document.createElement("input");
+    inp.type = "range"; inp.min = p.min; inp.max = p.max; inp.step = p.step;
+    inp.addEventListener("input", () => { showValue(p, inp.value); rebuild(); });
+    wrap.appendChild(lab); wrap.appendChild(inp); host.appendChild(wrap);
+    sliders[p.pi] = { input: inp, val };
+  }
+}
+
+async function main() {
+  const res = await fetch("./ship.wasm?v=" + Date.now(), { cache: "no-store" });
+  const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
+  wasm = instance.exports;
+
+  CLASSES = table(wasm.class_count(), wasm.class_name_ptr, wasm.class_name_len);
+  ROLES = table(wasm.role_count(), wasm.role_name_ptr, wasm.role_name_len);
+  LIVERIES = table(wasm.livery_count(), wasm.livery_name_ptr, wasm.livery_name_len);
+  NUM = wasm.num_params();
+  PARAMS.find(p => p.pi === 9).max = LIVERIES.length - 1;
+
+  // Class picker, grouped by role.
+  const sel = $("cls");
+  for (let r = 0; r < ROLES.length; r++) {
+    const grp = document.createElement("optgroup");
+    grp.label = ROLES[r];
+    for (let i = 0; i < CLASSES.length; i++) {
+      if (wasm.class_role(i) !== r) continue;
+      const o = document.createElement("option");
+      o.value = String(i);
+      o.textContent = `${CLASSES[i].replace(/_/g, " ")} — ${wasm.class_length_m(i).toFixed(0)} m`;
+      grp.appendChild(o);
+    }
+    sel.appendChild(grp);
+  }
+  buildSliders();
+
+  // Stable scratch allocations, made before the (re-sized) pixel buffer.
+  paramsPtr = wasm.alloc(NUM * 4);
+  fitPtr = wasm.alloc(2 * 4);
+  namePtr = wasm.alloc(96);
+
+  resize();
+  setClass(Math.floor(Math.random() * CLASSES.length));
+  seed = (Math.random() * 0xffffff) >>> 0; $("seed").value = seed;
+  rebuild();
+
+  // -- wiring --
+  sel.addEventListener("change", () => setClass(parseInt(sel.value)));
+  $("seed").addEventListener("input", () => {
+    seed = (parseInt($("seed").value) || 0) >>> 0;
+    if (fleetMode) { fleetSeed = seed; buildFleet(); } else rebuild();
+  });
+  $("dice").addEventListener("click", () => {
+    seed = (Math.random() * 0xffffff) >>> 0; $("seed").value = seed;
+    if (fleetMode) { fleetSeed = seed; buildFleet(); } else rebuild();
+  });
+  $("gen").addEventListener("click", randomize);
+  $("reset").addEventListener("click", () => { loadDefaults(classIdx); rebuild(); });
+  $("fleet").addEventListener("click", () => {
+    fleetMode = !fleetMode;
+    $("fleet").classList.toggle("on", fleetMode);
+    if (fleetMode) buildFleet();
+    resize();
+    updateReadout();
+  });
+  $("pix").addEventListener("input", () => { $("pixV").textContent = $("pix").value + "×"; resize(); });
+  $("dth").addEventListener("input", () => $("dthV").textContent = parseFloat($("dth").value).toFixed(2));
+  $("star").addEventListener("input", () => $("starV").textContent = parseFloat($("star").value).toFixed(2));
+  $("thr").addEventListener("input", () => $("thrV").textContent = parseFloat($("thr").value).toFixed(2));
+  $("turn").addEventListener("input", () => $("turnV").textContent = parseFloat($("turn").value).toFixed(2));
+  $("hdg").addEventListener("input", () => {
+    heading = parseFloat($("hdg").value) * Math.PI / 180;
+    $("hdgV").textContent = $("hdg").value + "°";
+  });
+  $("dockHead").addEventListener("click", () => $("dock").classList.toggle("collapsed"));
+  window.addEventListener("resize", resize);
+  window.addEventListener("keydown", e => {
+    if (e.key === "f" || e.key === "F") $("fleet").click();
+    else if (e.key === "g" || e.key === "G") randomize();
+    else if (e.key === "p" || e.key === "P") {
+      for (const el of [$("dock"), ...document.querySelectorAll(".hud, .hint")])
+        el.style.display = el.style.display === "none" ? "" : "none";
+    }
+  });
+
+  requestAnimationFrame(frame);
+}
+main().catch(e => {
+  $("err").style.display = "grid";
+  $("err").textContent = "failed to load ship.wasm — " + e +
+    "\n\nBuild it with:\n  cargo build -p ship --target wasm32-unknown-unknown --release --no-default-features" +
+    "\n  cp target/wasm32-unknown-unknown/release/ship.wasm crates/ship/web/ship.wasm";
+});
+</script>
+</body>
+</html>
