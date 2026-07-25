@@ -29,6 +29,10 @@
   .hint { position: fixed; top: 18px; right: 20px; z-index: 5; pointer-events: none;
     font-size: 12px; color: #6b7290; text-align: right; text-shadow: 0 1px 3px rgba(0,0,0,.9); letter-spacing: .03em; }
   .hint b { color: #aeb4cd; font-weight: 600; }
+  /* Only meaningful while the fleet grid is up. */
+  #pickhint { display: none; color: #8fb7ff; }
+  body.fleet #pickhint { display: inline; }
+  body.fleet #stage { cursor: pointer; }
 
   /* Control dock — docked bottom-right on desktop, collapsible. */
   .dock { position: fixed; right: 16px; bottom: 16px; z-index: 6; width: 280px;
@@ -89,6 +93,7 @@
 </div>
 <div class="hint">
   <b>F</b> fleet view · <b>G</b> new ship · <b>P</b> hide UI
+  <span id="pickhint">— click a hull to inspect it</span>
 </div>
 
 <div class="dock" id="dock">
@@ -96,6 +101,7 @@
     <span>Controls</span><span class="chev">▾</span>
   </div>
   <div class="dock-body">
+    <div class="ctl"><button class="toggle" id="fleet">◫ Fleet view — all 64 classes</button></div>
     <div class="ctl"><label>Class</label><select id="cls"></select></div>
     <div class="row">
       <input type="number" id="seed" min="0" value="7" title="seed" />
@@ -115,8 +121,6 @@
     <div class="ctl"><label>Dither <b id="dthV">0.70</b></label><input type="range" id="dth" min="0" max="1" step="0.05" value="0.7" /></div>
     <div class="ctl"><label>Starfield <b id="starV">0.60</b></label><input type="range" id="star" min="0" max="2" step="0.05" value="0.6" /></div>
 
-    <div class="grp">View</div>
-    <div class="ctl"><button class="toggle" id="fleet">◫ Fleet view — all classes</button></div>
     <button class="wide" id="reset">↺ reset sliders to class defaults</button>
   </div>
 </div>
@@ -189,6 +193,10 @@ function resize() {
   const cw = Math.max(1, Math.floor(window.innerWidth * dpr));
   const ch = Math.max(1, Math.floor(window.innerHeight * dpr));
   canvas.width = cw; canvas.height = ch;
+  // Assigning width/height RESETS the 2D context state, so the nearest-neighbour
+  // flag has to be re-set here or the upscale silently goes back to bilinear —
+  // which quietly undoes the whole pixel-art look.
+  ctx.imageSmoothingEnabled = false;
   bw = Math.max(32, Math.floor(cw / pix));
   bh = Math.max(32, Math.floor(ch / pix));
   off.width = bw; off.height = bh;
@@ -270,14 +278,44 @@ function fleetGeom() {
   const n = CLASSES.length;
   const top = Math.round(bh * 0.11);
   const h = Math.max(16, bh - top);
-  const cols = Math.max(1, Math.ceil(Math.sqrt((n * bw) / (CELL_ASPECT * h))));
+  // On wide screens the dock floats over the right edge, so pull the grid in
+  // behind it — otherwise the last two columns are hidden. On phones the dock
+  // is a bottom sheet and only costs height, which `top` already handles.
+  const dock = $("dock");
+  const inset = window.innerWidth > 700 && !dock.classList.contains("collapsed")
+    ? Math.round(((dock.getBoundingClientRect().width + 30) / window.innerWidth) * bw)
+    : 0;
+  const w = Math.max(32, bw - inset);
+  const cols = Math.max(1, Math.ceil(Math.sqrt((n * w) / (CELL_ASPECT * h))));
   const rows = Math.ceil(n / cols);
-  return { cols, rows, top, cw: Math.max(8, Math.floor(bw / cols)), ch: Math.max(8, Math.floor(h / rows)) };
+  return { cols, rows, top, cw: Math.max(8, Math.floor(w / cols)), ch: Math.max(8, Math.floor(h / rows)) };
 }
 function buildFleet() {
   for (const s of fleetShips) wasm.ship_free(s);
   fleetShips = CLASSES.map((_, i) => wasm.ship_new(i, (fleetSeed + i * 2654435761) >>> 0));
   updateReadout();
+}
+
+function setFleet(on) {
+  fleetMode = on;
+  $("fleet").classList.toggle("on", on);
+  document.body.classList.toggle("fleet", on);
+  if (on) buildFleet();
+  resize();
+  updateReadout();
+}
+
+/// Which fleet cell is under a client-space point, or -1.
+function cellAt(clientX, clientY) {
+  const r = canvas.getBoundingClientRect();
+  const g = fleetGeom();
+  const fx = ((clientX - r.left) / r.width) * bw;
+  const fy = ((clientY - r.top) / r.height) * bh - g.top;
+  if (fy < 0) return -1;
+  const col = Math.floor(fx / g.cw), row = Math.floor(fy / g.ch);
+  if (col < 0 || col >= g.cols || row < 0) return -1;
+  const i = row * g.cols + col;
+  return i < CLASSES.length ? i : -1;
 }
 
 // ---- frame -----------------------------------------------------------------
@@ -378,7 +416,18 @@ async function main() {
   rebuild();
 
   // -- wiring --
-  sel.addEventListener("change", () => setClass(parseInt(sel.value)));
+  sel.addEventListener("change", () => {
+    if (fleetMode) setFleet(false);
+    setClass(parseInt(sel.value));
+  });
+  // In the fleet grid, a hull is a link: click it to open it on its own.
+  canvas.addEventListener("click", e => {
+    if (!fleetMode) return;
+    const i = cellAt(e.clientX, e.clientY);
+    if (i < 0) return;
+    setFleet(false);
+    setClass(i);
+  });
   $("seed").addEventListener("input", () => {
     seed = (parseInt($("seed").value) || 0) >>> 0;
     if (fleetMode) { fleetSeed = seed; buildFleet(); } else rebuild();
@@ -389,13 +438,7 @@ async function main() {
   });
   $("gen").addEventListener("click", randomize);
   $("reset").addEventListener("click", () => { loadDefaults(classIdx); rebuild(); });
-  $("fleet").addEventListener("click", () => {
-    fleetMode = !fleetMode;
-    $("fleet").classList.toggle("on", fleetMode);
-    if (fleetMode) buildFleet();
-    resize();
-    updateReadout();
-  });
+  $("fleet").addEventListener("click", () => setFleet(!fleetMode));
   $("pix").addEventListener("input", () => { $("pixV").textContent = $("pix").value + "×"; resize(); });
   $("dth").addEventListener("input", () => $("dthV").textContent = parseFloat($("dth").value).toFixed(2));
   $("star").addEventListener("input", () => $("starV").textContent = parseFloat($("star").value).toFixed(2));
@@ -405,7 +448,10 @@ async function main() {
     heading = parseFloat($("hdg").value) * Math.PI / 180;
     $("hdgV").textContent = $("hdg").value + "°";
   });
-  $("dockHead").addEventListener("click", () => $("dock").classList.toggle("collapsed"));
+  $("dockHead").addEventListener("click", () => {
+    $("dock").classList.toggle("collapsed");
+    if (fleetMode) resize(); // the grid reflows into the reclaimed width
+  });
   window.addEventListener("resize", resize);
   window.addEventListener("keydown", e => {
     if (e.key === "f" || e.key === "F") $("fleet").click();

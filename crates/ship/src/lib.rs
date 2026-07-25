@@ -595,8 +595,10 @@ fn livery(l: Liv) -> Palette {
         glow: [0.55, 0.78, 1.00],
     };
     match l {
-        // fleet grey with a cool cast
-        Liv::Naval => Palette { plate: [0.50, 0.54, 0.60], shade: [0.34, 0.37, 0.44], accent: [0.72, 0.76, 0.84], trim: [0.24, 0.44, 0.66], ..base },
+        // fleet grey with a cool cast. `accent` carries the bold colour (it's the
+        // stripe); `trim` is fine detail and superstructure, so it stays light —
+        // swapped, the navy blue lands on whole bridge blocks and reads as glass.
+        Liv::Naval => Palette { plate: [0.50, 0.54, 0.60], shade: [0.34, 0.37, 0.44], accent: [0.24, 0.44, 0.66], trim: [0.74, 0.78, 0.85], ..base },
         // darker, greener naval — marine assault units
         Liv::Marine => Palette { plate: [0.38, 0.44, 0.40], shade: [0.25, 0.30, 0.28], accent: [0.74, 0.70, 0.38], trim: [0.52, 0.58, 0.50], ..base },
         // merchant: weathered white over rust-red boot topping
