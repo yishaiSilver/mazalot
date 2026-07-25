@@ -4,19 +4,20 @@ version = "0.1.0"
 edition = "2021"
 
 # One crate, three faces:
-#   • lib.rs   — pure per-pixel render math (rlib for the bins, cdylib for wasm)
+#   • lib.rs   — re-exports `planet-core`, the render math (rlib for the bins,
+#                cdylib for wasm); shared with `solar`, which renders the same
+#                planets as sprite tiles in its system view
 #   • wasm.rs  — a thin C-ABI wrapper over the lib, compiled only for wasm32
 #   • bin/*    — native GIF/PNG generators (need `image`+`rand`, the `native` feature)
-# The pure render path pulls in only the dependency-free `noise-core`/`dither-core`
-# rlibs, so the wasm build (`--no-default-features`) stays tiny and can never pull
-# in `image`/`rand`.
+# The pure render path pulls in only the dependency-free `planet-core` rlib (and
+# the `*-core` rlibs under it), so the wasm build (`--no-default-features`) stays
+# tiny and can never pull in `image`/`rand`.
 
 [lib]
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-noise-core = { path = "../noise-core" }
-dither-core = { path = "../dither-core" }
+planet-core = { path = "../planet-core" }
 # Shared C-ABI glue for wasm.rs. Plain (non-optional) dep so it is present in
 # the wasm build; it exports zero C symbols, so the export set is unchanged.
 wasm-abi = { path = "../wasm-abi" }

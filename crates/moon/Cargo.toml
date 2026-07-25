@@ -8,7 +8,7 @@ edition = "2021"
 #   • wasm.rs  — a thin C-ABI wrapper over the lib, compiled only for wasm32
 #   • bin/*    — native GIF/PNG generator (needs `image`, the `native` feature)
 # Shares its noise/color primitives and its planet tile renderer with the sibling
-# crates via the dependency-free `noise-core`/`dither-core`/`scene-core`/`body-core`
+# crates via the dependency-free `noise-core`/`dither-core`/`scene-core`/`planet-core`
 # rlibs (they used to be copy-pasted in here). Because those shared crates carry no
 # third-party deps, the wasm build (`--no-default-features`) stays tiny.
 
@@ -21,7 +21,10 @@ crate-type = ["rlib", "cdylib"]
 noise-core = { path = "../noise-core" }
 dither-core = { path = "../dither-core" }
 scene-core = { path = "../scene-core" }
-body-core = { path = "../body-core" }
+# The planet archetypes + shader, shared verbatim with `planet` and `solar`.
+# Depend on the rlib, not on `planet` itself: `planet` is a cdylib whose
+# `#[no_mangle]` C-ABI exports would collide with this crate's own in wasm.
+planet-core = { path = "../planet-core" }
 image = { version = "0.25", default-features = false, features = ["png", "gif"], optional = true }
 # Shared C-ABI wasm glue (macros + tiny helpers). Plain dep: it's present in the
 # wasm build too, and exports ZERO C symbols, so the wasm export set is unchanged.

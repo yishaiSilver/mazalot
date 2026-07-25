@@ -1,0 +1,21 @@
+[package]
+name = "planet-core"
+version = "0.1.0"
+edition = "2021"
+
+# The full-fidelity planet renderer: the type table, the per-pixel sphere shader
+# (weather, aurora, specular, rings, moons) and the pixel-art quantizer. One
+# shader, two framings:
+#   • hero  — `render_rgba*`, a planet filling a square frame (the `planet` crate)
+#   • scene — `render_tile`, a transparent sprite lit from any direction (`solar`)
+# Depends only on the dependency-free `*-core` rlibs, so the wasm builds that pull
+# it in stay tiny.
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+noise-core = { path = "../noise-core" }
+dither-core = { path = "../dither-core" }
+# For the `Tile` sprite target a scene compositor blits.
+scene-core = { path = "../scene-core" }

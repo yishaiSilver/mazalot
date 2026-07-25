@@ -12,25 +12,37 @@ paper-doll **character** compositor, and a fully separate **creature** generator
 
 ## Crate layout
 
-This is a Cargo workspace with **two disjoint halves that share no code** — only
-the third-party deps (`image`, `rand`) and this manifest. Planets never touch the
-bird crates; birds never touch the planet crates.
+A Cargo workspace under `crates/`. Each **demo crate** has the same three faces —
+`lib.rs` (pure render math), `wasm.rs` (a raw C-ABI cdylib face, **no
+wasm-bindgen**), and `src/bin/*` (native GIF/PNG generators behind a `native`
+feature) — and they share their common machinery through **library crates**
+rather than copy-pasting it. The library crates carry **no third-party deps**, so
+a `--no-default-features` wasm build never sees `image`/`rand` and stays tiny.
 
-**Planets:**
-
-| Crate | What it is |
-|-------|------------|
-| `core/` (`planet-core`) | The single source of truth: 3D value-noise + Worley, the 26-type planet table, sphere shading, weather, and the pixel-art output stage. **Pure math, zero dependencies.** Emits raw RGBA bytes. Also holds the **star** renderer (`sun` module), which reuses the same noise + dither helpers. |
-| `src/` (`sprite-compositor`) | Native generators. Wraps core's frames into spinning **GIFs**, a contact-sheet **PNG**, and a combined all-types GIF (via the `image` crate): `--bin planet`, `--bin sun`. Also the character compositor. |
-| `web/` (`planet-web`) | Rust → WASM (raw cdylib, **no wasm-bindgen**). A browser page renders a live rotating planet on a canvas with full tuning controls. |
-
-**Birds (fully disjoint from planets):**
+**Library crates (shared, dependency-free):**
 
 | Crate | What it is |
 |-------|------------|
-| `bird-core/` (`bird-core`) | Procedural alien/bird creature generation — structural randomness (body plans, features, palettes), not just recolor. **Pure, zero dependencies.** |
-| `bird/` (`bird`) | Native generators. `--bin alien` (hybrid alien "genus" families, animated) and `--bin bird` (naturalistic earth birds). |
-| `bird-web/` (`bird-web`) | Rust → WASM (raw cdylib, no wasm-bindgen). Renders a live creature on a canvas, with a **Detail** slider that varies the pixelation live (supersamples the same art from chunky to fine). |
+| `noise-core` | 3D value-noise + fBm + domain warp + Worley, and the color/ramp math. The bottom of everything. |
+| `dither-core` | Bayer ordered dithering and level quantization — the pixel-art output stage. |
+| `scene-core` | The scene-compositor kit: draggable `Camera`, seeded `Rng`, and the `Tile` + `blit` alpha compositor. |
+| `planet-core` | **The** planet renderer — the only one in the workspace. The 26-type table, sphere shading, weather, rings, moons. One shader, two framings: a *hero* square frame (`render_rgba`) and a *scene sprite tile* (`render_tile`). `planet`, `solar` and `moon` are all framings of it. |
+| `sun-core` | The compact star tile (granulation + corona) used by `solar` and `comet`. |
+| `wasm-abi` | The raw C-ABI glue: `alloc`/`dealloc` and opaque-handle macros. Exports no symbols itself. |
+| `render-io` | The only crate that touches `image`: GIF/contact-sheet/poster helpers for the native bins. |
+
+**Demo crates:**
+
+| Crate | What it is |
+|-------|------------|
+| `planet` | One planet filling the frame — 26 types, full tuning controls in the web demo. |
+| `star` | One star filling the frame: granulation, sunspots, prominences, corona. |
+| `solar` | A draggable, zoomable **solar system** — a star with `planet-core`'s worlds in eccentric orbit around it. |
+| `moon` | A `planet-core` world with depth-sorted moons orbiting it. |
+| `asteroid` | Drifting, perspective-squashed asteroid belts. |
+| `comet` | Eccentric-orbit comets with anti-sunward tails. |
+| `character` | A paper-doll character compositor (native only). |
+| `bird` | A fully separate creature generator: `--bin alien` (hybrid alien "genus" families) and `--bin bird` (naturalistic earth birds). Shares nothing with the planet crates. |
 
 ## The planet system
 
@@ -65,9 +77,8 @@ stretching, and a full 360° spin loops seamlessly.
 ## The star system
 
 A star is the **inverse of a planet**: self-luminous, so there is *no* day/night
-terminator and no external light — the whole disc glows. The `sun` module reuses
-`planet-core`'s noise, color, and Bayer-dither helpers and adds star-specific
-shading:
+terminator and no external light — the whole disc glows. The `star` crate reuses
+the shared `noise-core`/`dither-core` helpers and adds star-specific shading:
 
 - **Granulation** — Worley convection cells (bright centres, dark inter-granular lanes) plus a warped-fbm mottle, boiling over time (loop-safe).
 - **Sunspots** — low-frequency umbrae that drift slowly across the surface.
@@ -79,7 +90,7 @@ shading:
 **8 types** across the temperature spectrum — `blue_giant`, `white_star`,
 `yellow_dwarf`, `orange_dwarf`, `red_giant`, `red_dwarf`, `white_dwarf` — plus an
 exotic teal `sol` (a nod to *rebels-in-the-sky*). Add a star type = add one row
-to `STYPES` in `core/src/sun.rs`.
+to `STYPES` in `crates/star/src/lib.rs`.
 
 ## The solar system
 
@@ -88,10 +99,11 @@ Where `planet` and `star` each render *one* body filling a square, `solar`
 viewport that you can **drag around** and **zoom into** — a central star with
 planets orbiting it, against a starfield. Same seed => the same system, forever.
 
-Like every other "type" crate it is **self-contained** (shares no code — it
-carries its own compact noise/color primitives and its own small *tile*
-renderers for a star and a planet, scaled to read at the tens-of-pixels size a
-system view needs). The new work is the layer on top:
+The worlds in orbit here are **literally the `planet` demo's worlds** — same
+archetype table, same shader — asked for in `planet-core`'s *sprite* framing: a
+transparent tile, sized to its disc and lit from an arbitrary direction, instead
+of a hero planet filling a square. The star is `sun-core`'s compact tile. So the
+new work here is the layer on top:
 
 - **Orbital layout** — from a seed: a star (one of 5 archetypes), then 4–8
   planets placed outward in bands, so rocky/lava worlds fall near the star and
@@ -126,8 +138,10 @@ Each frame: paint the background → dot in each orbit path → render every bod
 a small RGBA tile and alpha-blend it in, depth-sorted. Bodies are small, so the
 whole scene stays cheap enough to render live *while you drag*.
 
-**Add a planet archetype** = add a row to `PKINDS`; **add a star** = add a row to
-`SUNS` — both in `crates/solar/src/lib.rs`.
+**Add a world to the roster** = add a row to `ROSTER` in `crates/solar/src/lib.rs`
+naming a `planet-core` type and the orbital band it belongs in (the archetype
+itself is defined once, over in `planet-core`); **add a star** = add a row to
+`SUNS` in the same file.
 
 ## Running it
 
@@ -329,6 +343,8 @@ per-pixel shader runs once per tile pixel. Two ways to keep it cheap:
 
 ## Adding a planet type
 
-Add one row to `TYPES` in `core/src/lib.rs` — palette, thresholds, flags. Both
-the native GIFs and the web demo pick it up automatically; there is only one copy
-of the algorithm.
+Add one row to `TYPES` in `crates/planet-core/src/lib.rs` — palette, thresholds,
+flags. The native GIFs and the web demo pick it up automatically; there is only
+one copy of the algorithm. To put the new world into orbit as well, add it to
+`ROSTER` in `crates/solar/src/lib.rs` (a name + which band it belongs in) —
+`solar` renders it with the very same shader.

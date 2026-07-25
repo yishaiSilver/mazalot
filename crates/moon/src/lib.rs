@@ -6,14 +6,16 @@
 //! and 2–5 satellites orbiting it, each correctly passing IN FRONT OF and BEHIND
 //! the parent body as it goes round. Same seed => the same planet + moons, forever.
 //!
-//! This crate leans on the workspace's shared, dependency-free `*-core` rlibs
-//! (`noise-core`/`dither-core` for the compact noise/color/dither primitives,
-//! `scene-core` for the compositor helpers, and `body-core` for the parent
-//! planet *tile* renderer — a compact cousin of solar's) plus its own fake-3D
-//! cratered-rock tile for the moons, tuned to read at the tens-of-pixels scale.
-//! The new work here over a lone body is the layer on top — orbital layout for
-//! the satellites and the depth sort that makes a moon on the far side of its
-//! orbit disappear behind the planet while one on the near side draws over it.
+//! This crate leans on the workspace's shared, dependency-free `*-core` rlibs:
+//! `noise-core`/`dither-core` for the noise/color/dither primitives, `scene-core`
+//! for the compositor helpers, and `planet-core` for the parent world itself —
+//! the very same archetypes and shader the `planet` demo shows head-on and
+//! `solar` puts in orbit, asked for as a sprite tile. What stays local is the
+//! fake-3D cratered-rock tile for the moons (a genuinely different surface: no
+//! atmosphere, no weather, all regolith and impact craters) and the layer on top
+//! — orbital layout for the satellites and the depth sort that makes a moon on
+//! the far side of its orbit disappear behind the planet while one on the near
+//! side draws over it.
 //!
 //! Pipeline per frame (see [`MoonSystem::render`]):
 //!   1. paint the dark space backdrop + a faint static starfield,
@@ -30,12 +32,10 @@
 use std::f32::consts::TAU;
 
 // ===========================================================================
-// Noise + math primitives — sourced from the shared noise-core / dither-core
-// crates (previously a byte-for-byte local copy). Values are unchanged, so the
-// rendered output is identical.
+// Shared primitives — noise/color math and the ordered dither, used below by
+// the moon shader and the starfield backdrop.
 // ===========================================================================
 
-use body_core::{base, render_body_tile, BodyKind as ParentKind, KIND_GAS, KIND_TERRA};
 use dither_core::bayer;
 use noise_core::{clamp01, contrast, fbm, hash3, mix, smoothstep, worley, Rgb};
 use scene_core::{blit, to_screen, Rng, Tile, ORBIT_FLATTEN};
@@ -54,41 +54,24 @@ fn seed_offsets(seed: u32) -> [f32; 3] {
 }
 
 // ===========================================================================
-// Parent planet type table (compact)
+// Parent planet roster
 // ===========================================================================
 
-// The parent-planet archetype is now `body_core::BodyKind` (aliased `ParentKind`
-// on import), rendered by the shared `render_body_tile`. Its kind tags come from
-// body-core: the old PK_TERRA/PK_GAS become KIND_TERRA/KIND_GAS, and the old
-// PK_BARREN maps to KIND_TERRA as well — moon's barren world always rendered
-// through the terrestrial arm, so it must stay on KIND_TERRA (KIND_EMISSIVE == 2
-// would render it as glowing lava instead).
+/// The worlds that can sit at the centre of the stage, named as `planet-core`
+/// types — that crate owns the palette and the shader, exactly as it does for
+/// `planet`'s hero view and `solar`'s orbiting bodies. One is chosen per system
+/// by seed. Kept deliberately short: the parent is a backdrop for the moons
+/// crossing it, so the roster favours worlds that read at a glance.
+///
+/// The web demo's `PARENT_NAMES` is index-aligned with this list (it can't read
+/// `&str`s across the C ABI), so reordering here means editing `web/index.html`.
+const PARENTS: &[&str] = &["terran", "ocean", "barren", "gas_giant", "ice_giant"];
 
-const TERRAN: &[(f32, Rgb)] = &[
-    (0.46, [0.08, 0.16, 0.36]), (0.50, [0.13, 0.30, 0.55]), (0.52, [0.78, 0.73, 0.52]),
-    (0.64, [0.28, 0.54, 0.26]), (0.78, [0.16, 0.38, 0.18]), (0.90, [0.45, 0.40, 0.34]),
-    (1.01, [0.92, 0.94, 0.98]),
-];
-const OCEAN: &[(f32, Rgb)] = &[
-    (0.58, [0.04, 0.12, 0.32]), (0.68, [0.10, 0.27, 0.51]), (0.70, [0.76, 0.70, 0.50]),
-    (0.78, [0.30, 0.52, 0.30]), (1.01, [0.19, 0.42, 0.22]),
-];
-const BARREN: &[(f32, Rgb)] = &[
-    (0.44, [0.22, 0.20, 0.22]), (0.60, [0.34, 0.32, 0.34]), (0.78, [0.50, 0.48, 0.49]),
-    (1.01, [0.66, 0.64, 0.63]),
-];
-
-/// The parent archetypes. One is chosen per system by seed. These are
-/// `body_core::BodyKind` rows (aliased `ParentKind`); `..base()` fills the
-/// emissive/ring/orbit-placement fields moon's worlds don't use with neutral
-/// defaults, so the rendered output is unchanged.
-const PARENTS: &[ParentKind] = &[
-    ParentKind { name: "terran", kind: KIND_TERRA, freq: 2.2, contr: 2.1, stops: TERRAN, band_lo: [0.0; 3], band_hi: [0.0; 3], bands: 0.0, atmo: [0.30, 0.45, 0.65], caps: 0.85, clouds: 0.8, ..base() },
-    ParentKind { name: "ocean",  kind: KIND_TERRA, freq: 2.4, contr: 1.7, stops: OCEAN,  band_lo: [0.0; 3], band_hi: [0.0; 3], bands: 0.0, atmo: [0.25, 0.42, 0.66], caps: 0.6,  clouds: 0.7, ..base() },
-    ParentKind { name: "barren", kind: KIND_TERRA, freq: 3.4, contr: 1.9, stops: BARREN, band_lo: [0.0; 3], band_hi: [0.0; 3], bands: 0.0, atmo: [0.0; 3],          caps: 0.0,  clouds: 0.0, ..base() },
-    ParentKind { name: "gas giant", kind: KIND_GAS, freq: 4.0, contr: 1.0, stops: &[], band_lo: [0.55, 0.40, 0.28], band_hi: [0.88, 0.79, 0.62], bands: 11.0, atmo: [0.40, 0.34, 0.22], caps: 0.0, clouds: 0.0, ..base() },
-    ParentKind { name: "ice giant", kind: KIND_GAS, freq: 4.0, contr: 1.0, stops: &[], band_lo: [0.20, 0.38, 0.66], band_hi: [0.55, 0.74, 0.92], bands: 9.0,  atmo: [0.30, 0.45, 0.70], caps: 0.0, clouds: 0.0, ..base() },
-];
+/// `planet-core` type index for parent `i`. Resolved once at generation time and
+/// cached on the [`MoonSystem`], never per frame.
+fn parent_type(i: usize) -> usize {
+    planet_core::type_index(PARENTS[i % PARENTS.len()]).unwrap_or(0)
+}
 
 /// Number of parent-planet archetypes.
 pub fn parent_kind_count() -> usize {
@@ -96,7 +79,7 @@ pub fn parent_kind_count() -> usize {
 }
 /// Name of a parent archetype (wraps out of range).
 pub fn parent_kind_name(i: usize) -> &'static str {
-    PARENTS[i % PARENTS.len()].name
+    PARENTS[i % PARENTS.len()]
 }
 
 // ===========================================================================
@@ -181,7 +164,8 @@ impl Moon {
 /// same seed reproduces the same scene forever.
 pub struct MoonSystem {
     pub seed: u32,
-    pub parent_kind: usize,
+    pub parent_kind: usize, // index into PARENTS (what the HUD names)
+    pub parent_type: usize, // index into planet_core::TYPES (what renders it)
     pub parent_radius: f32, // world units
     pub parent_spin: f32,   // parent axial-spin turns per unit time
     pub moons: Vec<Moon>,
@@ -202,9 +186,9 @@ impl MoonSystem {
     pub fn generate_n(seed: u32, count_override: u32) -> MoonSystem {
         let mut rng = Rng::new(seed ^ 0x3a10_be);
         let parent_kind = (rng.f() * PARENTS.len() as f32) as usize % PARENTS.len();
-        let pk = &PARENTS[parent_kind];
+        let parent_type = parent_type(parent_kind);
         // Gas/ice giants are bigger discs than rocky/terran parents.
-        let parent_radius = if pk.kind == KIND_GAS {
+        let parent_radius = if planet_core::is_giant(parent_type) {
             rng.range(52.0, 62.0)
         } else {
             rng.range(40.0, 50.0)
@@ -232,7 +216,7 @@ impl MoonSystem {
             orbit += radius + rng.range(24.0, 40.0) + i as f32 * 6.0;
         }
 
-        MoonSystem { seed, parent_kind, parent_radius, parent_spin, moons, orbit_width: 1.0 }
+        MoonSystem { seed, parent_kind, parent_type, parent_radius, parent_spin, moons, orbit_width: 1.0 }
     }
 
     /// Set the dashed orbit-line thickness in pixels, clamped to 1..=6 (1 =
@@ -293,9 +277,10 @@ impl MoonSystem {
                     continue;
                 }
                 let rad_render = rad_px.clamp(2.0, buf_cap.min(200.0));
-                let pk = &PARENTS[self.parent_kind];
+                // One angle turns the surface and advances the weather alike —
+                // that is the planet shader's contract.
                 let spin_a = self.parent_spin * t * TAU;
-                let tile = render_parent_tile(pk, self.seed, spin_a, t, rad_render);
+                let tile = render_parent_tile(self.parent_type, self.seed, spin_a, rad_render);
                 blit(out, w, h, &tile, pcx, pcy, rad_px / rad_render);
             } else {
                 let m = &self.moons[which as usize];
@@ -332,11 +317,11 @@ fn quant(o: Rgb, bx: f32) -> Rgb {
 }
 
 /// Render the parent planet to a lit RGBA tile of diameter ~`2*rad_px`. A thin
-/// wrapper over the shared `body_core::render_body_tile`: moon lights its parent
-/// from the fixed off-screen sun (`LIGHT_DIR`), and `spin_a`/`t` drive the axial
-/// rotation and the weather/band drift exactly as the old local renderer did.
-fn render_parent_tile(pk: &ParentKind, seed: u32, spin_a: f32, t: f32, rad_px: f32) -> Tile {
-    render_body_tile(pk, seed, spin_a, t, LIGHT_DIR, rad_px)
+/// wrapper over `planet_core::render_tile` — the same call `solar` makes for the
+/// worlds in its orbits, and the same shader the `planet` demo shows head-on;
+/// moon only pins the light to its fixed off-screen sun (`LIGHT_DIR`).
+fn render_parent_tile(type_idx: usize, seed: u32, spin_a: f32, rad_px: f32) -> Tile {
+    planet_core::render_tile(type_idx, seed, spin_a, LIGHT_DIR, rad_px)
 }
 
 /// Moon surface albedo at a rotated surface point (no lighting yet): a grey/tinted
@@ -515,3 +500,30 @@ fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, m: &Moon, width: f3
 // Browser (wasm) C-ABI glue — excluded from native builds. See wasm.rs.
 #[cfg(target_arch = "wasm32")]
 mod wasm;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `PARENTS` names `planet-core` archetypes as strings, so a typo (or a
+    /// renamed row over there) would silently fall back to type 0 and quietly
+    /// turn every parent world into a terran. Pin it.
+    #[test]
+    fn every_parent_name_resolves() {
+        for (i, name) in PARENTS.iter().enumerate() {
+            assert!(
+                planet_core::type_index(name).is_some(),
+                "no planet-core type named {name:?} (PARENTS[{i}])"
+            );
+        }
+    }
+
+    /// The generator gives giants a bigger disc, so at least one parent has to
+    /// be one — otherwise that branch is dead and every scene reads the same.
+    #[test]
+    fn the_roster_has_a_giant_and_a_rocky_world() {
+        let giants = PARENTS.iter().enumerate().filter(|(i, _)| planet_core::is_giant(parent_type(*i)));
+        assert!(giants.clone().count() > 0, "no giant parent");
+        assert!(giants.count() < PARENTS.len(), "no rocky parent");
+    }
+}

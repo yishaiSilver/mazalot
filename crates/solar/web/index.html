@@ -168,8 +168,12 @@
 <div class="err" id="err"></div>
 
 <script type="module">
-// Names must stay index-aligned with the Rust tables (PKINDS / SUNS).
-const PLANET_NAMES = ["terran","ocean","jungle","desert","barren","lava","ice","gas giant","ice giant","ringed giant"];
+// Names must stay index-aligned with the Rust tables (solar's ROSTER / SUNS).
+// The planets themselves are the `planet` crate's archetypes, rendered by the
+// same shader its own demo uses; these are just their names, prettified.
+const PLANET_NAMES = ["desert","barren","moon","iron","obsidian","lava","molten sea",
+  "terran","ocean","archipelago","gaia","swamp","savanna","toxic","radioactive","fungal","chrome",
+  "ice","tundra","alpine","crystal","storm shroud","gas giant","ice giant","storm giant","ringed giant"];
 const SUN_NAMES = ["yellow dwarf","orange dwarf","red giant","white star","blue giant"];
 
 const $ = id => document.getElementById(id);

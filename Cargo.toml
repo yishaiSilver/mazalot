@@ -7,7 +7,8 @@
 #   crates/noise-core — 3D value/worley noise + color math (dep-free)
 #   crates/dither-core — Bayer ordered-dither + level quantization (dep-free)
 #   crates/scene-core  — Camera, Rng, Tile/blit compositing, starfield tint
-#   crates/body-core   — compact planet-body renderer (shared by solar + moon)
+#   crates/planet-core — THE planet renderer, in both framings: a hero square frame
+#                        (`planet`) and a scene sprite tile (`solar`, `moon`)
 #   crates/sun-core    — compact star renderer (shared by solar + comet)
 #   crates/wasm-abi    — the raw C-ABI alloc/dealloc + opaque-handle glue
 #   crates/render-io   — native GIF/PNG bin helpers (needs `image`)
@@ -23,8 +24,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/noise-core", "crates/dither-core", "crates/scene-core",
-    "crates/body-core", "crates/sun-core", "crates/wasm-abi", "crates/render-io",
+    "crates/noise-core", "crates/dither-core", "crates/scene-core", "crates/planet-core",
+    "crates/sun-core", "crates/wasm-abi", "crates/render-io",
     "crates/planet", "crates/star", "crates/solar", "crates/bird",
     "crates/character", "crates/moon", "crates/asteroid", "crates/comet",
 ]

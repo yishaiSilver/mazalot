@@ -7,13 +7,14 @@
 //! same system, forever.
 //!
 //! This crate leans on the workspace's shared, dependency-free `*-core` rlibs:
-//! `noise-core`/`dither-core` for the compact noise/color primitives, `scene-core`
-//! for the compositor + camera helpers, and `sun-core`/`body-core` for the *tile*
-//! renderers of a star and a planet — small versions of the same fake-3D sphere
-//! technique the sibling crates use, tuned to read at the tens-of-pixels scale a
-//! system view needs. The new work here is the layer on top — orbital layout,
-//! depth sorting so planets pass in front of and behind the sun, and a draggable
-//! camera.
+//! `noise-core`/`dither-core` for the noise/color primitives, `scene-core` for the
+//! compositor + camera helpers, `sun-core` for the compact star tile, and
+//! `planet-core` for the planets. That last one is the whole point: the worlds in
+//! orbit here are literally the worlds the `planet` demo renders — same archetype
+//! table, same shader — asked for in its *sprite* framing (a transparent tile lit
+//! from an arbitrary direction) instead of its hero framing. The new work here is
+//! the layer on top — orbital layout, depth sorting so planets pass in front of
+//! and behind the sun, and a draggable camera.
 //!
 //! Pipeline per frame (see [`render_system`]):
 //!   1. paint the parallax starfield for the current camera,
@@ -29,36 +30,22 @@ use std::cell::RefCell;
 use std::f32::consts::TAU;
 
 // ===========================================================================
-// Noise + math primitives — now imported from the shared primitive crates
-// (`noise-core` / `dither-core`) instead of a local copy. The values are
-// unchanged, so the rendered output is byte-for-byte identical.
+// Shared primitives — noise/color math and the ordered dither, used here by the
+// nebula + starfield background.
 // ===========================================================================
 
 use noise_core::{clamp01, fbm, hash3, mix, smoothstep, Rgb};
 use dither_core::bayer;
 
-// Shared scene-compositor primitives (formerly copy-pasted into this crate).
-// Values are byte-identical to the local copies these replaced, so the rendered
-// output is unchanged. `Camera` is re-exported because it's part of this crate's
-// public API (its wasm glue + bins reference `solar::Camera` / `crate::Camera`).
+// The scene-compositor kit: camera transform, seeded RNG, and the tile blitter
+// every body is drawn through. `Camera` is re-exported because it's part of this
+// crate's public API (the wasm glue + bins reference `solar::Camera`).
 use scene_core::{blit, to_screen, Rng, Tile, ORBIT_FLATTEN};
 pub use scene_core::Camera;
 
-// The compact "lite renderer" for the central sun (formerly a local copy of
-// `SunKind` + `sun_surface` + `render_sun_tile`). `StarKind` is field-identical
-// to solar's old `SunKind`, so the `SUNS` table and every field access are
-// unchanged; the alias keeps solar's ~9 `SunKind` references working.
+// The compact star-tile renderer, shared with `comet`. Aliased to `SunKind`
+// because in a system this star is *the* sun.
 use sun_core::StarKind as SunKind;
-// The compact "lite renderer" for the orbiting planets (formerly a local copy of
-// `PKind` + `pbase` + the `KIND_*` consts + `planet_surface` + `render_planet_tile`).
-// `BodyKind` is field-for-field identical to solar's old `PKind` and `base()` ==
-// solar's old `pbase()`, so the `PKINDS` table and every `..pbase()` spread work
-// unchanged; the `render_body_tile as render_planet_tile` alias keeps the call
-// site's signature identical.
-use body_core::{
-    base as pbase, render_body_tile as render_planet_tile, BodyKind as PKind, KIND_EMISSIVE,
-    KIND_GAS, KIND_ICE, KIND_TERRA,
-};
 
 // ===========================================================================
 // The star at the centre
@@ -82,57 +69,72 @@ const CORONA_REACH: f32 = 0.7;
 const SUN_TQUANT: f32 = 0.08;
 
 // ===========================================================================
-// Planet type table (compact)
+// Planet roster
 // ===========================================================================
 
-const TERRAN: &[(f32, Rgb)] = &[
-    (0.46, [0.08, 0.16, 0.36]), (0.50, [0.13, 0.30, 0.55]), (0.52, [0.78, 0.73, 0.52]),
-    (0.64, [0.28, 0.54, 0.26]), (0.78, [0.16, 0.38, 0.18]), (0.90, [0.45, 0.40, 0.34]),
-    (1.01, [0.92, 0.94, 0.98]),
-];
-const OCEAN: &[(f32, Rgb)] = &[
-    (0.58, [0.04, 0.12, 0.32]), (0.68, [0.10, 0.27, 0.51]), (0.70, [0.76, 0.70, 0.50]),
-    (0.78, [0.30, 0.52, 0.30]), (1.01, [0.19, 0.42, 0.22]),
-];
-const DESERT: &[(f32, Rgb)] = &[
-    (0.42, [0.52, 0.32, 0.19]), (0.54, [0.78, 0.55, 0.32]), (0.68, [0.87, 0.69, 0.43]),
-    (0.82, [0.93, 0.82, 0.57]), (1.01, [0.72, 0.50, 0.34]),
-];
-const JUNGLE: &[(f32, Rgb)] = &[
-    (0.44, [0.06, 0.20, 0.34]), (0.50, [0.14, 0.34, 0.44]), (0.53, [0.30, 0.42, 0.20]),
-    (0.70, [0.18, 0.44, 0.18]), (0.86, [0.12, 0.32, 0.14]), (1.01, [0.50, 0.56, 0.32]),
-];
-const ICE: &[(f32, Rgb)] = &[
-    (0.32, [0.83, 0.91, 0.99]), (0.56, [0.68, 0.80, 0.93]), (0.76, [0.50, 0.66, 0.86]),
-    (1.01, [0.34, 0.51, 0.78]),
-];
-const BARREN: &[(f32, Rgb)] = &[
-    (0.44, [0.22, 0.20, 0.22]), (0.60, [0.34, 0.32, 0.34]), (0.78, [0.50, 0.48, 0.49]),
-    (1.01, [0.66, 0.64, 0.63]),
+/// One world this generator can place. The archetype itself — palette, shader,
+/// weather, rings — belongs to `planet-core`, named here rather than indexed so
+/// reordering that table can't silently re-point a row. All this crate adds is
+/// the one fact a *system* needs and a single planet doesn't: where the world
+/// belongs relative to its star. (Body size follows from `planet_core::is_giant`.)
+struct Archetype {
+    /// A `planet-core` type name (see `planet_core::type_name`).
+    ty: &'static str,
+    /// Preferred orbital band: 0 inner (hot/rocky), 1 mid, 2 outer (cold/gas).
+    band: u8,
+}
+
+/// The worlds in play, grouped by band so systems read naturally (rock near the
+/// star, gas and ice far out) without being rigid. Every `planet-core` archetype
+/// appears exactly once — see the test at the bottom of this file.
+///
+/// The web demo's `PLANET_NAMES` is index-aligned with this table (it can't read
+/// `&str`s across the C ABI), so reordering here means editing `web/index.html`.
+const ROSTER: &[Archetype] = &[
+    // inner — scorched, rocky, molten
+    Archetype { ty: "desert", band: 0 },
+    Archetype { ty: "barren", band: 0 },
+    Archetype { ty: "moon", band: 0 },
+    Archetype { ty: "iron", band: 0 },
+    Archetype { ty: "obsidian", band: 0 },
+    Archetype { ty: "lava", band: 0 },
+    Archetype { ty: "molten_sea", band: 0 },
+    // mid — the habitable belt, plus the odd exotic
+    Archetype { ty: "terran", band: 1 },
+    Archetype { ty: "ocean", band: 1 },
+    Archetype { ty: "archipelago", band: 1 },
+    Archetype { ty: "gaia", band: 1 },
+    Archetype { ty: "swamp", band: 1 },
+    Archetype { ty: "savanna", band: 1 },
+    Archetype { ty: "toxic", band: 1 },
+    Archetype { ty: "radioactive", band: 1 },
+    Archetype { ty: "fungal", band: 1 },
+    Archetype { ty: "chrome", band: 1 },
+    // outer — frozen, banded, storm-wracked
+    Archetype { ty: "ice", band: 2 },
+    Archetype { ty: "tundra", band: 2 },
+    Archetype { ty: "alpine", band: 2 },
+    Archetype { ty: "crystal", band: 2 },
+    Archetype { ty: "storm_shroud", band: 2 },
+    Archetype { ty: "gas_giant", band: 2 },
+    Archetype { ty: "ice_giant", band: 2 },
+    Archetype { ty: "storm_giant", band: 2 },
+    Archetype { ty: "ringed_giant", band: 2 },
 ];
 
-/// The planet archetypes. Placement leans on `orbit_band` so systems read
-/// naturally (rock near the star, gas/ice far out) without being rigid.
-const PKINDS: &[PKind] = &[
-    PKind { name: "terran", kind: KIND_TERRA, stops: TERRAN, caps: 0.85, clouds: 0.8, atmo: [0.30, 0.45, 0.65], freq: 2.2, contr: 2.1, orbit_band: 1, ..pbase() },
-    PKind { name: "ocean", kind: KIND_TERRA, stops: OCEAN, caps: 0.6, clouds: 0.7, atmo: [0.25, 0.42, 0.66], freq: 2.4, contr: 1.7, orbit_band: 1, ..pbase() },
-    PKind { name: "jungle", kind: KIND_TERRA, stops: JUNGLE, caps: 0.2, clouds: 0.6, atmo: [0.28, 0.48, 0.40], freq: 2.6, contr: 1.8, orbit_band: 1, ..pbase() },
-    PKind { name: "desert", kind: KIND_TERRA, stops: DESERT, caps: 0.1, clouds: 0.1, atmo: [0.38, 0.28, 0.18], freq: 2.6, contr: 1.5, orbit_band: 0, ..pbase() },
-    PKind { name: "barren", kind: KIND_TERRA, stops: BARREN, caps: 0.0, clouds: 0.0, atmo: [0.0, 0.0, 0.0], freq: 3.6, contr: 1.9, orbit_band: 0, ..pbase() },
-    PKind { name: "lava", kind: KIND_EMISSIVE, rock: [0.16, 0.09, 0.07], glow_lo: [1.0, 0.42, 0.06], glow_hi: [1.0, 0.92, 0.35], atmo: [0.30, 0.10, 0.05], freq: 3.0, orbit_band: 0, ..pbase() },
-    PKind { name: "ice", kind: KIND_ICE, stops: ICE, caps: 0.0, atmo: [0.45, 0.60, 0.85], freq: 2.8, contr: 1.4, orbit_band: 2, ..pbase() },
-    PKind { name: "gas giant", kind: KIND_GAS, band_lo: [0.55, 0.40, 0.28], band_hi: [0.88, 0.79, 0.62], bands: 11.0, atmo: [0.40, 0.34, 0.22], orbit_band: 2, ..pbase() },
-    PKind { name: "ice giant", kind: KIND_GAS, band_lo: [0.20, 0.38, 0.66], band_hi: [0.55, 0.74, 0.92], bands: 9.0, atmo: [0.30, 0.45, 0.70], orbit_band: 2, ..pbase() },
-    PKind { name: "ringed giant", kind: KIND_GAS, band_lo: [0.50, 0.40, 0.30], band_hi: [0.84, 0.76, 0.60], bands: 10.0, atmo: [0.36, 0.30, 0.20], rings: true, orbit_band: 2, ..pbase() },
-];
+/// `planet-core` type index for roster entry `i`. Resolved once per planet at
+/// generation time and cached in [`Planet::ptype`], never per frame.
+fn roster_type(i: usize) -> usize {
+    planet_core::type_index(ROSTER[i % ROSTER.len()].ty).unwrap_or(0)
+}
 
-/// Names of the planet archetypes, index-aligned with `PKINDS`.
+/// Number of planet archetypes.
 pub fn planet_kind_count() -> usize {
-    PKINDS.len()
+    ROSTER.len()
 }
 /// Name of a planet archetype (wraps out of range).
 pub fn planet_kind_name(i: usize) -> &'static str {
-    PKINDS[i % PKINDS.len()].name
+    ROSTER[i % ROSTER.len()].ty
 }
 /// Number of star archetypes.
 pub fn sun_kind_count() -> usize {
@@ -151,7 +153,8 @@ pub fn sun_kind_name(i: usize) -> &'static str {
 /// [`render_system`] for how world → screen works); angles are radians.
 #[derive(Clone, Copy)]
 pub struct Planet {
-    pub kind: usize,     // index into PKINDS
+    pub kind: usize,     // index into ROSTER (what the HUD names)
+    pub ptype: usize,    // index into planet_core::TYPES (what renders it)
     pub orbit: f32,      // semi-major axis, world units
     pub radius: f32,     // body radius, world units
     pub speed: f32,      // mean motion, radians of mean anomaly per unit time
@@ -323,11 +326,10 @@ impl System {
             } else {
                 2
             };
-            // Pick a type whose orbit_band matches, else anything.
+            // Pick a type whose band matches, else anything.
             let kind = pick_kind(&mut rng, want_band);
-            let pk = &PKINDS[kind];
-            let is_giant = pk.kind == KIND_GAS;
-            let radius = if is_giant {
+            let ptype = roster_type(kind);
+            let radius = if planet_core::is_giant(ptype) {
                 rng.range(22.0, 34.0)
             } else {
                 rng.range(9.0, 17.0)
@@ -346,6 +348,7 @@ impl System {
             let bseed = seed.wrapping_mul(2_654_435_761).wrapping_add(i as u32 * 40_503 + 1);
             planets.push(Planet {
                 kind,
+                ptype,
                 orbit,
                 radius,
                 speed,
@@ -425,22 +428,24 @@ impl System {
 
 fn pick_kind(rng: &mut Rng, want_band: u8) -> usize {
     // Collect indices in the wanted band; fall back to all if none.
-    let mut pool = [0usize; 16];
+    let mut pool = [0usize; ROSTER.len()];
     let mut n = 0usize;
-    for (i, k) in PKINDS.iter().enumerate() {
-        if k.orbit_band == want_band {
+    for (i, a) in ROSTER.iter().enumerate() {
+        if a.band == want_band {
             pool[n] = i;
             n += 1;
         }
     }
     if n == 0 {
-        return (rng.f() * PKINDS.len() as f32) as usize % PKINDS.len();
+        return (rng.f() * ROSTER.len() as f32) as usize % ROSTER.len();
     }
     pool[(rng.f() * n as f32) as usize % n]
 }
 
 // ===========================================================================
-// Body tile renderers — each fills a small RGBA tile, transparent off-body
+// Body tile renderers — each fills a small RGBA tile, transparent off-body.
+// Both live in shared crates: the star in `sun-core`, the planets in
+// `planet-core` (called straight from `draw_bodies`).
 // ===========================================================================
 
 /// Render the star to a tile of diameter ~`2*rad_px` (+corona margin). Thin
@@ -823,10 +828,12 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
             let m = (lx * lx + ly * ly + lz * lz).sqrt();
             let light = [lx / m, ly / m, lz / m];
 
-            let pk = &PKINDS[p.kind];
-            let spin_a = p.phase + p.spin * t_spin * TAU; // axial rotation (its own clock)
+            // `spin_a` both turns the surface and advances that world's weather —
+            // the planet shader takes one angle for both, so a fast-spinning world
+            // also churns faster.
+            let spin_a = p.phase + p.spin * t_spin * TAU;
             let rad_render = (rad_px / sys.planet_pixel).clamp(2.0, maxr);
-            let tile = render_planet_tile(pk, p.seed, spin_a, t_spin, light, rad_render);
+            let tile = planet_core::render_tile(p.ptype, p.seed, spin_a, light, rad_render);
             blit(out, w, h, &tile, sx, sy, rad_px / rad_render);
         }
     }
@@ -867,3 +874,34 @@ pub fn planet_nearest_center(sys: &System, w: u32, h: u32, cam: &Camera, t: f32)
 // Browser (wasm) C-ABI glue — excluded from native builds. See wasm.rs.
 #[cfg(target_arch = "wasm32")]
 mod wasm;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The roster names `planet-core` archetypes as strings, so a typo (or a
+    /// renamed row over there) would silently fall back to type 0 and quietly
+    /// fill systems with terrans. Pin it: every name resolves, and every
+    /// archetype is placed exactly once.
+    #[test]
+    fn roster_covers_every_planet_type_once() {
+        let mut seen = vec![0usize; planet_core::type_count()];
+        for a in ROSTER {
+            let i = planet_core::type_index(a.ty)
+                .unwrap_or_else(|| panic!("no planet-core type named {:?}", a.ty));
+            seen[i] += 1;
+        }
+        for (i, n) in seen.iter().enumerate() {
+            assert_eq!(*n, 1, "{} appears {} times in ROSTER", planet_core::type_name(i), n);
+        }
+    }
+
+    /// Every band must be non-empty, or `pick_kind` silently falls back to the
+    /// whole table and the inner/outer character of a system washes out.
+    #[test]
+    fn every_orbital_band_has_worlds() {
+        for band in 0..=2u8 {
+            assert!(ROSTER.iter().any(|a| a.band == band), "orbital band {band} is empty");
+        }
+    }
+}
