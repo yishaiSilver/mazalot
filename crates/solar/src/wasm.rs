@@ -70,6 +70,21 @@ pub extern "C" fn system_set_view(
     );
 }
 
+/// Set the dashed orbit-path line thickness in pixels (clamped to 1..=6).
+#[no_mangle]
+pub extern "C" fn system_set_orbit_width(sys: *mut System, px: f32) {
+    let sys = unsafe { &mut *sys };
+    sys.set_orbit_width(px);
+}
+
+/// Set the live eccentricity multiplier (0 = circular orbits, 1 = as generated,
+/// higher = exaggerated ellipses). Rescales the system without regenerating it.
+#[no_mangle]
+pub extern "C" fn system_set_eccentricity(sys: *mut System, scale: f32) {
+    let sys = unsafe { &mut *sys };
+    sys.set_eccentricity(scale);
+}
+
 /// Free a system previously returned by [`system_new`].
 #[no_mangle]
 pub extern "C" fn system_free(ptr: *mut System) {

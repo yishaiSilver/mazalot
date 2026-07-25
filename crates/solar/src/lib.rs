@@ -24,6 +24,7 @@
 //! scene stays cheap enough to render live while the user drags — exactly the
 //! "bake-or-stay-small" guidance in the workspace README.
 
+use std::cell::RefCell;
 use std::f32::consts::TAU;
 
 // ===========================================================================
@@ -187,14 +188,25 @@ const SUNS: &[SunKind] = &[
 /// Radius of the corona halo past the disc, in disc radii.
 const CORONA_REACH: f32 = 0.7;
 
+/// Boil-clock quantum for the star-tile cache: `t_sun` is snapped to this step so
+/// the tile is reused between re-bakes. Small enough that the convection looks
+/// continuous (~a dozen steps/sec at the default rotation), large enough that the
+/// costly tile is baked once every several frames instead of every frame.
+const SUN_TQUANT: f32 = 0.08;
+
 /// Emissive photosphere colour at a rotated surface point + limb factor.
-fn sun_surface(sk: &SunKind, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], t: f32, mu: f32) -> Rgb {
+fn sun_surface(sk: &SunKind, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], t: f32, mu: f32, lod: bool) -> Rgb {
     let f = sk.gran;
     let (px, py, pz) = (sx + ofs[0], sy + ofs[1], sz + ofs[2]);
     // Boil the cell field slowly over time; sample a warped worley for lanes.
-    let warp = 0.5 * fbm(px * 1.6 + t * 0.4, py * 1.6, pz * 1.6 - t * 0.3, 2) - 0.25;
+    // `lod` (set for large, zoomed-in tiles) drops the secondary-fBm octaves —
+    // they modulate below the Bayer-dither floor at that size, so it's a free
+    // ~20% off the re-bake with no visible change. Worley stays full (it *is*
+    // the visible cell structure).
+    let (warp_oct, blotch_oct) = if lod { (1, 2) } else { (2, 3) };
+    let warp = 0.5 * fbm(px * 1.6 + t * 0.4, py * 1.6, pz * 1.6 - t * 0.3, warp_oct) - 0.25;
     let w = worley(px * f + warp, py * f + warp, pz * f);
-    let blotch = fbm(px * 0.9, py * 0.9, pz * 0.9 + t * 0.2, 3);
+    let blotch = fbm(px * 0.9, py * 0.9, pz * 0.9 + t * 0.2, blotch_oct);
     let cool_region = smoothstep(0.46, 0.30, blotch);
     let lane = smoothstep(0.55, 0.82, w);
     let dark = clamp01(cool_region * 0.85 + lane * 0.4);
@@ -323,25 +335,56 @@ pub fn sun_kind_name(i: usize) -> &'static str {
 #[derive(Clone, Copy)]
 pub struct Planet {
     pub kind: usize,     // index into PKINDS
-    pub orbit: f32,      // orbital radius, world units
+    pub orbit: f32,      // semi-major axis, world units
     pub radius: f32,     // body radius, world units
-    pub speed: f32,      // angular speed, radians per unit time
-    pub phase: f32,      // angle at time 0
+    pub speed: f32,      // mean motion, radians of mean anomaly per unit time
+    pub phase: f32,      // mean anomaly at time 0
     pub tilt: f32,       // orbit foreshortening (0 = edge-on line, 1 = face-on circle)
     pub spin: f32,       // axial-spin turns per unit time (self rotation)
+    pub e: f32,          // eccentricity (0 = circle, ..<1 = ellipse); star sits at a focus
+    pub arg: f32,        // argument of periapsis — rotates the ellipse's long axis in-plane
     pub seed: u32,       // this body's noise seed
 }
 
 impl Planet {
-    /// World-space position + a depth key at time `t`. `spacing` scales the
-    /// orbit radius (a live UI multiplier). Depth > 0 means the planet is on the
-    /// near side of its orbit (drawn in front of the sun).
-    fn at(&self, t: f32, spacing: f32) -> (f32, f32, f32) {
-        let a = self.phase + self.speed * t;
-        let (s, c) = a.sin_cos();
-        let x = c * self.orbit * spacing;
-        let y = s * self.orbit * ORBIT_FLATTEN * self.tilt * spacing;
-        (x, y, s) // depth = sin(a): +1 at the front of the ellipse
+    /// Effective eccentricity with the system's live `ecc` multiplier applied,
+    /// clamped short of a parabola. `ecc == 0` forces perfect circles.
+    #[inline]
+    fn ecc(&self, ecc: f32) -> f32 {
+        (self.e * ecc).clamp(0.0, 0.9)
+    }
+
+    /// In-plane point (focus at origin) at eccentric anomaly `ea`, rotated by the
+    /// argument of periapsis. Returns `(x1, y1)` before the view squash. At `e ==
+    /// 0` this is a circle of radius `orbit` about the sun (the old behaviour).
+    #[inline]
+    fn plane_point(&self, ea: f32, e: f32) -> (f32, f32) {
+        let b = self.orbit * (1.0 - e * e).max(0.0).sqrt();
+        let ox = self.orbit * (ea.cos() - e); // perihelion at ea=0; focus at origin
+        let oy = b * ea.sin();
+        let (sw, cw) = self.arg.sin_cos();
+        (ox * cw - oy * sw, ox * sw + oy * cw)
+    }
+
+    /// World-space position + a depth key at time `t`. `spacing` scales the orbit,
+    /// `ecc` scales eccentricity (both live UI multipliers). The mean anomaly
+    /// `M = phase + speed·t` advances uniformly; the eccentric anomaly `E` is
+    /// recovered from `M = E − e·sin E` by a few Newton steps (Kepler's 2nd law —
+    /// the planet sweeps faster near perihelion). Depth > 0 means the near side of
+    /// the orbit (drawn in front of the sun).
+    fn at(&self, t: f32, spacing: f32, ecc: f32) -> (f32, f32, f32) {
+        let e = self.ecc(ecc);
+        let m = (self.phase + self.speed * t).rem_euclid(TAU);
+        let mut ea = m;
+        for _ in 0..6 {
+            let f = ea - e * ea.sin() - m;
+            let fp = 1.0 - e * ea.cos();
+            ea -= f / fp;
+        }
+        let (x1, y1) = self.plane_point(ea, e);
+        let x = x1 * spacing;
+        let y = y1 * ORBIT_FLATTEN * self.tilt * spacing;
+        (x, y, y1 / self.orbit) // depth ~ near/far side, normalised by the orbit size
     }
 }
 
@@ -369,10 +412,60 @@ pub struct System {
     // Background pan-parallax rate multiplier (scales every layer's scroll rate
     // `p`; 0 = stars fixed on pan, 1 = default).
     pub star_parallax: f32,
+    // Dashed orbit-path line thickness in pixels (1 = default 1px look).
+    pub orbit_width: f32,
+    // Eccentricity multiplier (scales every planet's generated `e`; 0 = force
+    // perfect circles, 1 = as generated, higher = exaggerate the ellipses).
+    pub ecc: f32,
     // Cached backdrop (background + orbit paths) + the key it was rendered for,
     // reused by `render_system_cached` while the camera/view is unchanged.
     bg_cache: Vec<u8>,
     bg_key: Option<BgKey>,
+    // Cached background layers. Interior-mutable so it memoizes through the
+    // shared `&System` render path too. See [`BgCache`] and `paint_background`.
+    neb: RefCell<BgCache>,
+    // Cached star tile — the single most expensive body shader (27-cell worley +
+    // fBm per pixel over a large tile when zoomed in). The boil evolves slowly,
+    // so like the nebula its clock is quantized: on a still-ish sun the tile is
+    // reused and only re-baked every few frames. See `draw_bodies`.
+    sun_tile: RefCell<SunCache>,
+    // Reused draw-order scratch (avoids a per-frame Vec alloc in `draw_bodies`).
+    order: RefCell<Vec<(f32, i32)>>,
+}
+
+/// Memoized star tile. The star's convection cells + corona are the costliest
+/// per-pixel shader, but the boil is slow, so we key the tile on the render
+/// radius and a QUANTIZED boil clock and reuse it between re-bakes.
+#[derive(Default)]
+struct SunCache {
+    /// `[quantized rad_render, quantized t_sun]` the `tile` is valid for.
+    key: Option<[i32; 2]>,
+    tile: Option<Tile>,
+}
+
+/// Two nested background caches, both exploiting that the backdrop-minus-stars
+/// "barely changes":
+///   • `neb_field` — the low-res per-cell fBm nebula, the most expensive single
+///     sub-pass. Keyed on the scroll offset ONLY (not zoom), so a pure zoom
+///     never re-bakes it.
+///   • `layer` — the full-res base-navy + nebula composite (everything except
+///     the moving stars and orbit paths). Keyed on scroll offset AND zoom-fade.
+///     This is the big one: on a drag it's reused as a `memcpy`, so the O(pixels)
+///     base-fill + nebula composite (~6.5 ms at 1000×640) collapses to a copy,
+///     and only the cheap star/orbit overlay redraws.
+/// The stars scroll every frame (they're the parallax), so they're never cached
+/// here — they're drawn on top of the (copied) layer each frame.
+#[derive(Default)]
+struct BgCache {
+    /// `[nw, nh, qx, qy]` the `neb_field` is valid for (zoom excluded).
+    neb_key: Option<[i32; 4]>,
+    /// Low-res (8px-cell) RGB nebula at full strength (density premultiplied,
+    /// NO zoom-fade — that's applied at composite) — `nw * nh` entries.
+    neb_field: Vec<[f32; 3]>,
+    /// `[w, h, qx, qy, quantized zoom-fade]` the `layer` is valid for.
+    layer_key: Option<[i32; 5]>,
+    /// Full-res RGBA base-navy + nebula (no stars, no orbits) — `w * h * 4` bytes.
+    layer: Vec<u8>,
 }
 
 /// How much orbits are squashed vertically to fake a tilted, near-top-down view.
@@ -431,6 +524,11 @@ impl System {
             let phase = rng.range(0.0, TAU);
             let tilt = rng.range(0.8, 1.0); // near face-on, a touch of variety
             let spin = rng.range(0.15, 0.6) * if rng.below(0.15) { -1.0 } else { 1.0 };
+            // A gentle spread of eccentricity so orbits read as ellipses with the
+            // sun at a focus, not perfect circles — inner worlds a touch rounder,
+            // the odd outer world more elongated. The `ecc` view knob scales this.
+            let e = (rng.range(0.03, 0.24) + frac * rng.range(0.0, 0.18)).min(0.42);
+            let arg = rng.range(0.0, TAU); // point each ellipse's long axis its own way
             let bseed = seed.wrapping_mul(2_654_435_761).wrapping_add(i as u32 * 40_503 + 1);
             planets.push(Planet {
                 kind,
@@ -440,6 +538,8 @@ impl System {
                 phase,
                 tilt,
                 spin,
+                e,
+                arg,
                 seed: bseed,
             });
             // Next orbit: leave room for this body + a growing gap.
@@ -450,7 +550,11 @@ impl System {
             seed, sun_kind, sun_radius, planets,
             spacing: 1.0, planet_size: 1.0, sun_size: 1.0, planet_pixel: 1.0, sun_pixel: 1.0,
             planet_detail: 160.0, sun_detail: 110.0, star_density: 0.5, star_parallax: 1.0,
+            orbit_width: 1.0, ecc: 1.0,
             bg_cache: Vec::new(), bg_key: None,
+            neb: RefCell::new(BgCache::default()),
+            sun_tile: RefCell::new(SunCache::default()),
+            order: RefCell::new(Vec::new()),
         }
     }
 
@@ -482,12 +586,24 @@ impl System {
         self.star_parallax = star_parallax.clamp(0.0, 4.0);
     }
 
+    /// Set the dashed orbit-path line thickness in pixels (1..=6; 1 = default).
+    pub fn set_orbit_width(&mut self, px: f32) {
+        self.orbit_width = px.clamp(1.0, 6.0);
+    }
+
+    /// Live eccentricity multiplier: 0 forces circular orbits, 1 keeps each
+    /// planet's generated eccentricity, higher exaggerates the ellipses.
+    pub fn set_eccentricity(&mut self, scale: f32) {
+        self.ecc = scale.clamp(0.0, 2.5);
+    }
+
     /// The outermost extent (world units) with the current view multipliers —
     /// handy for framing / zoom-fit.
     pub fn extent(&self) -> f32 {
         self.planets
             .last()
-            .map(|p| p.orbit * self.spacing + p.radius * self.planet_size)
+            // Aphelion (the far point) is a·(1 + e); frame against that.
+            .map(|p| p.orbit * (1.0 + p.ecc(self.ecc)) * self.spacing + p.radius * self.planet_size)
             .unwrap_or(self.sun_radius * self.sun_size)
             + 40.0
     }
@@ -548,6 +664,9 @@ fn render_sun_tile(sk: &SunKind, seed: u32, t: f32, rad_px: f32) -> Tile {
     let size = size.max(6);
     let c = size as f32 / 2.0;
     let ofs = seed_offsets(seed);
+    // A2 LOD: on a large (zoomed-in) tile, thin the secondary-fBm octaves.
+    let lod = size > 200;
+    let corona_oct = if lod { 2 } else { 3 };
     let mut px = vec![0u8; (size * size * 4) as usize];
 
     for iy in 0..size {
@@ -560,7 +679,7 @@ fn render_sun_tile(sk: &SunKind, seed: u32, t: f32, rad_px: f32) -> Tile {
             let (mut col, mut a);
             if d2 <= 1.0 {
                 let nz = (1.0 - d2).sqrt();
-                col = sun_surface(sk, nx, ny, nz, ofs, t, nz);
+                col = sun_surface(sk, nx, ny, nz, ofs, t, nz, lod);
                 a = 1.0;
             } else {
                 col = [0.0, 0.0, 0.0];
@@ -571,7 +690,7 @@ fn render_sun_tile(sk: &SunKind, seed: u32, t: f32, rad_px: f32) -> Tile {
             if edge > 0.0 && edge < CORONA_REACH {
                 let theta = ny.atan2(nx);
                 // Ragged flares around the rim + a smooth radial falloff.
-                let flare = 0.6 + 0.5 * fbm(theta.cos() * 5.0, theta.sin() * 5.0, t * 0.6, 3);
+                let flare = 0.6 + 0.5 * fbm(theta.cos() * 5.0, theta.sin() * 5.0, t * 0.6, corona_oct);
                 let fall = smoothstep(CORONA_REACH, 0.0, edge).powf(1.6);
                 let glow = clamp01(fall * flare);
                 let cc = [sk.corona[0] * glow, sk.corona[1] * glow, sk.corona[2] * glow];
@@ -841,6 +960,47 @@ fn star_tint(hh: f32) -> Rgb {
     }
 }
 
+/// Nebula bake resolution: one fBm sample per 8×8-px block → pixel-art clouds.
+const NEB_CELL: u32 = 8;
+/// The nebula scroll offset is snapped to this many pixels, so small pans (and
+/// all zooms) reuse the previous bake instead of re-running the per-cell fBm.
+/// The nebula is faint and low-frequency, so 2-px steps are imperceptible.
+const NEB_QUANT: f32 = 2.0;
+
+/// Ensure the cached nebula field matches `[nw, nh, qx, qy]`, re-baking the
+/// per-cell fBm only on a miss. Stores the field at FULL strength (density
+/// premultiplied, but no zoom-fade — that's applied per-pixel at composite),
+/// which is why the key excludes zoom: a pure zoom never invalidates the bake.
+fn ensure_nebula(cache: &RefCell<BgCache>, si: i32, nw: u32, nh: u32, qx: i32, qy: i32) {
+    let key = [nw as i32, nh as i32, qx, qy];
+    if let Ok(c) = cache.try_borrow() {
+        if c.neb_key == Some(key) && c.neb_field.len() == (nw * nh) as usize {
+            return; // hit — the clouds barely moved (or only the zoom changed)
+        }
+    }
+    let mut c = cache.borrow_mut();
+    let ta = NEB_TINTS[(hash3(si, 1, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
+    let tb = NEB_TINTS[(hash3(si, 2, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
+    let (nox, noy) = (qx as f32 * NEB_QUANT, qy as f32 * NEB_QUANT);
+    let f = 1.0 / 240.0;
+    c.neb_field.clear();
+    c.neb_field.resize((nw * nh) as usize, [0.0; 3]);
+    for cy in 0..nh {
+        for cx in 0..nw {
+            let gx = ((cx * NEB_CELL) as f32 + nox) * f;
+            let gy = ((cy * NEB_CELL) as f32 + noy) * f;
+            let dens = smoothstep(0.50, 0.74, fbm(gx, gy, 4.2, 3)); // patchy -> not crowded
+            if dens > 0.0 {
+                let n2 = fbm(gx * 1.8 + 40.0, gy * 1.8 + 7.0, 1.5, 2);
+                let col = mix(ta, tb, clamp01((n2 - 0.35) * 2.2));
+                let k = dens * 0.34; // faint; zoom-fade applied later at composite
+                c.neb_field[(cy * nw + cx) as usize] = [col[0] * k, col[1] * k, col[2] * k];
+            }
+        }
+    }
+    c.neb_key = Some(key);
+}
+
 /// Paint the space background: a faint colored nebula plus parallax star layers.
 ///
 /// The background is a fixed SCREEN-SPACE backdrop. Each layer scrolls at its own
@@ -856,57 +1016,71 @@ fn star_tint(hh: f32) -> Rgb {
 /// the visible grid cells (O(cells)); the far layer + nebula fade out when you
 /// zoom in on a body.
 #[allow(clippy::too_many_arguments)]
-fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32, density: f32, parallax: f32, bgx: f32, bgy: f32) {
+fn paint_background(
+    out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32, density: f32, parallax: f32,
+    bgx: f32, bgy: f32, cache: &RefCell<BgCache>,
+) {
     let z = cam.zoom;
     let si = seed as i32;
     let far_amt = 1.0 - smoothstep(3.0, 9.0, z);
     let neb_amt = 1.0 - smoothstep(2.5, 7.0, z);
+    let len = (w * h * 4) as usize;
 
-    // --- nebula: baked at low res each frame (8px blocks => pixel-art clouds) ---
-    const CELL: u32 = 8;
-    let nw = (w + CELL - 1) / CELL;
-    let nh = (h + CELL - 1) / CELL;
-    let mut neb: Vec<[f32; 3]> = Vec::new();
-    if neb_amt > 0.02 {
-        let ta = NEB_TINTS[(hash3(si, 1, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
-        let tb = NEB_TINTS[(hash3(si, 2, 9) * NEB_TINTS.len() as f32) as usize % NEB_TINTS.len()];
-        let np = 0.09 * parallax; // nebula scroll rate (slowest, pan only)
-        let (nox, noy) = (bgx * np + hash3(si, 5, 2) * 500.0, bgy * np + hash3(si, 6, 2) * 500.0);
-        let f = 1.0 / 240.0;
-        neb = vec![[0.0f32; 3]; (nw * nh) as usize];
-        for cy in 0..nh {
-            for cx in 0..nw {
-                let gx = ((cx * CELL) as f32 + nox) * f;
-                let gy = ((cy * CELL) as f32 + noy) * f;
-                let dens = smoothstep(0.50, 0.74, fbm(gx, gy, 4.2, 3)); // patchy -> not crowded
-                if dens > 0.0 {
-                    let n2 = fbm(gx * 1.8 + 40.0, gy * 1.8 + 7.0, 1.5, 2);
-                    let col = mix(ta, tb, clamp01((n2 - 0.35) * 2.2));
-                    let k = dens * neb_amt * 0.34; // faint
-                    neb[(cy * nw + cx) as usize] = [col[0] * k, col[1] * k, col[2] * k];
+    // The nebula scrolls at 9% of pan and its shape is zoom-independent (zoom
+    // only fades brightness), so we quantize the scroll offset — a small drag,
+    // and every zoom, reuses the bake.
+    let nw = (w + NEB_CELL - 1) / NEB_CELL;
+    let nh = (h + NEB_CELL - 1) / NEB_CELL;
+    let np = 0.09 * parallax; // nebula scroll rate (slowest, pan only)
+    let (qx, qy) = (
+        ((bgx * np + hash3(si, 5, 2) * 500.0) / NEB_QUANT).round() as i32,
+        ((bgy * np + hash3(si, 6, 2) * 500.0) / NEB_QUANT).round() as i32,
+    );
+    let show_neb = neb_amt > 0.02;
+
+    // --- base-navy + nebula LAYER, cached. Keyed on the scroll offset AND the
+    // (quantized) zoom-fade, this is everything except the moving stars/orbits.
+    // On a drag between offset ticks it's a memcpy; only a large pan or a zoom
+    // step rebuilds it. This is the O(pixels) part of the background. ---
+    let layer_key = [w as i32, h as i32, qx, qy, if show_neb { (neb_amt * 40.0).round() as i32 } else { -1 }];
+    let hit = {
+        let c = cache.borrow();
+        c.layer_key == Some(layer_key) && c.layer.len() == len
+    };
+    if hit {
+        out[..len].copy_from_slice(&cache.borrow().layer);
+    } else {
+        // Rebuild the layer. The per-cell fBm bake is itself cached (survives
+        // zoom), so a zoom-only rebuild skips it and just re-composites.
+        if show_neb {
+            ensure_nebula(cache, si, nw, nh, qx, qy);
+        }
+        let c = cache.borrow();
+        let field: &[[f32; 3]] = if show_neb { &c.neb_field } else { &[] };
+        let has_neb = !field.is_empty();
+        for iy in 0..h {
+            let nrow = (iy / NEB_CELL) * nw;
+            for ix in 0..w {
+                let (mut r, mut g, mut b) = (0.031f32, 0.027, 0.068); // base navy
+                if has_neb {
+                    let c = field[(nrow + ix / NEB_CELL) as usize];
+                    let d = bayer(ix, iy) * 0.015; // dither -> pixel-art gradient
+                    r += (c[0] * neb_amt + d).max(0.0);
+                    g += (c[1] * neb_amt + d).max(0.0);
+                    b += (c[2] * neb_amt + d).max(0.0);
                 }
+                let idx = ((iy * w + ix) * 4) as usize;
+                out[idx] = (clamp01(r) * 255.0) as u8;
+                out[idx + 1] = (clamp01(g) * 255.0) as u8;
+                out[idx + 2] = (clamp01(b) * 255.0) as u8;
+                out[idx + 3] = 255;
             }
         }
-    }
-
-    // --- pass 1: base navy + nebula (cheap: no per-pixel hashing) ---
-    for iy in 0..h {
-        let nrow = (iy / CELL) * nw;
-        for ix in 0..w {
-            let (mut r, mut g, mut b) = (0.031f32, 0.027, 0.068); // base navy
-            if !neb.is_empty() {
-                let c = neb[(nrow + ix / CELL) as usize];
-                let d = bayer(ix, iy) * 0.015; // dither -> pixel-art gradient
-                r += (c[0] + d).max(0.0);
-                g += (c[1] + d).max(0.0);
-                b += (c[2] + d).max(0.0);
-            }
-            let idx = ((iy * w + ix) * 4) as usize;
-            out[idx] = (clamp01(r) * 255.0) as u8;
-            out[idx + 1] = (clamp01(g) * 255.0) as u8;
-            out[idx + 2] = (clamp01(b) * 255.0) as u8;
-            out[idx + 3] = 255;
-        }
+        drop(c);
+        let mut c = cache.borrow_mut();
+        c.layer.clear();
+        c.layer.extend_from_slice(&out[..len]);
+        c.layer_key = Some(layer_key);
     }
 
     // --- pass 2: stars. Each layer is a fixed screen-space grid (spacing `sp`
@@ -961,27 +1135,38 @@ fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32, den
 }
 
 /// Dot in a planet's orbit path as a faint dashed ellipse around the sun.
-fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, p: &Planet, spacing: f32) {
+fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, p: &Planet, spacing: f32, ecc: f32, width: f32) {
     let steps = 220;
+    // Filled square stamp of half-extent `r`; width == 1 gives r == 0, i.e. the
+    // original single-pixel dot (pixel-identical to the default look).
+    let r = (((width - 1.0) * 0.5).round()) as i32;
+    // Sample the ellipse by eccentric anomaly so the dashed path traces the exact
+    // curve the planet travels (uniform in E draws the geometry, not the motion).
+    let e = p.ecc(ecc);
     for k in 0..steps {
         // Dashed: skip every few samples.
         if (k / 3) % 2 == 0 {
             continue;
         }
-        let a = TAU * k as f32 / steps as f32;
-        let (s, c) = a.sin_cos();
-        let wx = c * p.orbit * spacing;
-        let wy = s * p.orbit * ORBIT_FLATTEN * p.tilt * spacing;
+        let ea = TAU * k as f32 / steps as f32;
+        let (x1, y1) = p.plane_point(ea, e);
+        let wx = x1 * spacing;
+        let wy = y1 * ORBIT_FLATTEN * p.tilt * spacing;
         let (sx, sy) = to_screen(wx, wy, cam, w, h);
         let (px, py) = (sx as i32, sy as i32);
-        if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
-            continue;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                let (x, y) = (px + dx, py + dy);
+                if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+                    continue;
+                }
+                let idx = ((y as u32 * w + x as u32) * 4) as usize;
+                // Additive faint blue-grey.
+                out[idx] = (out[idx] as u32 + 26).min(90) as u8;
+                out[idx + 1] = (out[idx + 1] as u32 + 30).min(96) as u8;
+                out[idx + 2] = (out[idx + 2] as u32 + 40).min(120) as u8;
+            }
         }
-        let idx = ((py as u32 * w + px as u32) * 4) as usize;
-        // Additive faint blue-grey.
-        out[idx] = (out[idx] as u32 + 26).min(90) as u8;
-        out[idx + 1] = (out[idx + 1] as u32 + 30).min(96) as u8;
-        out[idx + 2] = (out[idx + 2] as u32 + 40).min(120) as u8;
     }
 }
 
@@ -1004,9 +1189,12 @@ pub fn render_system(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: 
 /// Cache key for the background + orbit layer: it's fully determined by the
 /// camera + view params (NO animation time), so as long as these are unchanged
 /// the backdrop is byte-for-byte identical frame to frame.
-type BgKey = [f32; 10];
+// The cached backdrop also paints the dashed orbit paths, which depend on the
+// live orbit shape/weight — so eccentricity and orbit width are part of the key
+// (alongside spacing) or the sliders would leave a stale backdrop.
+type BgKey = [f32; 12];
 fn bg_key(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: f32) -> BgKey {
-    [w as f32, h as f32, cam.x, cam.y, cam.zoom, sys.star_density, sys.star_parallax, sys.spacing, bgx, bgy]
+    [w as f32, h as f32, cam.x, cam.y, cam.zoom, sys.star_density, sys.star_parallax, sys.spacing, bgx, bgy, sys.ecc, sys.orbit_width]
 }
 
 /// Like [`render_system`] but caches the (time-independent) background + orbit
@@ -1032,21 +1220,23 @@ pub fn render_system_cached(sys: &mut System, w: u32, h: u32, cam: &Camera, bgx:
 /// Paint the backdrop: starfield + nebula, then the dashed orbit paths. Depends
 /// only on the camera + view params, never on animation time.
 fn draw_bg_orbits(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: f32, out: &mut [u8]) {
-    paint_background(out, w, h, cam, sys.seed, sys.star_density, sys.star_parallax, bgx, bgy);
+    paint_background(out, w, h, cam, sys.seed, sys.star_density, sys.star_parallax, bgx, bgy, &sys.neb);
     for p in &sys.planets {
-        paint_orbit(out, w, h, cam, p, sys.spacing);
+        paint_orbit(out, w, h, cam, p, sys.spacing, sys.ecc, sys.orbit_width);
     }
 }
 
 /// Draw the sun + planets over whatever is already in `out`, depth-sorted.
 #[allow(clippy::too_many_arguments)]
 fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin: f32, t_sun: f32, out: &mut [u8]) {
-    // Build a draw list of (depth, is_sun, planet_index). The sun sits at
-    // depth 0; planets sort around it by their orbital depth.
-    let mut order: Vec<(f32, i32)> = Vec::with_capacity(sys.planets.len() + 1);
+    // Build a draw list of (depth, is_sun, planet_index) in the System's reused
+    // scratch (no per-frame alloc). The sun sits at depth 0; planets sort around
+    // it by their orbital depth.
+    let mut order = sys.order.borrow_mut();
+    order.clear();
     order.push((0.0, -1)); // sun
     for (i, p) in sys.planets.iter().enumerate() {
-        let (_, _, depth) = p.at(t_orbit, sys.spacing);
+        let (_, _, depth) = p.at(t_orbit, sys.spacing, sys.ecc);
         order.push((depth, i as i32));
     }
     order.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -1071,7 +1261,8 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
         bx + e < 0.0 || bx - e > wf || by + e < 0.0 || by - e > hf
     };
 
-    for (_, which) in order {
+    for idx in 0..order.len() {
+        let which = order[idx].1;
         if which < 0 {
             // The star. Per-body pixelation: render the tile smaller by
             // `sun_pixel`, then `blit` upsizes it by the same factor, so it
@@ -1081,11 +1272,20 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
                 continue;
             }
             let rad_render = (rad_px / sys.sun_pixel).clamp(2.0, maxr_sun);
-            let tile = render_sun_tile(sun, sys.seed, t_sun, rad_render);
-            blit(out, w, h, &tile, suncx, suncy, rad_px / rad_render);
+            // A1: reuse the cached tile unless the render radius or the quantized
+            // boil clock changed. Re-bake at the QUANTIZED clock so the cached
+            // tile matches its key exactly (same trick as the nebula field).
+            let key = [rad_render.round() as i32, (t_sun / SUN_TQUANT).round() as i32];
+            let mut sc = sys.sun_tile.borrow_mut();
+            if sc.key != Some(key) || sc.tile.is_none() {
+                let tq = key[1] as f32 * SUN_TQUANT;
+                sc.tile = Some(render_sun_tile(sun, sys.seed, tq, rad_render));
+                sc.key = Some(key);
+            }
+            blit(out, w, h, sc.tile.as_ref().unwrap(), suncx, suncy, rad_px / rad_render);
         } else {
             let p = &sys.planets[which as usize];
-            let (wx, wy, _depth) = p.at(t_orbit, sys.spacing);
+            let (wx, wy, _depth) = p.at(t_orbit, sys.spacing, sys.ecc);
             let (sx, sy) = to_screen(wx, wy, cam, w, h);
             let rad_px = p.radius * sys.planet_size * cam.zoom;
             // Rings reach ~2 radii; pad generously so a ringed giant isn't clipped.
@@ -1116,7 +1316,7 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
 pub fn planet_world_pos(sys: &System, i: usize, t: f32) -> (f32, f32) {
     match sys.planets.get(i) {
         Some(p) => {
-            let (x, y, _) = p.at(t, sys.spacing);
+            let (x, y, _) = p.at(t, sys.spacing, sys.ecc);
             (x, y)
         }
         None => (0.0, 0.0),
@@ -1130,7 +1330,7 @@ pub fn planet_nearest_center(sys: &System, w: u32, h: u32, cam: &Camera, t: f32)
     let mut best = -1i32;
     let mut best_d = f32::MAX;
     for (i, p) in sys.planets.iter().enumerate() {
-        let (wx, wy, _) = p.at(t, sys.spacing);
+        let (wx, wy, _) = p.at(t, sys.spacing, sys.ecc);
         let (sx, sy) = to_screen(wx, wy, cam, w, h);
         let d = (sx - ccx).powi(2) + (sy - ccy).powi(2);
         // Only count it if the centre is within ~2.5 body radii on screen.
