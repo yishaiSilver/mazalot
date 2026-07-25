@@ -6,7 +6,8 @@
 #
 #   crates/noise-core — 3D value/worley noise + color math (dep-free)
 #   crates/dither-core — Bayer ordered-dither + level quantization (dep-free)
-#   crates/scene-core  — Camera, Rng, Tile/blit compositing, starfield tint
+#   crates/scene-core  — Camera, Rng, Tile/blit compositing
+#   crates/background-core — the deep-space backdrop: ground, nebula, parallax stars
 #   crates/planet-core — THE planet renderer, in both framings: a hero square frame
 #                        (`planet`) and a scene sprite tile (`solar`, `moon`)
 #   crates/sun-core    — compact star renderer (shared by solar + comet)
@@ -24,7 +25,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/noise-core", "crates/dither-core", "crates/scene-core", "crates/planet-core",
+    "crates/noise-core", "crates/dither-core", "crates/scene-core", "crates/background-core",
+    "crates/planet-core",
     "crates/sun-core", "crates/wasm-abi", "crates/render-io",
     "crates/planet", "crates/star", "crates/solar", "crates/bird",
     "crates/character", "crates/moon", "crates/asteroid", "crates/comet",

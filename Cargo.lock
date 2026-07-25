@@ -12,6 +12,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "asteroid"
 version = "0.1.0"
 dependencies = [
+ "background-core",
  "dither-core",
  "image",
  "noise-core",
@@ -25,6 +26,14 @@ name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+
+[[package]]
+name = "background-core"
+version = "0.1.0"
+dependencies = [
+ "dither-core",
+ "noise-core",
+]
 
 [[package]]
 name = "bird"
@@ -78,6 +87,7 @@ checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
 name = "comet"
 version = "0.1.0"
 dependencies = [
+ "background-core",
  "dither-core",
  "image",
  "noise-core",
@@ -178,6 +188,7 @@ dependencies = [
 name = "moon"
 version = "0.1.0"
 dependencies = [
+ "background-core",
  "dither-core",
  "image",
  "noise-core",
@@ -331,7 +342,7 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 name = "solar"
 version = "0.1.0"
 dependencies = [
- "dither-core",
+ "background-core",
  "noise-core",
  "planet-core",
  "render-io",

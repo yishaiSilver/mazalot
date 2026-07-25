@@ -20,6 +20,8 @@ crate-type = ["rlib", "cdylib"]
 noise-core = { path = "../noise-core" }
 dither-core = { path = "../dither-core" }
 scene-core = { path = "../scene-core" }
+# The shared deep-space backdrop (ground + parallax stars).
+background-core = { path = "../background-core" }
 sun-core = { path = "../sun-core" }
 # Raw C-ABI alloc/dealloc + opaque-handle glue for wasm.rs (exports no symbols
 # itself, so the wasm export set is unchanged). Plain dep: also in the wasm build.

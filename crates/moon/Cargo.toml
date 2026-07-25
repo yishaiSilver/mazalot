@@ -21,6 +21,8 @@ crate-type = ["rlib", "cdylib"]
 noise-core = { path = "../noise-core" }
 dither-core = { path = "../dither-core" }
 scene-core = { path = "../scene-core" }
+# The shared deep-space backdrop (ground + starfield).
+background-core = { path = "../background-core" }
 # The planet archetypes + shader, shared verbatim with `planet` and `solar`.
 # Depend on the rlib, not on `planet` itself: `planet` is a cdylib whose
 # `#[no_mangle]` C-ABI exports would collide with this crate's own in wasm.

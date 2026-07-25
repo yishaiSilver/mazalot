@@ -46,6 +46,9 @@ use std::f32::consts::{PI, TAU};
 use dither_core::bayer;
 use noise_core::{clamp01, fbm, hash3, Rgb};
 
+// The shared deep-space backdrop, common to every scene crate.
+use background_core::{paint_backdrop, paint_stars, Backdrop, StarLayer, StarTints, Starfield};
+
 // Shared scene-compositor primitives (were previously copy-pasted here
 // byte-for-byte). Camera is part of this crate's public API, so re-export it.
 use scene_core::{blit, to_screen, Rng, Tile, ORBIT_FLATTEN};
@@ -295,72 +298,39 @@ impl CometScene {
 // Backdrop + orbit path
 // ===========================================================================
 
-/// Star colour by a hash in [0,1): mostly pale/blue-white, a few warm.
-fn star_tint(hh: f32) -> Rgb {
-    if hh < 0.5 {
-        [0.92, 0.95, 1.00]
-    } else if hh < 0.72 {
-        [0.72, 0.83, 1.00]
-    } else if hh < 0.88 {
-        [1.00, 0.96, 0.78]
-    } else {
-        [1.00, 0.82, 0.60]
-    }
-}
+/// This scene's sky: mostly pale/blue-white, a few warm.
+const STAR_TINTS: StarTints = &[
+    (0.50, [0.92, 0.95, 1.00]),
+    (0.72, [0.72, 0.83, 1.00]),
+    (0.88, [1.00, 0.96, 0.78]),
+    (1.01, [1.00, 0.82, 0.60]),
+];
 
-/// Paint the space backdrop: a base navy plus a faint, fixed hashed starfield.
-///
-/// The field is anchored in SCREEN space with a slow pan-parallax tied to the
-/// camera, plotted by iterating visible grid cells (O(cells)) — one 1px star
-/// per hit. Deliberately simpler than `solar`'s nebula layers: the comet is the
-/// subject, so the background stays quiet.
+/// Two layers on a slow pan-parallax. Deliberately quieter than `solar`'s three
+/// plus a nebula: the comet is the subject, so the background stays out of the way.
+const STAR_LAYERS: &[StarLayer] = &[
+    StarLayer { parallax: 0.12, spacing: 7.0, threshold: 0.86, brightness: 0.55, faint: 0.5, salt: 0 },
+    StarLayer { parallax: 0.30, spacing: 10.0, threshold: 0.88, brightness: 0.90, faint: 0.5, salt: 1 },
+];
+
+/// Dithered navy, no nebula — see above.
+const BACKDROP: Backdrop = Backdrop {
+    base: [0.028, 0.026, 0.060],
+    dither: 0.012,
+    nebula: None,
+};
+
+/// Paint the space backdrop: the navy ground plus a faint hashed starfield
+/// anchored in screen space, scrolling at a slow pan-parallax tied to the camera.
 fn paint_background(out: &mut [u8], w: u32, h: u32, cam: &Camera, seed: u32) {
-    // Pass 1: flat navy base.
-    for iy in 0..h {
-        for ix in 0..w {
-            let d = bayer(ix, iy) * 0.012;
-            let idx = ((iy * w + ix) * 4) as usize;
-            out[idx] = (clamp01(0.028 + d) * 255.0) as u8;
-            out[idx + 1] = (clamp01(0.026 + d) * 255.0) as u8;
-            out[idx + 2] = (clamp01(0.060 + d) * 255.0) as u8;
-            out[idx + 3] = 255;
-        }
-    }
-
-    // Pass 2: two star layers scrolled at a slow pan-parallax rate.
-    let si = seed as i32;
     let (bgx, bgy) = (cam.x * cam.zoom, cam.y * cam.zoom);
-    let (wi, hi) = (w as i32, h as i32);
-    // (parallax p, screen grid px, threshold, brightness, salt)
-    let layers: [(f32, f32, f32, f32, i32); 2] = [
-        (0.12, 7.0, 0.86, 0.55, 0),  // far — dim
-        (0.30, 10.0, 0.88, 0.90, 1), // near — brighter
-    ];
-    for (p, sp, thr, bri, salt) in layers {
-        let inv = 1.0 / sp;
-        let (ox, oy) = (bgx * p, bgy * p);
-        let (c0x, c1x) = ((ox * inv).floor() as i32 - 1, ((ox + w as f32) * inv).floor() as i32 + 1);
-        let (c0y, c1y) = ((oy * inv).floor() as i32 - 1, ((oy + h as f32) * inv).floor() as i32 + 1);
-        for cy in c0y..=c1y {
-            for cx in c0x..=c1x {
-                let hh = hash3(cx.wrapping_add(si), cy, 17 + salt);
-                if hh <= thr {
-                    continue;
-                }
-                let jx = (hh * 137.0).fract();
-                let jy = (hh * 71.3 + 0.37).fract();
-                let px = ((cx as f32 + jx) * sp - ox).floor() as i32;
-                let py = ((cy as f32 + jy) * sp - oy).floor() as i32;
-                if px < 0 || py < 0 || px >= wi || py >= hi {
-                    continue;
-                }
-                let tt = (hh - thr) / (1.0 - thr);
-                let s = bri * (0.5 + 0.5 * tt);
-                let col = star_tint((hh * 313.0).fract());
-                add_px(out, w, px as u32, py as u32, [col[0] * s, col[1] * s, col[2] * s]);
-            }
-        }
-    }
+    paint_backdrop(out, w, h, &BACKDROP, seed, bgx, bgy, 1.0, 0.0, None);
+    let sky = Starfield::new(STAR_LAYERS, STAR_TINTS);
+    // Salt the grid with the seed so each scene gets its own sky.
+    let si = seed as i32;
+    paint_stars(out, w, h, &sky, bgx, bgy, |cx, cy, salt| {
+        hash3(cx.wrapping_add(si), cy, 17 + salt)
+    });
 }
 
 /// Dot in a comet's orbit as a faint dashed ellipse around the star. Samples the

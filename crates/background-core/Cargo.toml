@@ -1,0 +1,18 @@
+[package]
+name = "background-core"
+version = "0.1.0"
+edition = "2021"
+
+# The deep-space backdrop every scene crate paints before its bodies: a dithered
+# navy ground, an optional seeded nebula (baked at low res and cached), and
+# parallax starfields. solar, moon, comet and asteroid each carried their own
+# copy of this; the differences were all constants, so they now live in each
+# crate's config rather than in a second implementation.
+# Dependency-free, so the wasm builds that pull it in stay tiny.
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+noise-core = { path = "../noise-core" }
+dither-core = { path = "../dither-core" }

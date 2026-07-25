@@ -21,13 +21,14 @@ dependencies** (except `render-io`, which is the one that owns `image`):
 | `noise-core` | 3D value-noise, fBm, domain warp, Worley, colour/ramp math. Bottom of everything. |
 | `dither-core` | Bayer ordered dither + level quantization. |
 | `scene-core` | `Camera`, seeded `Rng`, `Tile` + `blit` alpha compositor. |
+| `background-core` | **The** backdrop — dithered ground, optional seeded nebula (baked + cached), parallax star layers. |
 | `planet-core` | **The** planet renderer — 26-type table, sphere shader, weather, rings, moons. |
 | `sun-core` | The compact star tile (granulation + corona). |
 | `wasm-abi` | `alloc`/`dealloc` + opaque-handle macros for the C ABI. |
 | `render-io` | GIF/contact-sheet/poster helpers. The only crate that touches `image`. |
 
 They stack in one direction only — `noise-core` → `dither-core`/`scene-core` →
-`planet-core`/`sun-core`. See the import table in `README.md`.
+`background-core`/`planet-core`/`sun-core`. See the import table in `README.md`.
 
 **Demo crates** — `planet`, `star`, `solar`, `moon`, `comet`, `asteroid`, `bird` —
 all have the same three faces:
@@ -55,6 +56,12 @@ planet looks like. It exposes the same shader in two framings:
 of it. If you find yourself writing a "simpler" planet shader for a new crate,
 add a framing to `planet-core` instead — that duplication has been removed once
 already.
+
+**One backdrop, likewise.** Every scene paints through `background-core`:
+`paint_backdrop` (ground + optional nebula) then `paint_stars`. A new scene crate
+supplies a `Backdrop` and a `Starfield` const and a closure that mixes its seed
+into the star grid — it does not write another star loop. The four that existed
+differed only in constants, which is how they silently drifted apart.
 
 **Demo crates never depend on each other.** They are cdylibs whose `#[no_mangle]`
 exports (`render`, `alloc`, `dealloc`, …) collide at link time in the wasm build.

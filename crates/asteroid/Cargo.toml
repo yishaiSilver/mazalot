@@ -19,6 +19,8 @@ crate-type = ["rlib", "cdylib"]
 noise-core = { path = "../noise-core" }
 dither-core = { path = "../dither-core" }
 scene-core = { path = "../scene-core" }
+# The shared deep-space backdrop (ground + parallax stars).
+background-core = { path = "../background-core" }
 image = { version = "0.25", default-features = false, features = ["png", "gif"], optional = true }
 # Shared C-ABI glue (macros + tiny helpers). Plain, non-optional dep so it's
 # present in the wasm build too; exports zero C symbols of its own.

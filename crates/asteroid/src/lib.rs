@@ -41,6 +41,9 @@ use noise_core::{clamp01, fbm, hash3, mix, smoothstep, worley, Rgb};
 pub use scene_core::Camera;
 use scene_core::{to_screen, Rng, ORBIT_FLATTEN};
 
+// The shared deep-space backdrop, common to every scene crate.
+use background_core::{paint_backdrop, paint_stars, Backdrop, StarLayer, StarTints, Starfield};
+
 /// Bounded, decorrelated per-rock noise offsets — the belt uses a 220-unit span
 /// (small enough that f32 precision holds and the noise doesn't collapse).
 fn seed_offsets(seed: u32) -> [f32; 3] {
@@ -240,82 +243,43 @@ fn belt_density(rn: f32, gaps: &[(f32, f32); 3]) -> f32 {
 // Background
 // ===========================================================================
 
-/// Star colour by a hash in [0,1): mostly pale/blue-white, a few warm, rare cyan.
-fn star_tint(hh: f32) -> Rgb {
-    if hh < 0.48 {
-        [0.90, 0.93, 1.00]
-    } else if hh < 0.68 {
-        [0.72, 0.82, 1.00]
-    } else if hh < 0.84 {
-        [1.00, 0.95, 0.78]
-    } else if hh < 0.95 {
-        [1.00, 0.82, 0.62]
-    } else {
-        [0.74, 1.00, 0.96]
-    }
-}
+/// This belt's sky: mostly pale/blue-white, a few warm, rare cyan.
+const STAR_TINTS: StarTints = &[
+    (0.48, [0.90, 0.93, 1.00]),
+    (0.68, [0.72, 0.82, 1.00]),
+    (0.84, [1.00, 0.95, 0.78]),
+    (0.95, [1.00, 0.82, 0.62]),
+    (1.01, [0.74, 1.00, 0.96]),
+];
 
-/// Paint the space background: a dark navy base plus two screen-space star
-/// layers that scroll on **pan** only (never on zoom — so a star can't outrun
-/// the belt). `bgx`/`bgy` are the accumulated screen-space camera pan; each
-/// layer is a fixed pixel grid, one 1px star per visible cell — O(cells), the
-/// same cheap cell-plot loop `solar` uses for its starfield.
+/// Two parallax layers, scrolling on **pan** only — never on zoom, so a star
+/// can't appear to outrun the belt.
+const STAR_LAYERS: &[StarLayer] = &[
+    StarLayer { parallax: 0.18, spacing: 7.0, threshold: 0.82, brightness: 0.60, faint: 0.5, salt: 0 },
+    StarLayer { parallax: 0.36, spacing: 10.0, threshold: 0.86, brightness: 0.95, faint: 0.5, salt: 1 },
+];
+
+/// Flat dark navy, no nebula: the belt is the subject and the rocks read best
+/// against an unbusy ground. Authored as the exact bytes (8, 7, 17).
+const BACKDROP: Backdrop = Backdrop {
+    base: [8.0 / 255.0, 7.0 / 255.0, 17.0 / 255.0],
+    dither: 0.0,
+    nebula: None,
+};
+
+/// Paint the space background: the navy ground plus the parallax starfield.
+/// `bgx`/`bgy` are the accumulated screen-space camera pan.
 fn paint_background(out: &mut [u8], w: u32, h: u32, seed: u32, density: f32, bgx: f32, bgy: f32) {
-    // --- base navy ---
-    for iy in 0..h {
-        for ix in 0..w {
-            let idx = ((iy * w + ix) * 4) as usize;
-            out[idx] = 8;
-            out[idx + 1] = 7;
-            out[idx + 2] = 17;
-            out[idx + 3] = 255;
-        }
-    }
-
-    let d = density.max(0.0);
-    if d <= 0.001 {
+    paint_backdrop(out, w, h, &BACKDROP, seed, bgx, bgy, 1.0, 0.0, None);
+    if density.max(0.0) <= 0.001 {
         return;
     }
-    // (parallax p, screen grid px, base threshold, brightness, salt)
-    let layers: [(f32, f32, f32, f32, i32); 2] = [
-        (0.18, 7.0, 0.82, 0.60, 0), // far — slow, dim
-        (0.36, 10.0, 0.86, 0.95, 1), // near — more parallax, brighter
-    ];
-    let (wi, hi) = (w as i32, h as i32);
-    // Salt the star hash with the belt seed so each belt gets its own sky.
-    let sky = seed as i32;
-    for (p, sp, base_thr, bri, salt) in layers {
-        let thr = 1.0 - (1.0 - base_thr) * d;
-        if thr >= 0.9999 {
-            continue;
-        }
-        let inv = 1.0 / sp;
-        let (ox, oy) = (bgx * p, bgy * p);
-        let (c0x, c1x) = ((ox * inv).floor() as i32 - 1, ((ox + w as f32) * inv).floor() as i32 + 1);
-        let (c0y, c1y) = ((oy * inv).floor() as i32 - 1, ((oy + h as f32) * inv).floor() as i32 + 1);
-        for cy in c0y..=c1y {
-            for cx in c0x..=c1x {
-                let hh = hash3(cx, cy, sky.wrapping_add(17 + salt));
-                if hh <= thr {
-                    continue;
-                }
-                let jx = (hh * 137.0).fract(); // jitter across the cell, [0,1)
-                let jy = (hh * 71.3 + 0.37).fract();
-                let px = ((cx as f32 + jx) * sp - ox).floor() as i32;
-                let py = ((cy as f32 + jy) * sp - oy).floor() as i32;
-                if px < 0 || py < 0 || px >= wi || py >= hi {
-                    continue;
-                }
-                let t = (hh - thr) / (1.0 - thr);
-                let s = bri * (0.5 + 0.5 * t);
-                let col = star_tint((hh * 313.0).fract());
-                let idx = ((py as u32 * w + px as u32) * 4) as usize;
-                out[idx] = (clamp01(out[idx] as f32 / 255.0 + s * col[0]) * 255.0) as u8;
-                out[idx + 1] = (clamp01(out[idx + 1] as f32 / 255.0 + s * col[1]) * 255.0) as u8;
-                out[idx + 2] = (clamp01(out[idx + 2] as f32 / 255.0 + s * col[2]) * 255.0) as u8;
-            }
-        }
-    }
+    let sky = Starfield { density, ..Starfield::new(STAR_LAYERS, STAR_TINTS) };
+    // Salt the star hash with the belt seed, so each belt gets its own sky.
+    let belt = seed as i32;
+    paint_stars(out, w, h, &sky, bgx, bgy, |cx, cy, salt| {
+        hash3(cx, cy, belt.wrapping_add(17 + salt))
+    });
 }
 
 /// A faint central focus marker: a small additive blue-grey glow at the empty

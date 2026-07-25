@@ -26,6 +26,7 @@ a `--no-default-features` wasm build never sees `image`/`rand` and stays tiny.
 | `noise-core` | 3D value-noise + fBm + domain warp + Worley, and the color/ramp math. The bottom of everything. |
 | `dither-core` | Bayer ordered dithering and level quantization — the pixel-art output stage. |
 | `scene-core` | The scene-compositor kit: draggable `Camera`, seeded `Rng`, and the `Tile` + `blit` alpha compositor. |
+| `background-core` | Everything a scene paints *before* its bodies: the dithered navy ground, an optional seeded **nebula** (baked at low res and cached), and **parallax star layers**. |
 | `planet-core` | **The** planet renderer — the only one in the workspace. The 26-type table, sphere shading, weather, rings, moons. One shader, two framings: a *hero* square frame (`render_rgba`) and a *scene sprite tile* (`render_tile`). `planet`, `solar` and `moon` are all framings of it. |
 | `sun-core` | The compact star tile (granulation + corona) used by `solar` and `comet`. |
 | `wasm-abi` | The raw C-ABI glue: `alloc`/`dealloc` and opaque-handle macros. Exports no symbols itself. |
@@ -49,28 +50,30 @@ a `--no-default-features` wasm build never sees `image`/`rand` and stays tiny.
 ● declared in that crate's `Cargo.toml` · ○ pulled in transitively · `render-io` is
 always behind the `native` feature, so the wasm build never sees it.
 
-| library crate | lines | planet | star | solar | moon | comet | asteroid |
-|---------------|------:|:------:|:----:|:-----:|:----:|:-----:|:--------:|
-| `noise-core`  |   146 |   ○    |  ●   |   ●   |  ●   |   ●   |    ●     |
-| `dither-core` |    31 |   ○    |  ●   |   ●   |  ●   |   ●   |    ●     |
-| `scene-core`  |   130 |   ○    |  ·   |   ●   |  ●   |   ●   |    ●     |
-| `planet-core` |   815 |   ●    |  ·   |   ●   |  ●   |   ·   |    ·     |
-| `sun-core`    |   124 |   ·    |  ·   |   ●   |  ·   |   ●   |    ·     |
-| `wasm-abi`    |    87 |   ●    |  ●   |   ●   |  ●   |   ●   |    ●     |
-| `render-io`   |   188 |   ●    |  ●   |   ●   |  ●   |   ●   |    ●     |
-| **`lib.rs`**  |       | **18** | 567  |  907  | 529  |  587  |   526    |
-| **`wasm.rs`** |       |   93   |  58  |  166  |  76  |   79  |    71    |
+| library crate      | lines | planet | star | solar | moon | comet | asteroid |
+|--------------------|------:|:------:|:----:|:-----:|:----:|:-----:|:--------:|
+| `noise-core`       |   146 |   ○    |  ●   |   ●   |  ●   |   ●   |    ●     |
+| `dither-core`      |    31 |   ○    |  ●   |   ○   |  ●   |   ●   |    ●     |
+| `scene-core`       |   130 |   ○    |  ·   |   ●   |  ●   |   ●   |    ●     |
+| `background-core`  |   365 |   ·    |  ·   |   ●   |  ●   |   ●   |    ●     |
+| `planet-core`      |   815 |   ●    |  ·   |   ●   |  ●   |   ·   |    ·     |
+| `sun-core`         |   124 |   ·    |  ·   |   ●   |  ·   |   ●   |    ·     |
+| `wasm-abi`         |    87 |   ●    |  ●   |   ●   |  ●   |   ●   |    ●     |
+| `render-io`        |   188 |   ●    |  ●   |   ●   |  ●   |   ●   |    ●     |
+| **`lib.rs`**       |       | **18** | 567  |  767  | 503  |  557  |   490    |
+| **`wasm.rs`**      |       |   93   |  58  |  166  |  76  |   79  |    71    |
 
-The library layer is 7 crates / 1,521 lines and stacks in one direction only:
+The library layer is 8 crates / 1,886 lines and stacks in one direction only:
 
 ```
-                        render-io ──── image (the only third-party dep)
-                        wasm-abi  ──── (nothing)
+                          render-io ──── image (the only third-party dep)
+                          wasm-abi  ──── (nothing)
 
-noise-core ──┬── dither-core ──┐
-             │                 ├── planet-core ── planet, solar, moon
-             └── scene-core ───┤
-                               └── sun-core ───── solar, comet
+noise-core ──┬── dither-core ──┬── background-core ── solar, moon, comet, asteroid
+             │                 │
+             └── scene-core ───┼── planet-core ────── planet, solar, moon
+                               │
+                               └── sun-core ───────── solar, comet
 ```
 
 `planet` is 18 lines because it is a face over `planet-core` — the same rlib `solar`
@@ -150,8 +153,9 @@ new work here is the layer on top:
 - **Draggable camera** — a world→screen camera; drag to pan, zoom about the
   viewport centre (keeps the scene + parallax anchored no matter where you've
   panned).
-- **Space background** — a faint seed-colored **nebula** (baked at low res each
-  frame → pixel-art clouds) plus three **parallax** star layers with temperature
+- **Space background** — `background-core`, shared with moon/comet/asteroid: a
+  faint seed-colored **nebula** (baked at low res → pixel-art clouds) plus three
+  **parallax** star layers with temperature
   colors. Each layer is a fixed *screen-space* grid scrolled by the camera's
   **accumulated screen-space pan** (Δcam·zoom summed over time) at a fraction `p`
   of the foreground — so on **pan** the stars always move slower than the system
@@ -344,6 +348,10 @@ So it's cached in **three nested layers**, each keyed on what changes it:
   base-fill + composite.
 - **Whole backdrop** (`render_system_cached`) — a still camera skips even the
   star overlay: the entire backdrop is one `memcpy`, only bodies re-render.
+
+The first two layers live in `background_core::BackdropCache`, so any scene that
+grows a nebula inherits them; the third is solar's, since it also caches the
+orbit paths.
 
 **Bodies** — with the background cached, bodies dominated, and the star's
 convection/corona shader (27-cell worley + fBm per pixel over a large tile) was

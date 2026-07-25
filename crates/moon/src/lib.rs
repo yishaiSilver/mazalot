@@ -40,6 +40,9 @@ use dither_core::bayer;
 use noise_core::{clamp01, contrast, fbm, hash3, mix, smoothstep, worley, Rgb};
 use scene_core::{blit, to_screen, Rng, Tile, ORBIT_FLATTEN};
 
+// The shared deep-space backdrop, common to every scene crate.
+use background_core::{paint_backdrop, paint_stars, Backdrop, StarLayer, StarTints, Starfield};
+
 // `Camera` is part of this crate's public API (its bin and wasm face import it as
 // `moon::Camera` / `crate::Camera`), so re-export scene-core's — a plain `pub use`
 // also brings it into scope for the lib below.
@@ -403,63 +406,34 @@ fn render_moon_tile(mk: &MoonKind, seed: u32, spin_a: f32, _t: f32, rad_px: f32)
 // Scene compositor
 // ===========================================================================
 
-/// Star colour by a hash in [0,1): mostly pale/blue-white, a few warm.
-fn star_tint(hh: f32) -> Rgb {
-    if hh < 0.5 {
-        [0.92, 0.95, 1.00]
-    } else if hh < 0.72 {
-        [0.72, 0.83, 1.00]
-    } else if hh < 0.9 {
-        [1.00, 0.96, 0.78]
-    } else {
-        [1.00, 0.82, 0.60]
-    }
-}
+/// This scene's sky: mostly pale/blue-white, a few warm.
+const STAR_TINTS: StarTints = &[
+    (0.50, [0.92, 0.95, 1.00]),
+    (0.72, [0.72, 0.83, 1.00]),
+    (0.90, [1.00, 0.96, 0.78]),
+    (1.01, [1.00, 0.82, 0.60]),
+];
 
-/// Paint the dark space backdrop plus a faint, fixed starfield. The field is a
-/// static screen-space grid keyed by the system seed (this scene doesn't pan),
-/// plotted one 1px star per hit cell — O(cells), cheap.
+/// One static layer: this scene has a fixed camera, so there is no pan to be
+/// parallax *for*, and a single grid keyed by the seed is the whole sky.
+const STAR_LAYERS: &[StarLayer] = &[
+    StarLayer { parallax: 0.0, spacing: 9.0, threshold: 0.86, brightness: 1.0, faint: 0.45, salt: 0 },
+];
+
+/// Dithered navy, no nebula: the parent planet fills the frame, so the backdrop
+/// stays flat behind it.
+const BACKDROP: Backdrop = Backdrop {
+    base: [0.028, 0.026, 0.060],
+    dither: 0.010,
+    nebula: None,
+};
+
+/// Paint the dark space backdrop plus a faint, fixed starfield.
 fn paint_background(out: &mut [u8], w: u32, h: u32, seed: u32) {
-    // Base navy fill with an ordered-dither so the flat field still reads as
-    // pixel-art rather than a dead block.
-    for iy in 0..h {
-        for ix in 0..w {
-            let d = bayer(ix, iy) * 0.010;
-            let idx = ((iy * w + ix) * 4) as usize;
-            out[idx] = (clamp01(0.028 + d) * 255.0) as u8;
-            out[idx + 1] = (clamp01(0.026 + d) * 255.0) as u8;
-            out[idx + 2] = (clamp01(0.060 + d) * 255.0) as u8;
-            out[idx + 3] = 255;
-        }
-    }
-
-    // Starfield: a fixed grid; ~1 in 7 cells lights up.
+    paint_backdrop(out, w, h, &BACKDROP, seed, 0.0, 0.0, 1.0, 0.0, None);
+    let sky = Starfield::new(STAR_LAYERS, STAR_TINTS);
     let salt = seed as i32 ^ 0x51ed;
-    let sp = 9.0f32; // grid spacing, px
-    let inv = 1.0 / sp;
-    let (wi, hi) = (w as i32, h as i32);
-    let (c1x, c1y) = ((w as f32 * inv) as i32 + 1, (h as f32 * inv) as i32 + 1);
-    for cy in 0..=c1y {
-        for cx in 0..=c1x {
-            let hh = hash3(cx, cy, salt);
-            if hh <= 0.86 {
-                continue;
-            }
-            let jx = (hh * 137.0).fract();
-            let jy = (hh * 71.3 + 0.37).fract();
-            let px = ((cx as f32 + jx) * sp).floor() as i32;
-            let py = ((cy as f32 + jy) * sp).floor() as i32;
-            if px < 0 || py < 0 || px >= wi || py >= hi {
-                continue;
-            }
-            let s = 0.45 + 0.55 * (hh - 0.86) / 0.14;
-            let col = star_tint((hh * 313.0).fract());
-            let idx = ((py as u32 * w + px as u32) * 4) as usize;
-            out[idx] = (clamp01(out[idx] as f32 / 255.0 + s * col[0]) * 255.0) as u8;
-            out[idx + 1] = (clamp01(out[idx + 1] as f32 / 255.0 + s * col[1]) * 255.0) as u8;
-            out[idx + 2] = (clamp01(out[idx + 2] as f32 / 255.0 + s * col[2]) * 255.0) as u8;
-        }
-    }
+    paint_stars(out, w, h, &sky, 0.0, 0.0, |cx, cy, _| hash3(cx, cy, salt));
 }
 
 /// Dot in a moon's orbit path as a faint dashed ellipse around the parent.
