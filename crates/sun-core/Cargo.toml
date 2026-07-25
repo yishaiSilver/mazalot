@@ -1,0 +1,15 @@
+[package]
+name = "sun-core"
+version = "0.1.0"
+edition = "2021"
+
+# Compact "lite" star renderer shared across the scene crates.
+# Dependency-free apart from the other *-core crates.
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+noise-core = { path = "../noise-core" }
+dither-core = { path = "../dither-core" }
+scene-core = { path = "../scene-core" }

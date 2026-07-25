@@ -1,0 +1,14 @@
+[package]
+name = "scene-core"
+version = "0.1.0"
+edition = "2021"
+
+# Shared scene-compositor primitives (Camera, seeded Rng, Tile + blit,
+# ORBIT_FLATTEN) for the crates that render a camera over many bodies:
+# solar, moon, comet, asteroid. Dependency-free apart from noise-core.
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+noise-core = { path = "../noise-core" }

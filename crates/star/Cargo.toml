@@ -7,19 +7,31 @@ edition = "2021"
 #   • lib.rs   — pure per-pixel star-render math (rlib + cdylib)
 #   • wasm.rs  — C-ABI wrapper over the lib, wasm32 only
 #   • bin/*    — native GIF/PNG generator (the `native` feature)
-# Fully self-contained: carries its own noise/color/dither primitives so it
-# shares no code with `planet` — only third-party deps and the workspace manifest.
-# The pure render path uses NO deps, so the wasm build stays tiny.
+# Shares its noise/color/dither primitives with the sibling crates via the
+# dependency-free `noise-core`/`dither-core` rlibs (they used to be copy-pasted
+# in here). Because those shared crates carry no third-party deps, the wasm build
+# (`--no-default-features`) stays tiny.
 
 [lib]
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+# Shared, dependency-free rlibs holding the noise/color/dither primitives that
+# used to be copy-pasted into this crate. Plain (non-optional) deps so they are
+# present in the wasm build too.
+noise-core = { path = "../noise-core" }
+dither-core = { path = "../dither-core" }
 image = { version = "0.25", default-features = false, features = ["png", "gif"], optional = true }
+# Shared C-ABI glue (macros expand in-crate; exports no C symbols itself, so the
+# wasm export set is unchanged). Plain dep so it's present in the wasm build too.
+wasm-abi = { path = "../wasm-abi" }
+# Shared native GIF/PNG orchestration; only the `native` feature pulls it in, so
+# the wasm build never sees it (nor its `image` dep).
+render-io = { path = "../render-io", optional = true }
 
 [features]
 default = ["native"]
-native = ["dep:image"]
+native = ["dep:image", "dep:render-io"]
 
 [[bin]]
 name = "sun"

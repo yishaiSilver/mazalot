@@ -8,41 +8,18 @@
 //!   3. `render(belt, buf, w, h, cam_x, cam_y, zoom, t)` -> fills RGBA
 //!   4. read the bytes from `memory.buffer`, draw to the canvas
 //!   5. `belt_free(belt)` / `dealloc(buf, len)` when done
+//!
+//! The byte-identical `alloc`/`dealloc` pair and the opaque-handle
+//! `new`/`new_params`/`free` trio come from the shared `wasm-abi` macros so this
+//! file only carries the belt-specific accessors, view setter, and render body.
 
 use crate::{Belt, Camera};
-use std::slice;
 
-/// Allocate `len` bytes in wasm memory and hand the pointer to JS.
-#[no_mangle]
-pub extern "C" fn alloc(len: usize) -> *mut u8 {
-    let mut v = Vec::<u8>::with_capacity(len);
-    let ptr = v.as_mut_ptr();
-    std::mem::forget(v);
-    ptr
-}
+// `alloc` + `dealloc` — the pixel-buffer allocator pair.
+wasm_abi::alloc_dealloc!();
 
-/// Free a buffer previously returned by `alloc`.
-#[no_mangle]
-pub extern "C" fn dealloc(ptr: *mut u8, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            drop(Vec::from_raw_parts(ptr, len, len));
-        }
-    }
-}
-
-/// Generate the belt for `seed` and hand back an opaque pointer.
-#[no_mangle]
-pub extern "C" fn belt_new(seed: u32) -> *mut Belt {
-    Box::into_raw(Box::new(Belt::generate(seed)))
-}
-
-/// Generate a belt for `seed`, forcing the rock count when `count > 0`
-/// (0 = the seed-derived ~380..700). Opaque pointer, freed with [`belt_free`].
-#[no_mangle]
-pub extern "C" fn belt_new_params(seed: u32, count: u32) -> *mut Belt {
-    Box::into_raw(Box::new(Belt::generate_n(seed, count)))
-}
+// `belt_new(seed)` / `belt_new_params(seed, count)` / `belt_free(ptr)`.
+wasm_abi::opaque_handle!(Belt, belt_new, belt_new_params, belt_free);
 
 /// Set the live view multipliers (belt spacing, rock size, star density) and the
 /// central-marker toggle. These rescale the existing belt without regenerating
@@ -57,16 +34,6 @@ pub extern "C" fn belt_set_view(
 ) {
     let belt = unsafe { &mut *belt };
     belt.set_view(spacing, rock_size, star_density, show_center != 0);
-}
-
-/// Free a belt previously returned by [`belt_new`].
-#[no_mangle]
-pub extern "C" fn belt_free(ptr: *mut Belt) {
-    if !ptr.is_null() {
-        unsafe {
-            drop(Box::from_raw(ptr));
-        }
-    }
 }
 
 /// Render the belt into the RGBA buffer at `buf` (must be >= w*h*4 bytes) at
@@ -84,7 +51,7 @@ pub extern "C" fn render(
     t: f32,
 ) {
     let belt = unsafe { &*belt };
-    let out = unsafe { slice::from_raw_parts_mut(buf, (w * h * 4) as usize) };
+    let out = unsafe { wasm_abi::out_rgba(buf, w, h) };
     let cam = Camera { x: cam_x, y: cam_y, zoom };
     crate::render_belt(belt, w, h, &cam, t, out);
 }

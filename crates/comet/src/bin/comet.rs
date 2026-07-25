@@ -3,29 +3,17 @@
 //! anti-sunward) plus framed poster PNGs across seeds.
 //!
 //! All orbit + tail math lives in the `comet` crate (shared with the web/WASM
-//! build). This file is only the `image`-crate orchestration — the same spirit
-//! as `solar`'s native bin, self-contained in `comet`.
+//! build). The `image`-crate orchestration (GIF/PNG encoding, fit-zoom) is the
+//! shared `render-io` helper; this file only owns the per-frame render call and
+//! the crate's `Camera`, which `render-io` never sees.
 
 use comet::{star_kind_name, Camera, CometScene};
-use image::codecs::gif::{GifEncoder, Repeat};
-use image::{Delay, Frame, RgbaImage};
-use std::fs::File;
-
-/// Render one scene frame straight into an `RgbaImage`.
-fn frame(scene: &CometScene, w: u32, h: u32, cam: &Camera, t: f32) -> RgbaImage {
-    let mut buf = vec![0u8; (w * h * 4) as usize];
-    scene.render(w, h, cam, t, &mut buf);
-    RgbaImage::from_raw(w, h, buf).expect("buffer size matches")
-}
 
 /// Zoom that fits the whole orbit into a `w`x`h` viewport with margin. Orbits
 /// are squashed vertically (~0.42), so height is the tighter axis by only a
 /// little; fit against the smaller half-span with a comfortable margin.
 fn fit_zoom(scene: &CometScene, w: u32, h: u32) -> f32 {
-    let ext = scene.extent();
-    let halfw = w as f32 * 0.5 * 0.9;
-    let halfh = h as f32 * 0.5 * 0.9;
-    (halfw / ext).min(halfh / (ext * 0.6))
+    render_io::fit_zoom(scene.extent(), w, h, 0.9, 0.6)
 }
 
 /// A GIF of the comet(s) sweeping a full orbit under a fixed, fitted camera —
@@ -36,15 +24,11 @@ fn write_orbit_gif(path: &str, seed: u32, w: u32, h: u32, frames: usize) -> Resu
     let cam = Camera { x: 0.0, y: 0.0, zoom: fit_zoom(&scene, w, h) };
     // One full period of the primary comet, so the animation loops perfectly.
     let span = scene.comets.first().map(|c| c.period).unwrap_or(12.0);
-    let file = File::create(path)?;
-    let mut enc = GifEncoder::new(file);
-    enc.set_repeat(Repeat::Infinite)?;
-    for f in 0..frames {
-        let t = span * f as f32 / frames as f32;
-        let img = frame(&scene, w, h, &cam, t);
-        enc.encode_frame(Frame::from_parts(img, 0, 0, Delay::from_numer_denom_ms(70, 1)))?;
-    }
-    Ok(())
+    render_io::write_orbit_gif(path, w, h, frames, span, 70, |w, h, t| {
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        scene.render(w, h, &cam, t, &mut buf);
+        buf
+    })
 }
 
 /// A framed poster still, timed near perihelion so the tail is at its longest.
@@ -54,7 +38,11 @@ fn write_poster(path: &str, seed: u32, w: u32, h: u32) -> Result<(), Box<dyn std
     // Perihelion happens when mean anomaly ≡ 0, i.e. t·(2π/period) = −phase.
     let c = &scene.comets[0];
     let t_peri = (-c.phase / std::f32::consts::TAU) * c.period + c.period; // first peri >= 0
-    frame(&scene, w, h, &cam, t_peri).save(path)?;
+    render_io::write_poster(path, w, h, t_peri, |w, h, t| {
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        scene.render(w, h, &cam, t, &mut buf);
+        buf
+    })?;
     // Report what the seed produced.
     println!(
         "  seed {seed}: {} + {} comet(s), e[0]={:.2}, peri/aph={:.0}/{:.0}",

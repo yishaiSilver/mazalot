@@ -7,20 +7,33 @@ edition = "2021"
 #   • lib.rs   — pure system-render math (rlib for the bin, cdylib for wasm)
 #   • wasm.rs  — a thin C-ABI wrapper over the lib, compiled only for wasm32
 #   • bin/*    — native GIF/PNG generator (needs `image`, the `native` feature)
-# Fully self-contained: carries its own noise/color/tile-render primitives so it
-# shares no code with `planet` or `star` — only third-party deps and the
-# workspace manifest. The pure render path uses NO deps, so the wasm build
-# (`--no-default-features`) stays tiny.
+# Shares its noise/color primitives and its star + planet tile renderers with the
+# sibling crates via the dependency-free `noise-core`/`dither-core`/`scene-core`/
+# `sun-core`/`body-core` rlibs (they used to be copy-pasted in here). Because those
+# shared crates carry no third-party deps, the wasm build (`--no-default-features`)
+# stays tiny.
 
 [lib]
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
-image = { version = "0.25", default-features = false, features = ["png", "gif"], optional = true }
+# Shared, dependency-free primitive rlibs. Plain (non-optional) deps so they're
+# present in the wasm build too — the pure render path stays tiny.
+noise-core = { path = "../noise-core" }
+dither-core = { path = "../dither-core" }
+scene-core = { path = "../scene-core" }
+sun-core = { path = "../sun-core" }
+body-core = { path = "../body-core" }
+# Raw C-ABI glue for wasm.rs. Plain (non-optional) dep — it exports no C symbols
+# itself, so the wasm export set is unchanged; used only under target_arch=wasm32.
+wasm-abi = { path = "../wasm-abi" }
+# Native image-crate orchestration (GIF/PNG). Optional: only the native bin pulls
+# it, so the wasm build (`--no-default-features`) stays tiny.
+render-io = { path = "../render-io", optional = true }
 
 [features]
 default = ["native"]
-native = ["dep:image"]
+native = ["dep:render-io"]
 
 [[bin]]
 name = "solar"

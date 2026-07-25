@@ -1,14 +1,15 @@
 //! asteroid — a procedural, seed-driven **asteroid belt** that slowly revolves.
 //!
-//! Pure math, zero dependencies. Where `solar` renders a whole system (a star
-//! with planets you can drag around), `asteroid` renders one *ring of rubble*:
-//! a drifting annular field of hundreds of small rocks orbiting an empty focus,
-//! squashed vertically for a tilted, near-top-down read (the same `ORBIT_FLATTEN`
-//! trick `solar` uses for its orbits). Same seed => the same belt, forever.
+//! Pure math over the dependency-free `*-core` rlibs. Where `solar` renders a
+//! whole system (a star with planets you can drag around), `asteroid` renders one
+//! *ring of rubble*: a drifting annular field of hundreds of small rocks orbiting
+//! an empty focus, squashed vertically for a tilted, near-top-down read (the same
+//! `ORBIT_FLATTEN` trick `solar` uses for its orbits). Same seed => the same belt,
+//! forever.
 //!
-//! This crate is self-contained by the workspace rule (each "type" crate shares
-//! no code with the others — only third-party deps and the manifest). It carries
-//! its own compact noise/color/dither primitives and its own tiny lit-sprite
+//! This crate leans on the workspace's shared, dependency-free `*-core` rlibs
+//! (`noise-core`/`dither-core` for the compact noise/color/dither primitives,
+//! `scene-core` for the camera + orbit helpers) plus its own tiny lit-sprite
 //! renderer for the few big rocks, tuned to read at the handful-of-pixels scale
 //! a belt view needs. The new work here is the layer on top — a Keplerian-ish
 //! annulus with tasteful Kirkwood density gaps, cheap depth-shaded specks, and a
@@ -28,153 +29,33 @@
 use std::f32::consts::TAU;
 
 // ===========================================================================
-// Noise + math primitives (this crate's own copy — shared with nobody)
+// Shared primitives (noise-core / dither-core) — see the workspace manifest.
 // ===========================================================================
 
-fn hash3(x: i32, y: i32, z: i32) -> f32 {
-    // Murmur3-style bit mixer -> well-distributed, mean ~0.5.
-    let mut h = (x as u32).wrapping_mul(0x8da6_b343)
-        ^ (y as u32).wrapping_mul(0xd816_3841)
-        ^ (z as u32).wrapping_mul(0xcb1a_b31f);
-    h ^= h >> 16;
-    h = h.wrapping_mul(0x7feb_352d);
-    h ^= h >> 15;
-    h = h.wrapping_mul(0x846c_a68b);
-    h ^= h >> 16;
-    (h as f32) / (u32::MAX as f32)
-}
+use dither_core::bayer;
+use noise_core::{clamp01, fbm, hash3, mix, smoothstep, worley, Rgb};
 
-fn smoother(t: f32) -> f32 {
-    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
-}
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
-}
+// Shared scene-compositor primitives (camera, world→screen, seeded RNG, tilt).
+// Camera is re-exported because it's part of this crate's public API (wasm.rs /
+// the native bin reference `asteroid::Camera`).
+pub use scene_core::Camera;
+use scene_core::{to_screen, Rng, ORBIT_FLATTEN};
 
-fn value_noise(x: f32, y: f32, z: f32) -> f32 {
-    let (xi, yi, zi) = (x.floor(), y.floor(), z.floor());
-    let (xf, yf, zf) = (x - xi, y - yi, z - zi);
-    let (xi, yi, zi) = (xi as i32, yi as i32, zi as i32);
-    let (u, v, w) = (smoother(xf), smoother(yf), smoother(zf));
-    let c = |dx: i32, dy: i32, dz: i32| hash3(xi + dx, yi + dy, zi + dz);
-    let x00 = lerp(c(0, 0, 0), c(1, 0, 0), u);
-    let x10 = lerp(c(0, 1, 0), c(1, 1, 0), u);
-    let x01 = lerp(c(0, 0, 1), c(1, 0, 1), u);
-    let x11 = lerp(c(0, 1, 1), c(1, 1, 1), u);
-    lerp(lerp(x00, x10, v), lerp(x01, x11, v), w)
-}
-
-fn fbm(mut x: f32, mut y: f32, mut z: f32, octaves: u32) -> f32 {
-    let (mut sum, mut amp, mut norm) = (0.0, 0.5, 0.0);
-    for _ in 0..octaves {
-        sum += amp * value_noise(x, y, z);
-        norm += amp;
-        amp *= 0.5;
-        x *= 2.0;
-        y *= 2.0;
-        z *= 2.0;
-    }
-    sum / norm
-}
-
-/// 3D Worley F1: distance to the nearest hashed feature point (~[0, 1]). Gives
-/// the big rocks their crater pits.
-fn worley(x: f32, y: f32, z: f32) -> f32 {
-    let (fx, fy, fz) = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
-    let mut f1 = 9.0f32;
-    for dz in -1..=1 {
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                let (cx, cy, cz) = (fx + dx, fy + dy, fz + dz);
-                let ox = hash3(cx, cy, cz);
-                let oy = hash3(cx + 911, cy + 733, cz + 512);
-                let oz = hash3(cx + 271, cy + 619, cz + 188);
-                let (px, py, pz) = (cx as f32 + ox, cy as f32 + oy, cz as f32 + oz);
-                let d = ((px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2)).sqrt();
-                f1 = f1.min(d);
-            }
-        }
-    }
-    f1
-}
-
-type Rgb = [f32; 3];
-
-fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
-    [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)]
-}
-fn clamp01(x: f32) -> f32 {
-    x.max(0.0).min(1.0)
-}
-fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
-    let t = clamp01((x - e0) / (e1 - e0));
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// Bounded, decorrelated per-rock noise offsets — keep them small so f32
-/// precision holds and the surface noise doesn't collapse into bands.
+/// Bounded, decorrelated per-rock noise offsets — the belt uses a 220-unit span
+/// (small enough that f32 precision holds and the noise doesn't collapse).
 fn seed_offsets(seed: u32) -> [f32; 3] {
-    [
-        hash3(seed as i32, 1, 7) * 220.0 + 4.0,
-        hash3(seed as i32, 2, 7) * 220.0 + 4.0,
-        hash3(seed as i32, 3, 7) * 220.0 + 4.0,
-    ]
-}
-
-/// Tiny deterministic RNG for belt generation (SplitMix-ish over hash3).
-struct Rng {
-    seed: i32,
-    ctr: i32,
-}
-impl Rng {
-    fn new(seed: u32) -> Rng {
-        Rng { seed: seed as i32, ctr: 0 }
-    }
-    fn f(&mut self) -> f32 {
-        self.ctr = self.ctr.wrapping_add(1);
-        hash3(self.seed, self.ctr, 0x9e37)
-    }
-    /// Uniform in [lo, hi).
-    fn range(&mut self, lo: f32, hi: f32) -> f32 {
-        lo + (hi - lo) * self.f()
-    }
-    fn below(&mut self, p: f32) -> bool {
-        self.f() < p
-    }
-}
-
-// ===========================================================================
-// Ordered dither (Bayer + quantize) — the crisp pixel-art read
-// ===========================================================================
-
-/// 8x8 Bayer matrix; `bayer()` maps it into a −0.5..0.5 ordered-dither offset.
-const BAYER: [u8; 64] = [
-    0, 32, 8, 40, 2, 34, 10, 42, 48, 16, 56, 24, 50, 18, 58, 26, 12, 44, 4, 36, 14, 46,
-    6, 38, 60, 28, 52, 20, 62, 30, 54, 22, 3, 35, 11, 43, 1, 33, 9, 41, 51, 19, 59, 27,
-    49, 17, 57, 25, 15, 47, 7, 39, 13, 45, 5, 37, 63, 31, 55, 23, 61, 29, 53, 21,
-];
-fn bayer(x: u32, y: u32) -> f32 {
-    (BAYER[((y % 8) * 8 + (x % 8)) as usize] as f32 + 0.5) / 64.0 - 0.5
+    noise_core::seed_offsets(seed, 220.0)
 }
 
 /// Ordered-dither quantize to kill banding while staying crisp under motion.
+/// The belt uses 22 levels; the shared 8x8 Bayer path lives in `dither-core`.
 fn quant(o: Rgb, bx: f32) -> Rgb {
-    let levels = 22.0;
-    let d = bx * 0.7 / levels;
-    [
-        clamp01(((o[0] + d) * levels).round() / levels),
-        clamp01(((o[1] + d) * levels).round() / levels),
-        clamp01(((o[2] + d) * levels).round() / levels),
-    ]
+    dither_core::quant(o, bx, 22.0, 0.7)
 }
 
 // ===========================================================================
 // Belt generation
 // ===========================================================================
-
-/// How much the belt is squashed vertically to fake a tilted, near-top-down
-/// view (shared with `solar`'s orbits — the whole workspace tilts the same way).
-const ORBIT_FLATTEN: f32 = 0.42;
 
 /// Fixed off-screen sun direction the big rocks are lit from, in the tile's
 /// screen frame (+x right, +y up, +z toward viewer). Upper-left, angled at the
@@ -353,33 +234,6 @@ fn belt_density(rn: f32, gaps: &[(f32, f32); 3]) -> f32 {
         d *= 1.0 - 0.9 * (-x * x).exp();
     }
     clamp01(d)
-}
-
-// ===========================================================================
-// Camera + world→screen
-// ===========================================================================
-
-/// Camera over the world. `x,y` is the world point shown at the viewport
-/// centre; `zoom` scales world units to pixels (1.0 = 1:1).
-#[derive(Clone, Copy)]
-pub struct Camera {
-    pub x: f32,
-    pub y: f32,
-    pub zoom: f32,
-}
-impl Camera {
-    pub fn centered() -> Camera {
-        Camera { x: 0.0, y: 0.0, zoom: 1.0 }
-    }
-}
-
-/// World → screen for the given viewport.
-#[inline]
-fn to_screen(wx: f32, wy: f32, cam: &Camera, w: u32, h: u32) -> (f32, f32) {
-    (
-        w as f32 * 0.5 + (wx - cam.x) * cam.zoom,
-        h as f32 * 0.5 + (wy - cam.y) * cam.zoom,
-    )
 }
 
 // ===========================================================================

@@ -9,24 +9,8 @@
 
 use std::slice;
 
-/// Allocate `len` bytes in wasm memory and hand the pointer to JS.
-#[no_mangle]
-pub extern "C" fn alloc(len: usize) -> *mut u8 {
-    let mut v = Vec::<u8>::with_capacity(len);
-    let ptr = v.as_mut_ptr();
-    std::mem::forget(v);
-    ptr
-}
-
-/// Free a buffer previously returned by `alloc`.
-#[no_mangle]
-pub extern "C" fn dealloc(ptr: *mut u8, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            drop(Vec::from_raw_parts(ptr, len, len));
-        }
-    }
-}
+// The byte-identical `alloc`/`dealloc` C-ABI pair, emitted in-crate.
+wasm_abi::alloc_dealloc!();
 
 /// Render a star frame (RGBA) into the buffer at `ptr`.
 #[no_mangle]

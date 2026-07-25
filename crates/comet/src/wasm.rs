@@ -12,47 +12,12 @@
 use crate::{Camera, CometScene};
 use std::slice;
 
-/// Allocate `len` bytes in wasm memory and hand the pointer to JS.
-#[no_mangle]
-pub extern "C" fn alloc(len: usize) -> *mut u8 {
-    let mut v = Vec::<u8>::with_capacity(len);
-    let ptr = v.as_mut_ptr();
-    std::mem::forget(v);
-    ptr
-}
+// `alloc` / `dealloc` — byte-identical to the hand-rolled pair, emitted in-crate.
+wasm_abi::alloc_dealloc!();
 
-/// Free a buffer previously returned by `alloc`.
-#[no_mangle]
-pub extern "C" fn dealloc(ptr: *mut u8, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            drop(Vec::from_raw_parts(ptr, len, len));
-        }
-    }
-}
-
-/// Generate the scene for `seed` and hand back an opaque pointer.
-#[no_mangle]
-pub extern "C" fn comet_new(seed: u32) -> *mut CometScene {
-    Box::into_raw(Box::new(CometScene::generate(seed)))
-}
-
-/// Generate a scene for `seed`, forcing the comet count when `count > 0`
-/// (0 = the seed-derived 1..=3). Opaque pointer, freed with [`comet_free`].
-#[no_mangle]
-pub extern "C" fn comet_new_params(seed: u32, count: u32) -> *mut CometScene {
-    Box::into_raw(Box::new(CometScene::generate_n(seed, count)))
-}
-
-/// Free a scene previously returned by [`comet_new`].
-#[no_mangle]
-pub extern "C" fn comet_free(ptr: *mut CometScene) {
-    if !ptr.is_null() {
-        unsafe {
-            drop(Box::from_raw(ptr));
-        }
-    }
-}
+// `comet_new(seed)` / `comet_new_params(seed, count)` / `comet_free(ptr)` — the
+// opaque-handle trio over `CometScene::generate` / `CometScene::generate_n`.
+wasm_abi::opaque_handle!(CometScene, comet_new, comet_new_params, comet_free);
 
 /// Render the scene into the RGBA buffer at `buf` (must be >= w*h*4 bytes) at
 /// time `t`, from a camera at `(cam_x, cam_y)` with `zoom`.
@@ -69,7 +34,7 @@ pub extern "C" fn render(
     t: f32,
 ) {
     let scene = unsafe { &*scene };
-    let out = unsafe { slice::from_raw_parts_mut(buf, (w * h * 4) as usize) };
+    let out = unsafe { wasm_abi::out_rgba(buf, w, h) };
     let cam = Camera { x: cam_x, y: cam_y, zoom };
     scene.render(w, h, &cam, t, out);
 }

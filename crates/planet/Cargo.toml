@@ -7,20 +7,28 @@ edition = "2021"
 #   • lib.rs   — pure per-pixel render math (rlib for the bins, cdylib for wasm)
 #   • wasm.rs  — a thin C-ABI wrapper over the lib, compiled only for wasm32
 #   • bin/*    — native GIF/PNG generators (need `image`+`rand`, the `native` feature)
-# The pure render path uses NO deps, so the wasm build (`--no-default-features`)
-# stays tiny and can never pull in `image`/`rand`.
+# The pure render path pulls in only the dependency-free `noise-core`/`dither-core`
+# rlibs, so the wasm build (`--no-default-features`) stays tiny and can never pull
+# in `image`/`rand`.
 
 [lib]
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+noise-core = { path = "../noise-core" }
+dither-core = { path = "../dither-core" }
+# Shared C-ABI glue for wasm.rs. Plain (non-optional) dep so it is present in
+# the wasm build; it exports zero C symbols, so the export set is unchanged.
+wasm-abi = { path = "../wasm-abi" }
+# Native GIF/PNG orchestration for the bin; only pulled in by `native`.
+render-io = { path = "../render-io", optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "gif"], optional = true }
 rand = { version = "0.8", optional = true }
 rand_chacha = { version = "0.3", optional = true }
 
 [features]
 default = ["native"]
-native = ["dep:image", "dep:rand", "dep:rand_chacha"]
+native = ["dep:image", "dep:rand", "dep:rand_chacha", "dep:render-io"]
 
 [[bin]]
 name = "planet"

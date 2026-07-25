@@ -1,0 +1,14 @@
+[package]
+name = "render-io"
+version = "0.1.0"
+edition = "2021"
+
+# Native GIF/PNG orchestration shared by the space-crate bins. Carries the
+# `image` dep (png+gif); only pulled in by each bin's `native` feature, so the
+# wasm build never sees it.
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "gif"] }

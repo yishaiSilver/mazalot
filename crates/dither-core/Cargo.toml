@@ -1,0 +1,13 @@
+[package]
+name = "dither-core"
+version = "0.1.0"
+edition = "2021"
+
+# Shared 8x8 ordered (Bayer) dithering + level quantization, the "pixel-art"
+# tone map every celestial crate ends its per-pixel path with. Dependency-free.
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+noise-core = { path = "../noise-core" }

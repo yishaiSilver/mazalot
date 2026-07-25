@@ -13,37 +13,13 @@
 use crate::{Camera, System};
 use std::slice;
 
-/// Allocate `len` bytes in wasm memory and hand the pointer to JS.
-#[no_mangle]
-pub extern "C" fn alloc(len: usize) -> *mut u8 {
-    let mut v = Vec::<u8>::with_capacity(len);
-    let ptr = v.as_mut_ptr();
-    std::mem::forget(v);
-    ptr
-}
+// The byte-identical `alloc`/`dealloc` C-ABI pair, emitted in-crate.
+wasm_abi::alloc_dealloc!();
 
-/// Free a buffer previously returned by `alloc`.
-#[no_mangle]
-pub extern "C" fn dealloc(ptr: *mut u8, len: usize) {
-    if !ptr.is_null() {
-        unsafe {
-            drop(Vec::from_raw_parts(ptr, len, len));
-        }
-    }
-}
-
-/// Generate the system for `seed` and hand back an opaque pointer.
-#[no_mangle]
-pub extern "C" fn system_new(seed: u32) -> *mut System {
-    Box::into_raw(Box::new(System::generate(seed)))
-}
-
-/// Generate a system for `seed`, forcing the planet count when `count > 0`
-/// (0 = the seed-derived 4..=8). Opaque pointer, freed with [`system_free`].
-#[no_mangle]
-pub extern "C" fn system_new_params(seed: u32, count: u32) -> *mut System {
-    Box::into_raw(Box::new(System::generate_n(seed, count)))
-}
+// `system_new(seed)` / `system_new_params(seed, count)` / `system_free(ptr)`:
+// the opaque-handle trio over `System` (System::generate / generate_n), with the
+// exact export names preserved.
+wasm_abi::opaque_handle!(System, system_new, system_new_params, system_free);
 
 /// Set the live view multipliers (planet spacing, planet/sun size, per-body
 /// pixelation) and per-body detail caps (max tile radius, px). These rescale the
@@ -85,16 +61,6 @@ pub extern "C" fn system_set_eccentricity(sys: *mut System, scale: f32) {
     sys.set_eccentricity(scale);
 }
 
-/// Free a system previously returned by [`system_new`].
-#[no_mangle]
-pub extern "C" fn system_free(ptr: *mut System) {
-    if !ptr.is_null() {
-        unsafe {
-            drop(Box::from_raw(ptr));
-        }
-    }
-}
-
 /// Render the system into the RGBA buffer at `buf` (must be >= w*h*4 bytes) with
 /// one clock for everything. Kept for simple callers (e.g. the menu thumbnail).
 #[no_mangle]
@@ -110,7 +76,7 @@ pub extern "C" fn render(
     t: f32,
 ) {
     let sys = unsafe { &*sys };
-    let out = unsafe { slice::from_raw_parts_mut(buf, (w * h * 4) as usize) };
+    let out = unsafe { wasm_abi::out_rgba(buf, w, h) };
     let cam = Camera { x: cam_x, y: cam_y, zoom };
     // Static single frame (menu thumbnail): screen-space bg offset = cam·zoom.
     crate::render_system(sys, w, h, &cam, cam_x * zoom, cam_y * zoom, t, t, t, out);
@@ -137,7 +103,7 @@ pub extern "C" fn render_t(
     t_sun: f32,
 ) {
     let sys = unsafe { &mut *sys };
-    let out = unsafe { slice::from_raw_parts_mut(buf, (w * h * 4) as usize) };
+    let out = unsafe { wasm_abi::out_rgba(buf, w, h) };
     let cam = Camera { x: cam_x, y: cam_y, zoom };
     // Caches the time-independent backdrop; a still camera skips re-rendering it.
     crate::render_system_cached(sys, w, h, &cam, bgx, bgy, t_orbit, t_spin, t_sun, out);

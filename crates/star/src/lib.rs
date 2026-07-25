@@ -1,8 +1,9 @@
 //! star — the single source of truth for procedural star generation.
 //!
-//! Pure math, zero dependencies. Produces raw RGBA bytes via [`render_rgba`];
-//! callers wrap those however they like (the native bin turns them into
-//! GIFs/PNGs with the `image` crate; a wasm face can expose them to a canvas).
+//! Pure math over the dependency-free `noise-core` + `dither-core` rlibs.
+//! Produces raw RGBA bytes via [`render_rgba`]; callers wrap those however they
+//! like (the native bin turns them into GIFs/PNGs with the `image` crate; a wasm
+//! face can expose them to a canvas).
 //!
 //! A star is the *inverse* of a planet: it is self-luminous, so there is no
 //! day/night terminator and no external light. What sells "this is a sun" is a
@@ -11,81 +12,19 @@
 //! soft **corona** halo, and a continuous shimmer of **prominences** off the
 //! limb. Same inputs => same star; a full 2π `angle` loop is seamless.
 //!
-//! This crate is self-contained by design (the workspace's rule: each "type"
-//! crate shares no code with the others). The noise/color/dither primitives
-//! below are the star-relevant subset of the same toolkit `planet` uses.
+//! The noise/color/dither primitives this crate uses now come from the shared,
+//! dependency-free `noise-core`/`dither-core` rlibs (the star-relevant subset of
+//! the same toolkit `planet` uses); they used to be copy-pasted in here.
 
 use std::f32::consts::{PI, TAU};
 
-// ---------------------------------------------------------------------------
-// Noise: 3D value-noise fBm + 3D Worley (cellular) for convection cells.
-// ---------------------------------------------------------------------------
-
-fn hash3(x: i32, y: i32, z: i32) -> f32 {
-    // Murmur3-style bit mixer -> well-distributed, mean ~0.5.
-    let mut h = (x as u32).wrapping_mul(0x8da6_b343)
-        ^ (y as u32).wrapping_mul(0xd816_3841)
-        ^ (z as u32).wrapping_mul(0xcb1a_b31f);
-    h ^= h >> 16;
-    h = h.wrapping_mul(0x7feb_352d);
-    h ^= h >> 15;
-    h = h.wrapping_mul(0x846c_a68b);
-    h ^= h >> 16;
-    (h as f32) / (u32::MAX as f32)
-}
-
-fn smoother(t: f32) -> f32 {
-    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
-}
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
-}
-
-fn value_noise(x: f32, y: f32, z: f32) -> f32 {
-    let (xi, yi, zi) = (x.floor(), y.floor(), z.floor());
-    let (xf, yf, zf) = (x - xi, y - yi, z - zi);
-    let (xi, yi, zi) = (xi as i32, yi as i32, zi as i32);
-    let (u, v, w) = (smoother(xf), smoother(yf), smoother(zf));
-    let c = |dx: i32, dy: i32, dz: i32| hash3(xi + dx, yi + dy, zi + dz);
-    let x00 = lerp(c(0, 0, 0), c(1, 0, 0), u);
-    let x10 = lerp(c(0, 1, 0), c(1, 1, 0), u);
-    let x01 = lerp(c(0, 0, 1), c(1, 0, 1), u);
-    let x11 = lerp(c(0, 1, 1), c(1, 1, 1), u);
-    lerp(lerp(x00, x10, v), lerp(x01, x11, v), w)
-}
-
-fn fbm(mut x: f32, mut y: f32, mut z: f32, octaves: u32) -> f32 {
-    let (mut sum, mut amp, mut norm) = (0.0, 0.5, 0.0);
-    for _ in 0..octaves {
-        sum += amp * value_noise(x, y, z);
-        norm += amp;
-        amp *= 0.5;
-        x *= 2.0;
-        y *= 2.0;
-        z *= 2.0;
-    }
-    sum / norm
-}
-
-/// 3D Worley F1: distance to nearest hashed feature point. ~[0, 1.0].
-fn worley(x: f32, y: f32, z: f32) -> f32 {
-    let (fx, fy, fz) = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
-    let mut f1 = 9.0f32;
-    for dz in -1..=1 {
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                let (cx, cy, cz) = (fx + dx, fy + dy, fz + dz);
-                let ox = hash3(cx, cy, cz);
-                let oy = hash3(cx + 911, cy + 733, cz + 512);
-                let oz = hash3(cx + 271, cy + 619, cz + 188);
-                let (px, py, pz) = (cx as f32 + ox, cy as f32 + oy, cz as f32 + oz);
-                let d = ((px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2)).sqrt();
-                f1 = f1.min(d);
-            }
-        }
-    }
-    f1
-}
+// The 3D noise (hash3/value_noise/fbm/worley), the color helpers
+// (mix/clamp01/smoothstep/ramp3 and the Rgb type) and the ordered-dither
+// `bayer` primitive now come from the shared, dependency-free crates instead of
+// being copy-pasted here. `smoother` is imported for the LOCAL 5D looping-boil
+// noise below (which still lives in this crate).
+use dither_core::bayer;
+use noise_core::{clamp01, fbm, hash3, mix, ramp3, smoother, smoothstep, worley, Rgb};
 
 // ---------------------------------------------------------------------------
 // 5D value noise — for seamless "boil-in-place" over the loop.
@@ -154,39 +93,15 @@ fn fbm5(mut p: [f32; 5], octaves: u32) -> f32 {
 }
 
 // ---------------------------------------------------------------------------
-// Color helpers
+// Seed offsets
 // ---------------------------------------------------------------------------
-
-type Rgb = [f32; 3];
-
-fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
-    [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)]
-}
-fn clamp01(x: f32) -> f32 {
-    x.max(0.0).min(1.0)
-}
-fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
-    let t = clamp01((x - e0) / (e1 - e0));
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// Three-stop cool → mid → hot temperature ramp.
-fn ramp3(a: Rgb, b: Rgb, c: Rgb, t: f32) -> Rgb {
-    if t < 0.5 {
-        mix(a, b, t * 2.0)
-    } else {
-        mix(b, c, (t - 0.5) * 2.0)
-    }
-}
 
 /// Bounded, decorrelated noise offsets from a seed. These MUST stay small: huge
 /// sample coordinates lose f32 precision and the noise collapses into bands.
+/// Thin wrapper over the shared helper with star's span (256.0), so every call
+/// site — and the exact numeric result — is unchanged.
 fn seed_offsets(seed: u32) -> [f32; 3] {
-    [
-        hash3(seed as i32, 1, 7) * 256.0 + 4.0,
-        hash3(seed as i32, 2, 7) * 256.0 + 4.0,
-        hash3(seed as i32, 3, 7) * 256.0 + 4.0,
-    ]
+    noise_core::seed_offsets(seed, 256.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -204,26 +119,11 @@ impl Style {
     }
 }
 
-// 8x8 ordered (Bayer) matrix, values 0..63.
-const BAYER: [u8; 64] = [
-    0, 32, 8, 40, 2, 34, 10, 42, 48, 16, 56, 24, 50, 18, 58, 26, 12, 44, 4, 36, 14, 46,
-    6, 38, 60, 28, 52, 20, 62, 30, 54, 22, 3, 35, 11, 43, 1, 33, 9, 41, 51, 19, 59, 27,
-    49, 17, 57, 25, 15, 47, 7, 39, 13, 45, 5, 37, 63, 31, 55, 23, 61, 29, 53, 21,
-];
-fn bayer(x: u32, y: u32) -> f32 {
-    (BAYER[((y % 8) * 8 + (x % 8)) as usize] as f32 + 0.5) / 64.0 - 0.5 // -0.5..0.5
-}
-
 /// Final per-pixel quantization via ordered dithering — kills ramp banding and
-/// dithers the corona falloff while staying crisp under spin.
+/// dithers the corona falloff while staying crisp under spin. Star uses a
+/// 22-level ramp; the quantizer math is the shared one, byte-for-byte.
 fn finalize(o: Rgb, bx: f32, style: &Style) -> Rgb {
-    let levels = 22.0;
-    let d = bx * style.dither / levels;
-    [
-        clamp01(((o[0] + d) * levels).round() / levels),
-        clamp01(((o[1] + d) * levels).round() / levels),
-        clamp01(((o[2] + d) * levels).round() / levels),
-    ]
+    dither_core::quant(o, bx, 22.0, style.dither)
 }
 
 // ---------------------------------------------------------------------------

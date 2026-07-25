@@ -58,8 +58,9 @@ Output lands in `dist/` (git-ignored).
 
 1. **Build** `crates/<crate>/web/<crate>.wasm`
    (`cargo build -p <crate> --target wasm32-unknown-unknown --release --no-default-features`).
-   The `--no-default-features` flag drops the native-only `image` dependency so
-   the wasm stays tiny. Skipped with `--no-build`.
+   The `--no-default-features` flag drops the native-only `image`/`render-io`
+   dependencies; the shared `*-core` crates the wasm still pulls in carry no
+   third-party deps of their own, so the wasm stays tiny. Skipped with `--no-build`.
 2. **Strip the document wrapper.** A Claude artifact is published *inside* a
    `<!doctype html><head></head><body>` skeleton, so the script keeps only the
    page content from `<title>` onward and removes the outer

@@ -1,16 +1,16 @@
 //! moon — a procedural, seed-driven **planet with its own moons**.
 //!
-//! Pure math, zero dependencies. Where `solar` renders a whole star system into
-//! a draggable viewport, `moon` scopes that same depth-sorted compositor down to
-//! a single stage: one lit parent planet at the centre and 2–5 satellites
-//! orbiting it, each correctly passing IN FRONT OF and BEHIND the parent body as
-//! it goes round. Same seed => the same planet + moons, forever.
+//! Pure math over the dependency-free `*-core` rlibs. Where `solar` renders a
+//! whole star system into a draggable viewport, `moon` scopes that same depth-
+//! sorted compositor down to a single stage: one lit parent planet at the centre
+//! and 2–5 satellites orbiting it, each correctly passing IN FRONT OF and BEHIND
+//! the parent body as it goes round. Same seed => the same planet + moons, forever.
 //!
-//! This crate is self-contained by the workspace rule (each "type" crate shares
-//! no code with the others — only third-party deps and the manifest). It carries
-//! its own compact noise/color/dither primitives and its own fake-3D sphere
-//! *tile* renderers: a compact cousin of solar's planet tile for the parent, and
-//! a cratered-rock tile for the moons, tuned to read at the tens-of-pixels scale.
+//! This crate leans on the workspace's shared, dependency-free `*-core` rlibs
+//! (`noise-core`/`dither-core` for the compact noise/color/dither primitives,
+//! `scene-core` for the compositor helpers, and `body-core` for the parent
+//! planet *tile* renderer — a compact cousin of solar's) plus its own fake-3D
+//! cratered-rock tile for the moons, tuned to read at the tens-of-pixels scale.
 //! The new work here over a lone body is the layer on top — orbital layout for
 //! the satellites and the depth sort that makes a moon on the far side of its
 //! orbit disappear behind the planet while one on the near side draws over it.
@@ -30,157 +30,39 @@
 use std::f32::consts::TAU;
 
 // ===========================================================================
-// Noise + math primitives (this crate's own copy — shared with nobody)
+// Noise + math primitives — sourced from the shared noise-core / dither-core
+// crates (previously a byte-for-byte local copy). Values are unchanged, so the
+// rendered output is identical.
 // ===========================================================================
 
-fn hash3(x: i32, y: i32, z: i32) -> f32 {
-    // Murmur3-style bit mixer -> well-distributed, mean ~0.5.
-    let mut h = (x as u32).wrapping_mul(0x8da6_b343)
-        ^ (y as u32).wrapping_mul(0xd816_3841)
-        ^ (z as u32).wrapping_mul(0xcb1a_b31f);
-    h ^= h >> 16;
-    h = h.wrapping_mul(0x7feb_352d);
-    h ^= h >> 15;
-    h = h.wrapping_mul(0x846c_a68b);
-    h ^= h >> 16;
-    (h as f32) / (u32::MAX as f32)
-}
+use body_core::{base, render_body_tile, BodyKind as ParentKind, KIND_GAS, KIND_TERRA};
+use dither_core::bayer;
+use noise_core::{clamp01, contrast, fbm, hash3, mix, smoothstep, worley, Rgb};
+use scene_core::{blit, to_screen, Rng, Tile, ORBIT_FLATTEN};
 
-fn smoother(t: f32) -> f32 {
-    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
-}
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
-}
-
-fn value_noise(x: f32, y: f32, z: f32) -> f32 {
-    let (xi, yi, zi) = (x.floor(), y.floor(), z.floor());
-    let (xf, yf, zf) = (x - xi, y - yi, z - zi);
-    let (xi, yi, zi) = (xi as i32, yi as i32, zi as i32);
-    let (u, v, w) = (smoother(xf), smoother(yf), smoother(zf));
-    let c = |dx: i32, dy: i32, dz: i32| hash3(xi + dx, yi + dy, zi + dz);
-    let x00 = lerp(c(0, 0, 0), c(1, 0, 0), u);
-    let x10 = lerp(c(0, 1, 0), c(1, 1, 0), u);
-    let x01 = lerp(c(0, 0, 1), c(1, 0, 1), u);
-    let x11 = lerp(c(0, 1, 1), c(1, 1, 1), u);
-    lerp(lerp(x00, x10, v), lerp(x01, x11, v), w)
-}
-
-fn fbm(mut x: f32, mut y: f32, mut z: f32, octaves: u32) -> f32 {
-    let (mut sum, mut amp, mut norm) = (0.0, 0.5, 0.0);
-    for _ in 0..octaves {
-        sum += amp * value_noise(x, y, z);
-        norm += amp;
-        amp *= 0.5;
-        x *= 2.0;
-        y *= 2.0;
-        z *= 2.0;
-    }
-    sum / norm
-}
-
-/// 3D Worley F1: distance to the nearest hashed feature point (~[0, 1]). Used
-/// here to scatter the moons' impact craters — each feature point becomes a pit
-/// with a bright rim.
-fn worley(x: f32, y: f32, z: f32) -> f32 {
-    let (fx, fy, fz) = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
-    let mut f1 = 9.0f32;
-    for dz in -1..=1 {
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                let (cx, cy, cz) = (fx + dx, fy + dy, fz + dz);
-                let ox = hash3(cx, cy, cz);
-                let oy = hash3(cx + 911, cy + 733, cz + 512);
-                let oz = hash3(cx + 271, cy + 619, cz + 188);
-                let (px, py, pz) = (cx as f32 + ox, cy as f32 + oy, cz as f32 + oz);
-                let d = ((px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2)).sqrt();
-                f1 = f1.min(d);
-            }
-        }
-    }
-    f1
-}
-
-type Rgb = [f32; 3];
-
-fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
-    [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)]
-}
-fn clamp01(x: f32) -> f32 {
-    x.max(0.0).min(1.0)
-}
-fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
-    let t = clamp01((x - e0) / (e1 - e0));
-    t * t * (3.0 - 2.0 * t)
-}
-fn contrast(h: f32, k: f32) -> f32 {
-    clamp01((h - 0.5) * k + 0.5)
-}
-fn ramp(stops: &[(f32, Rgb)], h: f32) -> Rgb {
-    for s in stops {
-        if h < s.0 {
-            return s.1;
-        }
-    }
-    stops[stops.len() - 1].1
-}
+// `Camera` is part of this crate's public API (its bin and wasm face import it as
+// `moon::Camera` / `crate::Camera`), so re-export scene-core's — a plain `pub use`
+// also brings it into scope for the lib below.
+pub use scene_core::Camera;
 
 /// Bounded, decorrelated per-body noise offsets — keep them small so f32
-/// precision holds and the noise doesn't collapse into bands.
+/// precision holds and the noise doesn't collapse into bands. Thin wrapper over
+/// `noise_core::seed_offsets` pinned to this crate's historical span (220.0) so
+/// every existing call site yields the exact same numbers.
 fn seed_offsets(seed: u32) -> [f32; 3] {
-    [
-        hash3(seed as i32, 1, 7) * 220.0 + 4.0,
-        hash3(seed as i32, 2, 7) * 220.0 + 4.0,
-        hash3(seed as i32, 3, 7) * 220.0 + 4.0,
-    ]
-}
-
-/// Tiny deterministic RNG for system generation (SplitMix-ish over hash3).
-struct Rng {
-    seed: i32,
-    ctr: i32,
-}
-impl Rng {
-    fn new(seed: u32) -> Rng {
-        Rng { seed: seed as i32, ctr: 0 }
-    }
-    fn f(&mut self) -> f32 {
-        self.ctr = self.ctr.wrapping_add(1);
-        hash3(self.seed, self.ctr, 0x9e37)
-    }
-    /// Uniform in [lo, hi).
-    fn range(&mut self, lo: f32, hi: f32) -> f32 {
-        lo + (hi - lo) * self.f()
-    }
-    fn below(&mut self, p: f32) -> bool {
-        self.f() < p
-    }
+    noise_core::seed_offsets(seed, 220.0)
 }
 
 // ===========================================================================
 // Parent planet type table (compact)
 // ===========================================================================
 
-const PK_TERRA: u8 = 0; // fbm continents + sea/caps/clouds
-const PK_GAS: u8 = 1; // latitude bands
-const PK_BARREN: u8 = 2; // dry cratered/rocky world
-
-/// A parent-planet archetype: the body the moons orbit. A compact cousin of
-/// solar's planet table with just the handful of looks a single hero body needs.
-#[derive(Clone, Copy)]
-struct ParentKind {
-    name: &'static str,
-    kind: u8,
-    freq: f32,
-    contr: f32,
-    stops: &'static [(f32, Rgb)], // terran / barren surface ramp
-    band_lo: Rgb,                 // gas
-    band_hi: Rgb,
-    bands: f32,
-    atmo: Rgb,   // limb-glow tint ([0,0,0] = airless)
-    caps: f32,   // polar cap coverage
-    clouds: f32, // white cloud cover
-}
+// The parent-planet archetype is now `body_core::BodyKind` (aliased `ParentKind`
+// on import), rendered by the shared `render_body_tile`. Its kind tags come from
+// body-core: the old PK_TERRA/PK_GAS become KIND_TERRA/KIND_GAS, and the old
+// PK_BARREN maps to KIND_TERRA as well — moon's barren world always rendered
+// through the terrestrial arm, so it must stay on KIND_TERRA (KIND_EMISSIVE == 2
+// would render it as glowing lava instead).
 
 const TERRAN: &[(f32, Rgb)] = &[
     (0.46, [0.08, 0.16, 0.36]), (0.50, [0.13, 0.30, 0.55]), (0.52, [0.78, 0.73, 0.52]),
@@ -196,13 +78,16 @@ const BARREN: &[(f32, Rgb)] = &[
     (1.01, [0.66, 0.64, 0.63]),
 ];
 
-/// The parent archetypes. One is chosen per system by seed.
+/// The parent archetypes. One is chosen per system by seed. These are
+/// `body_core::BodyKind` rows (aliased `ParentKind`); `..base()` fills the
+/// emissive/ring/orbit-placement fields moon's worlds don't use with neutral
+/// defaults, so the rendered output is unchanged.
 const PARENTS: &[ParentKind] = &[
-    ParentKind { name: "terran", kind: PK_TERRA, freq: 2.2, contr: 2.1, stops: TERRAN, band_lo: [0.0; 3], band_hi: [0.0; 3], bands: 0.0, atmo: [0.30, 0.45, 0.65], caps: 0.85, clouds: 0.8 },
-    ParentKind { name: "ocean",  kind: PK_TERRA, freq: 2.4, contr: 1.7, stops: OCEAN,  band_lo: [0.0; 3], band_hi: [0.0; 3], bands: 0.0, atmo: [0.25, 0.42, 0.66], caps: 0.6,  clouds: 0.7 },
-    ParentKind { name: "barren", kind: PK_BARREN, freq: 3.4, contr: 1.9, stops: BARREN, band_lo: [0.0; 3], band_hi: [0.0; 3], bands: 0.0, atmo: [0.0; 3],          caps: 0.0,  clouds: 0.0 },
-    ParentKind { name: "gas giant", kind: PK_GAS, freq: 4.0, contr: 1.0, stops: &[], band_lo: [0.55, 0.40, 0.28], band_hi: [0.88, 0.79, 0.62], bands: 11.0, atmo: [0.40, 0.34, 0.22], caps: 0.0, clouds: 0.0 },
-    ParentKind { name: "ice giant", kind: PK_GAS, freq: 4.0, contr: 1.0, stops: &[], band_lo: [0.20, 0.38, 0.66], band_hi: [0.55, 0.74, 0.92], bands: 9.0,  atmo: [0.30, 0.45, 0.70], caps: 0.0, clouds: 0.0 },
+    ParentKind { name: "terran", kind: KIND_TERRA, freq: 2.2, contr: 2.1, stops: TERRAN, band_lo: [0.0; 3], band_hi: [0.0; 3], bands: 0.0, atmo: [0.30, 0.45, 0.65], caps: 0.85, clouds: 0.8, ..base() },
+    ParentKind { name: "ocean",  kind: KIND_TERRA, freq: 2.4, contr: 1.7, stops: OCEAN,  band_lo: [0.0; 3], band_hi: [0.0; 3], bands: 0.0, atmo: [0.25, 0.42, 0.66], caps: 0.6,  clouds: 0.7, ..base() },
+    ParentKind { name: "barren", kind: KIND_TERRA, freq: 3.4, contr: 1.9, stops: BARREN, band_lo: [0.0; 3], band_hi: [0.0; 3], bands: 0.0, atmo: [0.0; 3],          caps: 0.0,  clouds: 0.0, ..base() },
+    ParentKind { name: "gas giant", kind: KIND_GAS, freq: 4.0, contr: 1.0, stops: &[], band_lo: [0.55, 0.40, 0.28], band_hi: [0.88, 0.79, 0.62], bands: 11.0, atmo: [0.40, 0.34, 0.22], caps: 0.0, clouds: 0.0, ..base() },
+    ParentKind { name: "ice giant", kind: KIND_GAS, freq: 4.0, contr: 1.0, stops: &[], band_lo: [0.20, 0.38, 0.66], band_hi: [0.55, 0.74, 0.92], bands: 9.0,  atmo: [0.30, 0.45, 0.70], caps: 0.0, clouds: 0.0, ..base() },
 ];
 
 /// Number of parent-planet archetypes.
@@ -253,10 +138,6 @@ pub fn moon_kind_name(i: usize) -> &'static str {
 // ===========================================================================
 // System generation
 // ===========================================================================
-
-/// How much orbits are squashed vertically to fake a tilted, near-top-down view
-/// (shared with solar's ORBIT_FLATTEN idea).
-const ORBIT_FLATTEN: f32 = 0.42;
 
 /// The fixed off-screen sun direction, in the tile's screen frame (+x right,
 /// +y up, +z toward viewer). Shared by the parent and every moon: the sun is
@@ -323,7 +204,7 @@ impl MoonSystem {
         let parent_kind = (rng.f() * PARENTS.len() as f32) as usize % PARENTS.len();
         let pk = &PARENTS[parent_kind];
         // Gas/ice giants are bigger discs than rocky/terran parents.
-        let parent_radius = if pk.kind == PK_GAS {
+        let parent_radius = if pk.kind == KIND_GAS {
             rng.range(52.0, 62.0)
         } else {
             rng.range(40.0, 50.0)
@@ -443,130 +324,19 @@ impl MoonSystem {
 // Body tile renderers — each fills a small RGBA tile, transparent off-body
 // ===========================================================================
 
-/// Ordered-dither offset from an 8x8 Bayer matrix, in −0.5..0.5.
-const BAYER: [u8; 64] = [
-    0, 32, 8, 40, 2, 34, 10, 42, 48, 16, 56, 24, 50, 18, 58, 26, 12, 44, 4, 36, 14, 46,
-    6, 38, 60, 28, 52, 20, 62, 30, 54, 22, 3, 35, 11, 43, 1, 33, 9, 41, 51, 19, 59, 27,
-    49, 17, 57, 25, 15, 47, 7, 39, 13, 45, 5, 37, 63, 31, 55, 23, 61, 29, 53, 21,
-];
-fn bayer(x: u32, y: u32) -> f32 {
-    (BAYER[((y % 8) * 8 + (x % 8)) as usize] as f32 + 0.5) / 64.0 - 0.5
-}
-
 /// Ordered-dither quantize to kill banding while staying crisp under motion.
+/// Thin wrapper over `dither_core::quant` pinned to this crate's historical
+/// 24 levels / 0.7 dither strength; the Bayer bias comes from `dither_core::bayer`.
 fn quant(o: Rgb, bx: f32) -> Rgb {
-    let levels = 24.0;
-    let d = bx * 0.7 / levels;
-    [
-        clamp01(((o[0] + d) * levels).round() / levels),
-        clamp01(((o[1] + d) * levels).round() / levels),
-        clamp01(((o[2] + d) * levels).round() / levels),
-    ]
+    dither_core::quant(o, bx, 24.0, 0.7)
 }
 
-/// A rendered body ready to blit: RGBA pixels + its pixel diameter. Alpha is 0
-/// off-body and 255 on the opaque disc.
-struct Tile {
-    px: Vec<u8>,
-    size: u32,
-}
-
-/// Parent surface albedo at a rotated surface point (no lighting yet).
-fn parent_surface(pk: &ParentKind, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], t: f32) -> Rgb {
-    let (px, py, pz) = (sx + ofs[0], sy + ofs[1], sz + ofs[2]);
-    match pk.kind {
-        PK_GAS => {
-            // Latitude bands with a little worley turbulence + slow zonal drift.
-            let turb = (worley(px * 3.0, py * 3.0, pz * 3.0) - 0.5) * 0.5;
-            let lat = sy + turb * 0.4;
-            let band = 0.5 + 0.5 * (lat * pk.bands + t * 0.2).sin();
-            let mut col = mix(pk.band_lo, pk.band_hi, band);
-            let fine = fbm(px * 4.0, py * 4.0, pz * 4.0, 3);
-            col = mix(col, pk.band_hi, smoothstep(0.55, 0.82, fine) * 0.3);
-            col
-        }
-        _ => {
-            // Terran / barren: fbm continents, sea level built into the ramp, caps.
-            let raw = fbm(px * pk.freq, py * pk.freq, pz * pk.freq, 6);
-            let h = contrast(raw, pk.contr);
-            let mut col = ramp(pk.stops, h);
-            let cap = smoothstep(0.72, 0.9, sy.abs()) * pk.caps;
-            col = mix(col, [0.92, 0.95, 1.0], cap);
-            col
-        }
-    }
-}
-
-/// Render the parent planet to a lit RGBA tile of diameter ~`2*rad_px`. `spin_a`
-/// is the axial rotation phase; `t` drifts weather/bands.
+/// Render the parent planet to a lit RGBA tile of diameter ~`2*rad_px`. A thin
+/// wrapper over the shared `body_core::render_body_tile`: moon lights its parent
+/// from the fixed off-screen sun (`LIGHT_DIR`), and `spin_a`/`t` drive the axial
+/// rotation and the weather/band drift exactly as the old local renderer did.
 fn render_parent_tile(pk: &ParentKind, seed: u32, spin_a: f32, t: f32, rad_px: f32) -> Tile {
-    let size = ((rad_px + 1.5) * 2.0).ceil() as u32;
-    let size = size.max(6);
-    let c = size as f32 / 2.0;
-    let ofs = seed_offsets(seed);
-    let (sina, cosa) = spin_a.sin_cos();
-    let has_atmo = pk.atmo != [0.0, 0.0, 0.0];
-    let l = LIGHT_DIR;
-    let mut px = vec![0u8; (size * size * 4) as usize];
-
-    for iy in 0..size {
-        for ix in 0..size {
-            let nx = (ix as f32 + 0.5 - c) / rad_px;
-            let ny = (c - (iy as f32 + 0.5)) / rad_px;
-            let d2 = nx * nx + ny * ny;
-
-            let mut o: Rgb = [0.0, 0.0, 0.0];
-            let mut a: f32 = 0.0;
-
-            if d2 <= 1.0 {
-                let nz = (1.0 - d2).sqrt();
-                // Rotate the surface point around Y by the spin so it turns.
-                let sx = nx * cosa + nz * sina;
-                let sy = ny;
-                let sz = -nx * sina + nz * cosa;
-
-                let mut col = parent_surface(pk, sx, sy, sz, ofs, t);
-
-                if pk.clouds > 0.0 {
-                    let (cs, cc) = (spin_a * 1.4).sin_cos();
-                    let cx3 = nx * cc + nz * cs + ofs[0];
-                    let cz3 = -nx * cs + nz * cc + ofs[2];
-                    let cloud = fbm(cx3 * 2.8, ny * 2.8 + ofs[1], cz3 * 2.8 + t * 0.1, 4);
-                    col = mix(col, [1.0, 1.0, 1.0], smoothstep(0.54, 0.72, cloud) * pk.clouds);
-                }
-
-                // Directional Lambert against the fixed sun.
-                let diff = (nx * l[0] + ny * l[1] + nz * l[2]).max(0.0);
-                let shade = 0.08 + 0.92 * diff;
-                o = [col[0] * shade, col[1] * shade, col[2] * shade];
-
-                // Atmospheric rim on the lit limb.
-                if has_atmo {
-                    let rim = (1.0 - nz).powf(3.0) * 0.6 * (0.4 + 0.6 * diff);
-                    o = [
-                        clamp01(o[0] + pk.atmo[0] * rim),
-                        clamp01(o[1] + pk.atmo[1] * rim),
-                        clamp01(o[2] + pk.atmo[2] * rim),
-                    ];
-                }
-                a = 1.0;
-
-                // Crisp dark limb outline for sprite readability.
-                let edge = 1.0 - 1.4 / rad_px;
-                if d2 > edge * edge {
-                    o = [o[0] * 0.30, o[1] * 0.30, o[2] * 0.34];
-                }
-            }
-
-            let q = quant(o, bayer(ix, iy));
-            let idx = ((iy * size + ix) * 4) as usize;
-            px[idx] = (q[0] * 255.0) as u8;
-            px[idx + 1] = (q[1] * 255.0) as u8;
-            px[idx + 2] = (q[2] * 255.0) as u8;
-            px[idx + 3] = (clamp01(a) * 255.0) as u8;
-        }
-    }
-    Tile { px, size }
+    render_body_tile(pk, seed, spin_a, t, LIGHT_DIR, rad_px)
 }
 
 /// Moon surface albedo at a rotated surface point (no lighting yet): a grey/tinted
@@ -647,30 +417,6 @@ fn render_moon_tile(mk: &MoonKind, seed: u32, spin_a: f32, _t: f32, rad_px: f32)
 // ===========================================================================
 // Scene compositor
 // ===========================================================================
-
-/// Camera over the world. `x,y` is the world point shown at the viewport centre;
-/// `zoom` scales world units to pixels (1.0 = 1:1).
-#[derive(Clone, Copy)]
-pub struct Camera {
-    pub x: f32,
-    pub y: f32,
-    pub zoom: f32,
-}
-impl Camera {
-    /// A camera centred on the parent planet at 1:1 zoom.
-    pub fn centered() -> Camera {
-        Camera { x: 0.0, y: 0.0, zoom: 1.0 }
-    }
-}
-
-/// World → screen for the given viewport.
-#[inline]
-fn to_screen(wx: f32, wy: f32, cam: &Camera, w: u32, h: u32) -> (f32, f32) {
-    (
-        w as f32 * 0.5 + (wx - cam.x) * cam.zoom,
-        h as f32 * 0.5 + (wy - cam.y) * cam.zoom,
-    )
-}
 
 /// Star colour by a hash in [0,1): mostly pale/blue-white, a few warm.
 fn star_tint(hh: f32) -> Rgb {
@@ -761,55 +507,6 @@ fn paint_orbit(out: &mut [u8], w: u32, h: u32, cam: &Camera, m: &Moon, width: f3
                 out[idx] = (out[idx] as u32 + 22).min(84) as u8;
                 out[idx + 1] = (out[idx + 1] as u32 + 26).min(90) as u8;
                 out[idx + 2] = (out[idx + 2] as u32 + 34).min(112) as u8;
-            }
-        }
-    }
-}
-
-/// Alpha-blend a tile centred at screen `(sx, sy)` into the RGBA `out`,
-/// nearest-neighbour scaled by `scale` (1.0 = 1:1). `scale > 1` blows each tile
-/// pixel up into a crisp `scale`×`scale` block, so a body rendered into a small
-/// tile turns blocky rather than blurry when magnified.
-fn blit(out: &mut [u8], w: u32, h: u32, tile: &Tile, sx: f32, sy: f32, scale: f32) {
-    let dsize = (tile.size as f32 * scale).round().max(1.0) as i32;
-    let x0 = (sx - dsize as f32 * 0.5).floor() as i32;
-    let y0 = (sy - dsize as f32 * 0.5).floor() as i32;
-    let inv = 1.0 / scale;
-    // Iterate only the on-screen slice of the destination rectangle — clamping
-    // the loop bounds keeps blit cost proportional to visible area.
-    let ddy0 = (-y0).max(0);
-    let ddy1 = (h as i32 - y0).min(dsize);
-    let ddx0 = (-x0).max(0);
-    let ddx1 = (w as i32 - x0).min(dsize);
-    for ddy in ddy0..ddy1 {
-        let dy = y0 + ddy;
-        let ty = ((ddy as f32 + 0.5) * inv) as u32;
-        if ty >= tile.size {
-            continue;
-        }
-        for ddx in ddx0..ddx1 {
-            let dx = x0 + ddx;
-            let tx = ((ddx as f32 + 0.5) * inv) as u32;
-            if tx >= tile.size {
-                continue;
-            }
-            let si = ((ty * tile.size + tx) * 4) as usize;
-            let a = tile.px[si + 3] as u32;
-            if a == 0 {
-                continue;
-            }
-            let di = ((dy as u32 * w + dx as u32) * 4) as usize;
-            if a == 255 {
-                out[di] = tile.px[si];
-                out[di + 1] = tile.px[si + 1];
-                out[di + 2] = tile.px[si + 2];
-                out[di + 3] = 255;
-            } else {
-                let ia = 255 - a;
-                out[di] = ((tile.px[si] as u32 * a + out[di] as u32 * ia) / 255) as u8;
-                out[di + 1] = ((tile.px[si + 1] as u32 * a + out[di + 1] as u32 * ia) / 255) as u8;
-                out[di + 2] = ((tile.px[si + 2] as u32 * a + out[di + 2] as u32 * ia) / 255) as u8;
-                out[di + 3] = 255;
             }
         }
     }

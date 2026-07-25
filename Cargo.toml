@@ -1,6 +1,16 @@
-# Virtual workspace — no root package. Each crate under crates/ is one
-# self-contained "type": a pure-math lib + a wasm C-ABI face + native bins,
-# gated so the wasm build stays dependency-free.
+# Virtual workspace — no root package.
+#
+# The "type" crates each render one kind of thing; a pure-math lib + a wasm
+# C-ABI face + native bins. They share their common primitives through the
+# `*-core` library crates rather than copy-pasting them:
+#
+#   crates/noise-core — 3D value/worley noise + color math (dep-free)
+#   crates/dither-core — Bayer ordered-dither + level quantization (dep-free)
+#   crates/scene-core  — Camera, Rng, Tile/blit compositing, starfield tint
+#   crates/body-core   — compact planet-body renderer (shared by solar + moon)
+#   crates/sun-core    — compact star renderer (shared by solar + comet)
+#   crates/wasm-abi    — the raw C-ABI alloc/dealloc + opaque-handle glue
+#   crates/render-io   — native GIF/PNG bin helpers (needs `image`)
 #
 #   crates/planet    — procedural planets (bins: planet, bench) + wasm
 #   crates/star      — procedural stars/suns (bin: sun) + wasm
@@ -10,11 +20,14 @@
 #   crates/moon      — planets with depth-sorted orbiting moons (bin: moon) + wasm
 #   crates/asteroid  — drifting, perspective-squashed asteroid belts (bin: asteroid) + wasm
 #   crates/comet     — eccentric-orbit comets with anti-sunward tails (bin: comet) + wasm
-#
-# The "type" crates share no code — only third-party deps and this manifest.
 [workspace]
 resolver = "2"
-members = ["crates/planet", "crates/star", "crates/solar", "crates/bird", "crates/character", "crates/moon", "crates/asteroid", "crates/comet"]
+members = [
+    "crates/noise-core", "crates/dither-core", "crates/scene-core",
+    "crates/body-core", "crates/sun-core", "crates/wasm-abi", "crates/render-io",
+    "crates/planet", "crates/star", "crates/solar", "crates/bird",
+    "crates/character", "crates/moon", "crates/asteroid", "crates/comet",
+]
 
 [profile.release]
 opt-level = 3

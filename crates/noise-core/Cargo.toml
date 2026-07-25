@@ -1,0 +1,12 @@
+[package]
+name = "noise-core"
+version = "0.1.0"
+edition = "2021"
+
+# Shared, dependency-free procedural-noise + color-math primitives used by every
+# "celestial" crate (planet, star, solar, moon, comet, asteroid). Byte-identical
+# to the copies these crates used to carry inline. No deps, so it compiles into
+# the wasm builds for free.
+
+[lib]
+crate-type = ["rlib"]

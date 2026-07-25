@@ -1,18 +1,19 @@
 //! solar — a procedural, seed-driven **solar system** you can drag around.
 //!
-//! Pure math, zero dependencies. Where `planet` and `star` each render one body
-//! filling a square, `solar` renders a *whole system* into an arbitrary
-//! rectangular viewport: a central star with planets orbiting it, drawn against
-//! a starfield you can pan across and zoom into. Same seed => the same system,
-//! forever.
+//! Pure math over the dependency-free `*-core` rlibs. Where `planet` and `star`
+//! each render one body filling a square, `solar` renders a *whole system* into
+//! an arbitrary rectangular viewport: a central star with planets orbiting it,
+//! drawn against a starfield you can pan across and zoom into. Same seed => the
+//! same system, forever.
 //!
-//! This crate is self-contained by the workspace rule (each "type" crate shares
-//! no code with the others — only third-party deps and the manifest). It carries
-//! its own compact noise/color primitives and its own *tile* renderers for a
-//! star and a planet: small versions of the same fake-3D sphere technique the
-//! sibling crates use, tuned to read at the tens-of-pixels scale a system view
-//! needs. The new work here is the layer on top — orbital layout, depth sorting
-//! so planets pass in front of and behind the sun, and a draggable camera.
+//! This crate leans on the workspace's shared, dependency-free `*-core` rlibs:
+//! `noise-core`/`dither-core` for the compact noise/color primitives, `scene-core`
+//! for the compositor + camera helpers, and `sun-core`/`body-core` for the *tile*
+//! renderers of a star and a planet — small versions of the same fake-3D sphere
+//! technique the sibling crates use, tuned to read at the tens-of-pixels scale a
+//! system view needs. The new work here is the layer on top — orbital layout,
+//! depth sorting so planets pass in front of and behind the sun, and a draggable
+//! camera.
 //!
 //! Pipeline per frame (see [`render_system`]):
 //!   1. paint the parallax starfield for the current camera,
@@ -28,154 +29,40 @@ use std::cell::RefCell;
 use std::f32::consts::TAU;
 
 // ===========================================================================
-// Noise + math primitives (this crate's own copy — shared with nobody)
+// Noise + math primitives — now imported from the shared primitive crates
+// (`noise-core` / `dither-core`) instead of a local copy. The values are
+// unchanged, so the rendered output is byte-for-byte identical.
 // ===========================================================================
 
-fn hash3(x: i32, y: i32, z: i32) -> f32 {
-    // Murmur3-style bit mixer -> well-distributed, mean ~0.5.
-    let mut h = (x as u32).wrapping_mul(0x8da6_b343)
-        ^ (y as u32).wrapping_mul(0xd816_3841)
-        ^ (z as u32).wrapping_mul(0xcb1a_b31f);
-    h ^= h >> 16;
-    h = h.wrapping_mul(0x7feb_352d);
-    h ^= h >> 15;
-    h = h.wrapping_mul(0x846c_a68b);
-    h ^= h >> 16;
-    (h as f32) / (u32::MAX as f32)
-}
+use noise_core::{clamp01, fbm, hash3, mix, smoothstep, Rgb};
+use dither_core::bayer;
 
-fn smoother(t: f32) -> f32 {
-    t * t * t * (t * (t * 6.0 - 15.0) + 10.0)
-}
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
-}
+// Shared scene-compositor primitives (formerly copy-pasted into this crate).
+// Values are byte-identical to the local copies these replaced, so the rendered
+// output is unchanged. `Camera` is re-exported because it's part of this crate's
+// public API (its wasm glue + bins reference `solar::Camera` / `crate::Camera`).
+use scene_core::{blit, to_screen, Rng, Tile, ORBIT_FLATTEN};
+pub use scene_core::Camera;
 
-fn value_noise(x: f32, y: f32, z: f32) -> f32 {
-    let (xi, yi, zi) = (x.floor(), y.floor(), z.floor());
-    let (xf, yf, zf) = (x - xi, y - yi, z - zi);
-    let (xi, yi, zi) = (xi as i32, yi as i32, zi as i32);
-    let (u, v, w) = (smoother(xf), smoother(yf), smoother(zf));
-    let c = |dx: i32, dy: i32, dz: i32| hash3(xi + dx, yi + dy, zi + dz);
-    let x00 = lerp(c(0, 0, 0), c(1, 0, 0), u);
-    let x10 = lerp(c(0, 1, 0), c(1, 1, 0), u);
-    let x01 = lerp(c(0, 0, 1), c(1, 0, 1), u);
-    let x11 = lerp(c(0, 1, 1), c(1, 1, 1), u);
-    lerp(lerp(x00, x10, v), lerp(x01, x11, v), w)
-}
-
-fn fbm(mut x: f32, mut y: f32, mut z: f32, octaves: u32) -> f32 {
-    let (mut sum, mut amp, mut norm) = (0.0, 0.5, 0.0);
-    for _ in 0..octaves {
-        sum += amp * value_noise(x, y, z);
-        norm += amp;
-        amp *= 0.5;
-        x *= 2.0;
-        y *= 2.0;
-        z *= 2.0;
-    }
-    sum / norm
-}
-
-/// 3D Worley F1: distance to the nearest hashed feature point (~[0, 1]). Gives
-/// the sun its convection cells and, faintly, the gas bands their turbulence.
-fn worley(x: f32, y: f32, z: f32) -> f32 {
-    let (fx, fy, fz) = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
-    let mut f1 = 9.0f32;
-    for dz in -1..=1 {
-        for dy in -1..=1 {
-            for dx in -1..=1 {
-                let (cx, cy, cz) = (fx + dx, fy + dy, fz + dz);
-                let ox = hash3(cx, cy, cz);
-                let oy = hash3(cx + 911, cy + 733, cz + 512);
-                let oz = hash3(cx + 271, cy + 619, cz + 188);
-                let (px, py, pz) = (cx as f32 + ox, cy as f32 + oy, cz as f32 + oz);
-                let d = ((px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2)).sqrt();
-                f1 = f1.min(d);
-            }
-        }
-    }
-    f1
-}
-
-type Rgb = [f32; 3];
-
-fn mix(a: Rgb, b: Rgb, t: f32) -> Rgb {
-    [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)]
-}
-fn clamp01(x: f32) -> f32 {
-    x.max(0.0).min(1.0)
-}
-fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
-    let t = clamp01((x - e0) / (e1 - e0));
-    t * t * (3.0 - 2.0 * t)
-}
-fn contrast(h: f32, k: f32) -> f32 {
-    clamp01((h - 0.5) * k + 0.5)
-}
-fn ramp(stops: &[(f32, Rgb)], h: f32) -> Rgb {
-    for s in stops {
-        if h < s.0 {
-            return s.1;
-        }
-    }
-    stops[stops.len() - 1].1
-}
-fn ramp3(a: Rgb, b: Rgb, c: Rgb, t: f32) -> Rgb {
-    if t < 0.5 {
-        mix(a, b, t * 2.0)
-    } else {
-        mix(b, c, (t - 0.5) * 2.0)
-    }
-}
-
-/// Bounded, decorrelated per-body noise offsets — keep them small so f32
-/// precision holds and the noise doesn't collapse into bands.
-fn seed_offsets(seed: u32) -> [f32; 3] {
-    [
-        hash3(seed as i32, 1, 7) * 220.0 + 4.0,
-        hash3(seed as i32, 2, 7) * 220.0 + 4.0,
-        hash3(seed as i32, 3, 7) * 220.0 + 4.0,
-    ]
-}
-
-/// Tiny deterministic RNG for system generation (SplitMix-ish over hash3).
-struct Rng {
-    seed: i32,
-    ctr: i32,
-}
-impl Rng {
-    fn new(seed: u32) -> Rng {
-        Rng { seed: seed as i32, ctr: 0 }
-    }
-    fn f(&mut self) -> f32 {
-        self.ctr = self.ctr.wrapping_add(1);
-        hash3(self.seed, self.ctr, 0x9e37)
-    }
-    /// Uniform in [lo, hi).
-    fn range(&mut self, lo: f32, hi: f32) -> f32 {
-        lo + (hi - lo) * self.f()
-    }
-    fn below(&mut self, p: f32) -> bool {
-        self.f() < p
-    }
-}
+// The compact "lite renderer" for the central sun (formerly a local copy of
+// `SunKind` + `sun_surface` + `render_sun_tile`). `StarKind` is field-identical
+// to solar's old `SunKind`, so the `SUNS` table and every field access are
+// unchanged; the alias keeps solar's ~9 `SunKind` references working.
+use sun_core::StarKind as SunKind;
+// The compact "lite renderer" for the orbiting planets (formerly a local copy of
+// `PKind` + `pbase` + the `KIND_*` consts + `planet_surface` + `render_planet_tile`).
+// `BodyKind` is field-for-field identical to solar's old `PKind` and `base()` ==
+// solar's old `pbase()`, so the `PKINDS` table and every `..pbase()` spread work
+// unchanged; the `render_body_tile as render_planet_tile` alias keeps the call
+// site's signature identical.
+use body_core::{
+    base as pbase, render_body_tile as render_planet_tile, BodyKind as PKind, KIND_EMISSIVE,
+    KIND_GAS, KIND_ICE, KIND_TERRA,
+};
 
 // ===========================================================================
 // The star at the centre
 // ===========================================================================
-
-/// A small star archetype for the system centre. A compact cousin of the `star`
-/// crate's table: a cool→mid→hot photosphere ramp plus a corona tint.
-#[derive(Clone, Copy)]
-struct SunKind {
-    name: &'static str,
-    cool: Rgb,
-    mid: Rgb,
-    hot: Rgb,
-    corona: Rgb,
-    gran: f32, // granulation cell frequency
-}
 
 const SUNS: &[SunKind] = &[
     SunKind { name: "yellow dwarf", cool: [0.55, 0.20, 0.02], mid: [0.99, 0.74, 0.20], hot: [1.0, 0.97, 0.82], corona: [1.0, 0.82, 0.42], gran: 5.5 },
@@ -194,79 +81,9 @@ const CORONA_REACH: f32 = 0.7;
 /// costly tile is baked once every several frames instead of every frame.
 const SUN_TQUANT: f32 = 0.08;
 
-/// Emissive photosphere colour at a rotated surface point + limb factor.
-fn sun_surface(sk: &SunKind, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], t: f32, mu: f32, lod: bool) -> Rgb {
-    let f = sk.gran;
-    let (px, py, pz) = (sx + ofs[0], sy + ofs[1], sz + ofs[2]);
-    // Boil the cell field slowly over time; sample a warped worley for lanes.
-    // `lod` (set for large, zoomed-in tiles) drops the secondary-fBm octaves —
-    // they modulate below the Bayer-dither floor at that size, so it's a free
-    // ~20% off the re-bake with no visible change. Worley stays full (it *is*
-    // the visible cell structure).
-    let (warp_oct, blotch_oct) = if lod { (1, 2) } else { (2, 3) };
-    let warp = 0.5 * fbm(px * 1.6 + t * 0.4, py * 1.6, pz * 1.6 - t * 0.3, warp_oct) - 0.25;
-    let w = worley(px * f + warp, py * f + warp, pz * f);
-    let blotch = fbm(px * 0.9, py * 0.9, pz * 0.9 + t * 0.2, blotch_oct);
-    let cool_region = smoothstep(0.46, 0.30, blotch);
-    let lane = smoothstep(0.55, 0.82, w);
-    let dark = clamp01(cool_region * 0.85 + lane * 0.4);
-    let heat = clamp01(1.0 - 0.9 * dark);
-    let mut col = ramp3(sk.cool, sk.mid, sk.hot, heat);
-    // Gentle limb darkening: dimmer + cooler at the edge for a spherical read.
-    let limb = 0.66 + 0.34 * mu.powf(0.45);
-    col = mix(mix(col, sk.cool, 0.20 * (1.0 - mu)), col, mu.sqrt());
-    [col[0] * limb, col[1] * limb, col[2] * limb]
-}
-
 // ===========================================================================
 // Planet type table (compact)
 // ===========================================================================
-
-const KIND_TERRA: u8 = 0; // fbm continents + optional sea/caps
-const KIND_GAS: u8 = 1; // latitude bands
-const KIND_EMISSIVE: u8 = 2; // dark rock threaded with lava/glow
-const KIND_ICE: u8 = 3; // ridged frozen crust
-
-#[derive(Clone, Copy)]
-struct PKind {
-    name: &'static str,
-    kind: u8,
-    freq: f32,
-    contr: f32,
-    stops: &'static [(f32, Rgb)], // terrestrial / ice ramp
-    band_lo: Rgb,                 // gas
-    band_hi: Rgb,
-    bands: f32,
-    rock: Rgb, // emissive
-    glow_lo: Rgb,
-    glow_hi: Rgb,
-    atmo: Rgb,
-    caps: f32,   // polar cap coverage
-    clouds: f32, // white cloud cover
-    rings: bool,
-    orbit_band: u8, // 0 inner (hot/rocky), 1 mid, 2 outer (cold/gas) — for placement
-}
-
-const fn pbase() -> PKind {
-    PKind {
-        name: "",
-        kind: KIND_TERRA,
-        freq: 2.4,
-        contr: 1.9,
-        stops: &[],
-        band_lo: [0.5, 0.4, 0.3],
-        band_hi: [0.85, 0.78, 0.6],
-        bands: 10.0,
-        rock: [0.15, 0.09, 0.07],
-        glow_lo: [1.0, 0.42, 0.06],
-        glow_hi: [1.0, 0.92, 0.35],
-        atmo: [0.0, 0.0, 0.0],
-        caps: 0.0,
-        clouds: 0.0,
-        rings: false,
-        orbit_band: 1,
-    }
-}
 
 const TERRAN: &[(f32, Rgb)] = &[
     (0.46, [0.08, 0.16, 0.36]), (0.50, [0.13, 0.30, 0.55]), (0.52, [0.78, 0.73, 0.52]),
@@ -468,9 +285,6 @@ struct BgCache {
     layer: Vec<u8>,
 }
 
-/// How much orbits are squashed vertically to fake a tilted, near-top-down view.
-const ORBIT_FLATTEN: f32 = 0.42;
-
 impl System {
     /// Build the system for `seed` with the seed-derived planet count (4..=8).
     pub fn generate(seed: u32) -> System {
@@ -629,309 +443,16 @@ fn pick_kind(rng: &mut Rng, want_band: u8) -> usize {
 // Body tile renderers — each fills a small RGBA tile, transparent off-body
 // ===========================================================================
 
-/// Ordered-dither offset from an 8x8 Bayer matrix, in −0.5..0.5.
-const BAYER: [u8; 64] = [
-    0, 32, 8, 40, 2, 34, 10, 42, 48, 16, 56, 24, 50, 18, 58, 26, 12, 44, 4, 36, 14, 46,
-    6, 38, 60, 28, 52, 20, 62, 30, 54, 22, 3, 35, 11, 43, 1, 33, 9, 41, 51, 19, 59, 27,
-    49, 17, 57, 25, 15, 47, 7, 39, 13, 45, 5, 37, 63, 31, 55, 23, 61, 29, 53, 21,
-];
-fn bayer(x: u32, y: u32) -> f32 {
-    (BAYER[((y % 8) * 8 + (x % 8)) as usize] as f32 + 0.5) / 64.0 - 0.5
-}
-
-/// Ordered-dither quantize to kill banding while staying crisp under motion.
-fn quant(o: Rgb, bx: f32) -> Rgb {
-    let levels = 24.0;
-    let d = bx * 0.7 / levels;
-    [
-        clamp01(((o[0] + d) * levels).round() / levels),
-        clamp01(((o[1] + d) * levels).round() / levels),
-        clamp01(((o[2] + d) * levels).round() / levels),
-    ]
-}
-
-/// A rendered body ready to blit: RGBA pixels + its pixel radius. Alpha is 0
-/// off-body, 255 on the opaque disc, and partial in soft halos (sun corona).
-struct Tile {
-    px: Vec<u8>,
-    size: u32,
-}
-
-/// Render the star to a tile of diameter ~`2*rad_px` (+corona margin).
+/// Render the star to a tile of diameter ~`2*rad_px` (+corona margin). Thin
+/// wrapper over the shared `sun-core` renderer, pinning solar's corona reach and
+/// enabling its large-tile LOD path. `true` = enable the LOD detail-thinning.
 fn render_sun_tile(sk: &SunKind, seed: u32, t: f32, rad_px: f32) -> Tile {
-    let margin = rad_px * CORONA_REACH + 3.0;
-    let size = ((rad_px + margin) * 2.0).ceil() as u32;
-    let size = size.max(6);
-    let c = size as f32 / 2.0;
-    let ofs = seed_offsets(seed);
-    // A2 LOD: on a large (zoomed-in) tile, thin the secondary-fBm octaves.
-    let lod = size > 200;
-    let corona_oct = if lod { 2 } else { 3 };
-    let mut px = vec![0u8; (size * size * 4) as usize];
-
-    for iy in 0..size {
-        for ix in 0..size {
-            let nx = (ix as f32 + 0.5 - c) / rad_px;
-            let ny = (c - (iy as f32 + 0.5)) / rad_px;
-            let d2 = nx * nx + ny * ny;
-            let r = d2.sqrt();
-
-            let (mut col, mut a);
-            if d2 <= 1.0 {
-                let nz = (1.0 - d2).sqrt();
-                col = sun_surface(sk, nx, ny, nz, ofs, t, nz, lod);
-                a = 1.0;
-            } else {
-                col = [0.0, 0.0, 0.0];
-                a = 0.0;
-            }
-            // Corona halo: a soft, shimmering falloff past the limb.
-            let edge = r - 1.0;
-            if edge > 0.0 && edge < CORONA_REACH {
-                let theta = ny.atan2(nx);
-                // Ragged flares around the rim + a smooth radial falloff.
-                let flare = 0.6 + 0.5 * fbm(theta.cos() * 5.0, theta.sin() * 5.0, t * 0.6, corona_oct);
-                let fall = smoothstep(CORONA_REACH, 0.0, edge).powf(1.6);
-                let glow = clamp01(fall * flare);
-                let cc = [sk.corona[0] * glow, sk.corona[1] * glow, sk.corona[2] * glow];
-                // Composite corona over whatever's here (disc or empty).
-                col = [
-                    clamp01(col[0] * a + cc[0]),
-                    clamp01(col[1] * a + cc[1]),
-                    clamp01(col[2] * a + cc[2]),
-                ];
-                a = clamp01(a.max(glow));
-            }
-
-            let q = quant(col, bayer(ix, iy));
-            let idx = ((iy * size + ix) * 4) as usize;
-            px[idx] = (q[0] * 255.0) as u8;
-            px[idx + 1] = (q[1] * 255.0) as u8;
-            px[idx + 2] = (q[2] * 255.0) as u8;
-            px[idx + 3] = (clamp01(a) * 255.0) as u8;
-        }
-    }
-    Tile { px, size }
-}
-
-/// Planet surface albedo at a rotated surface point (no lighting yet).
-fn planet_surface(pk: &PKind, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], spin_t: f32) -> (Rgb, f32) {
-    let (px, py, pz) = (sx + ofs[0], sy + ofs[1], sz + ofs[2]);
-    match pk.kind {
-        KIND_GAS => {
-            // Latitude bands with a little worley turbulence; a slow zonal drift.
-            let turb = (worley(px * 3.0, py * 3.0, pz * 3.0) - 0.5) * 0.5;
-            let lat = sy + turb * 0.4;
-            let band = 0.5 + 0.5 * (lat * pk.bands + spin_t * 0.2).sin();
-            let mut col = mix(pk.band_lo, pk.band_hi, band);
-            let fine = fbm(px * 4.0, py * 4.0, pz * 4.0, 3);
-            col = mix(col, pk.band_hi, smoothstep(0.55, 0.82, fine) * 0.3);
-            (col, 0.0)
-        }
-        KIND_EMISSIVE => {
-            let n = contrast(fbm(px * pk.freq, py * pk.freq, pz * pk.freq, 6), 1.7);
-            let flow = fbm(px * 2.2 + spin_t * 0.5, py * 2.2, pz * 2.2, 3);
-            let glow = clamp01(smoothstep(0.44, 0.66, n) * (0.55 + 0.9 * flow));
-            let gcol = mix(pk.glow_lo, pk.glow_hi, clamp01(n * 1.4));
-            (mix(pk.rock, gcol, glow), glow)
-        }
-        KIND_ICE => {
-            let raw = fbm(px * pk.freq, py * pk.freq, pz * pk.freq, 5);
-            let n = 1.0 - (2.0 * raw - 1.0).abs(); // ridged fractures
-            let h = contrast(n, pk.contr);
-            (ramp(pk.stops, h), 0.0)
-        }
-        _ => {
-            // Terrestrial: fbm continents, sea level built into the ramp, caps.
-            let raw = fbm(px * pk.freq, py * pk.freq, pz * pk.freq, 6);
-            let h = contrast(raw, pk.contr);
-            let mut col = ramp(pk.stops, h);
-            let cap = smoothstep(0.72, 0.9, sy.abs()) * pk.caps;
-            col = mix(col, [0.92, 0.95, 1.0], cap);
-            (col, 0.0)
-        }
-    }
-}
-
-/// Render a planet to an RGBA tile, lit from world-space direction `light`
-/// (already rotated into the tile's screen frame: +x right, +y up, +z toward
-/// viewer). `spin_a` is the axial rotation phase.
-fn render_planet_tile(pk: &PKind, seed: u32, spin_a: f32, spin_t: f32, light: [f32; 3], rad_px: f32) -> Tile {
-    // Ring worlds need extra margin for the ring plane.
-    let ring_margin = if pk.rings { rad_px * 1.4 } else { 1.5 };
-    let size = ((rad_px + ring_margin) * 2.0).ceil() as u32;
-    let size = size.max(6);
-    let c = size as f32 / 2.0;
-    let ofs = seed_offsets(seed);
-    let (sina, cosa) = spin_a.sin_cos();
-    let has_atmo = pk.atmo != [0.0, 0.0, 0.0];
-    let l = light;
-    let mut px = vec![0u8; (size * size * 4) as usize];
-
-    // Ring geometry (world tilt shared with orbits: squashed vertically).
-    const RING_SQUASH: f32 = 0.42;
-    let (ring_in, ring_out) = (1.28f32, 2.05f32);
-    let ring_col: Rgb = [0.82, 0.74, 0.58];
-
-    for iy in 0..size {
-        for ix in 0..size {
-            let nx = (ix as f32 + 0.5 - c) / rad_px;
-            let ny = (c - (iy as f32 + 0.5)) / rad_px;
-            let d2 = nx * nx + ny * ny;
-
-            let mut o: Rgb = [0.0, 0.0, 0.0];
-            let mut a: f32 = 0.0;
-
-            if d2 <= 1.0 {
-                let nz = (1.0 - d2).sqrt();
-                // Rotate surface point around Y by the spin so it turns.
-                let sx = nx * cosa + nz * sina;
-                let sy = ny;
-                let sz = -nx * sina + nz * cosa;
-
-                let (mut col, emis) = planet_surface(pk, sx, sy, sz, ofs, spin_t);
-
-                if pk.clouds > 0.0 {
-                    let (cs, cc) = (spin_a * 1.4).sin_cos();
-                    let cx3 = nx * cc + nz * cs + ofs[0];
-                    let cz3 = -nx * cs + nz * cc + ofs[2];
-                    let cloud = fbm(cx3 * 2.8, ny * 2.8 + ofs[1], cz3 * 2.8 + spin_t * 0.1, 4);
-                    col = mix(col, [1.0, 1.0, 1.0], smoothstep(0.54, 0.72, cloud) * pk.clouds);
-                }
-
-                // Lambert against the sun direction (emissive worlds self-light).
-                let diff = (nx * l[0] + ny * l[1] + nz * l[2]).max(0.0);
-                let shade = (0.08 + 0.92 * diff).max(emis);
-                o = [col[0] * shade, col[1] * shade, col[2] * shade];
-
-                // Atmospheric rim on the lit limb.
-                if has_atmo {
-                    let rim = (1.0 - nz).powf(3.0) * 0.6 * (0.4 + 0.6 * diff);
-                    o = [
-                        clamp01(o[0] + pk.atmo[0] * rim),
-                        clamp01(o[1] + pk.atmo[1] * rim),
-                        clamp01(o[2] + pk.atmo[2] * rim),
-                    ];
-                }
-                a = 1.0;
-
-                // Crisp dark limb outline for sprite readability.
-                let edge = 1.0 - 1.4 / rad_px;
-                if d2 > edge * edge {
-                    o = [o[0] * 0.30, o[1] * 0.30, o[2] * 0.34];
-                }
-            }
-
-            // Rings: draw the back half behind the disc region we've filled; the
-            // front half (lower screen, ny<0) draws over. Since tiles composite
-            // as a unit, we just paint ring pixels wherever the disc is empty,
-            // plus the front arc even over the disc.
-            if pk.rings {
-                let rr = (nx * nx + (ny / RING_SQUASH).powi(2)).sqrt();
-                if rr >= ring_in && rr <= ring_out && (ny < 0.0 || d2 > 1.0) {
-                    let rn = (rr - ring_in) / (ring_out - ring_in);
-                    let stripes = 0.5 + 0.5 * (rn * 34.0).sin();
-                    let mut alpha = clamp01(0.35 + 0.5 * stripes);
-                    if rn > 0.46 && rn < 0.54 {
-                        alpha *= 0.14; // Cassini-ish gap
-                    }
-                    // Light the ring by the sun too (front side brighter).
-                    let rlit = 0.5 + 0.5 * l[1].abs();
-                    let rb = (0.55 + 0.45 * stripes) * rlit;
-                    let rc = [ring_col[0] * rb, ring_col[1] * rb, ring_col[2] * rb];
-                    o = [lerp(o[0], rc[0], alpha), lerp(o[1], rc[1], alpha), lerp(o[2], rc[2], alpha)];
-                    a = a.max(alpha);
-                }
-            }
-
-            let q = quant(o, bayer(ix, iy));
-            let idx = ((iy * size + ix) * 4) as usize;
-            px[idx] = (q[0] * 255.0) as u8;
-            px[idx + 1] = (q[1] * 255.0) as u8;
-            px[idx + 2] = (q[2] * 255.0) as u8;
-            px[idx + 3] = (clamp01(a) * 255.0) as u8;
-        }
-    }
-    Tile { px, size }
+    sun_core::render_star_tile(sk, seed, t, rad_px, CORONA_REACH, true)
 }
 
 // ===========================================================================
 // Scene compositor
 // ===========================================================================
-
-/// Camera over the world. `x,y` is the world point shown at the viewport
-/// centre; `zoom` scales world units to pixels (1.0 = 1:1).
-#[derive(Clone, Copy)]
-pub struct Camera {
-    pub x: f32,
-    pub y: f32,
-    pub zoom: f32,
-}
-impl Camera {
-    pub fn centered() -> Camera {
-        Camera { x: 0.0, y: 0.0, zoom: 1.0 }
-    }
-}
-
-/// World → screen for the given viewport.
-#[inline]
-fn to_screen(wx: f32, wy: f32, cam: &Camera, w: u32, h: u32) -> (f32, f32) {
-    (
-        w as f32 * 0.5 + (wx - cam.x) * cam.zoom,
-        h as f32 * 0.5 + (wy - cam.y) * cam.zoom,
-    )
-}
-
-/// Alpha-blend a tile centred at screen `(sx, sy)` into the RGBA `out`,
-/// nearest-neighbour scaled by `scale` (1.0 = 1:1). `scale > 1` blows each tile
-/// pixel up into a crisp `scale`×`scale` block — this is how per-body pixelation
-/// is applied: a body is rendered into a small tile, then upsized with hard
-/// edges, so it turns blocky without changing its on-screen size.
-fn blit(out: &mut [u8], w: u32, h: u32, tile: &Tile, sx: f32, sy: f32, scale: f32) {
-    let dsize = (tile.size as f32 * scale).round().max(1.0) as i32;
-    let x0 = (sx - dsize as f32 * 0.5).floor() as i32;
-    let y0 = (sy - dsize as f32 * 0.5).floor() as i32;
-    let inv = 1.0 / scale;
-    // Iterate only the on-screen slice of the (possibly huge, when zoomed in)
-    // destination rectangle — clamping the loop bounds instead of testing every
-    // pixel keeps blit cost proportional to visible area, not tile size.
-    let ddy0 = (-y0).max(0);
-    let ddy1 = (h as i32 - y0).min(dsize);
-    let ddx0 = (-x0).max(0);
-    let ddx1 = (w as i32 - x0).min(dsize);
-    for ddy in ddy0..ddy1 {
-        let dy = y0 + ddy;
-        let ty = ((ddy as f32 + 0.5) * inv) as u32;
-        if ty >= tile.size {
-            continue;
-        }
-        for ddx in ddx0..ddx1 {
-            let dx = x0 + ddx;
-            let tx = ((ddx as f32 + 0.5) * inv) as u32;
-            if tx >= tile.size {
-                continue;
-            }
-            let si = ((ty * tile.size + tx) * 4) as usize;
-            let a = tile.px[si + 3] as u32;
-            if a == 0 {
-                continue;
-            }
-            let di = ((dy as u32 * w + dx as u32) * 4) as usize;
-            if a == 255 {
-                out[di] = tile.px[si];
-                out[di + 1] = tile.px[si + 1];
-                out[di + 2] = tile.px[si + 2];
-                out[di + 3] = 255;
-            } else {
-                let ia = 255 - a;
-                out[di] = ((tile.px[si] as u32 * a + out[di] as u32 * ia) / 255) as u8;
-                out[di + 1] = ((tile.px[si + 1] as u32 * a + out[di + 1] as u32 * ia) / 255) as u8;
-                out[di + 2] = ((tile.px[si + 2] as u32 * a + out[di + 2] as u32 * ia) / 255) as u8;
-                out[di + 3] = 255;
-            }
-        }
-    }
-}
 
 /// Low-saturation nebula tints; two are picked per system by seed.
 const NEB_TINTS: &[Rgb] = &[
