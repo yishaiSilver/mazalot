@@ -46,11 +46,12 @@ pub extern "C" fn galaxy_new_params(seed: u32, count: u32, link_density: f32, ar
     Box::into_raw(Box::new(Galaxy::generate_params(seed, count, link_density, arms)))
 }
 
-/// Live view multipliers (glyph size scale, haze intensity) — no regeneration.
+/// Live view multipliers (glyph size scale, haze intensity, hyperlane width in
+/// px) — no regeneration. Changing the width re-bakes the cached backdrop.
 #[no_mangle]
-pub extern "C" fn galaxy_set_view(gal: *mut Galaxy, node_scale: f32, haze: f32) {
+pub extern "C" fn galaxy_set_view(gal: *mut Galaxy, node_scale: f32, haze: f32, link_width: f32) {
     let gal = unsafe { &mut *gal };
-    gal.set_view(node_scale, haze);
+    gal.set_view(node_scale, haze, link_width);
 }
 
 /// Free a galaxy previously returned by [`galaxy_new`].

@@ -109,7 +109,7 @@
   <div class="viewing" id="viewing">loading…<small id="sysinfo">Rust → WebAssembly</small></div>
 </div>
 <div class="hint" id="hint">
-  <b>drag</b> to pan · <b>scroll / pinch</b> to zoom<br><b>click a star</b> to inspect · <b>double-click</b> to enter
+  <b>drag</b> to pan · <b>scroll / pinch</b> to zoom<br><b>click a star</b> to inspect &amp; light up its jumps · <b>double-click</b> to enter
 </div>
 
 <button class="backbtn" id="back">← Galaxy</button>
@@ -141,6 +141,7 @@
     <div class="grp">Look</div>
     <div class="ctl"><label>Star size <b id="nsizeV">1.00×</b></label><input type="range" id="nsize" min="0.4" max="2.5" step="0.05" value="1" /></div>
     <div class="ctl"><label>Nebula haze <b id="hazeV">1.00×</b></label><input type="range" id="haze" min="0" max="2.5" step="0.05" value="1" /></div>
+    <div class="ctl"><label>Hyperlane width <b id="lwidthV">1.0px</b></label><input type="range" id="lwidth" min="1" max="6" step="0.5" value="1" /></div>
     <button class="wide" id="fit">⤢ Reset view</button>
   </div>
 </div>
@@ -200,7 +201,7 @@ const cam = () => (mode === "map" ? camMap : camSys);
 
 // --- map state ---
 let seed = 7, nSystems = 0, selNode = -1, hoverNode = -1;
-let vCount = 0, vLink = 0.35, vArms = 0, vNsize = 1, vHaze = 1;
+let vCount = 0, vLink = 0.35, vArms = 0, vNsize = 1, vHaze = 1, vLinkW = 1;
 let tMap = 0;
 
 // --- system (solar) state, mirrors the solar demo ---
@@ -235,7 +236,7 @@ function buildGalaxy() {
   if (gal) G.galaxy_free(gal);
   gal = G.galaxy_new_params(seed, vCount | 0, vLink, vArms | 0);
   nSystems = G.node_count(gal);
-  G.galaxy_set_view(gal, vNsize, vHaze);
+  G.galaxy_set_view(gal, vNsize, vHaze, vLinkW);
   $("countV").textContent = nSystems;
   const name = systemName(seed ^ 0xA11);
   $("ctxTitle").textContent = "Procedural Galaxy";
@@ -289,7 +290,7 @@ function enterSystem(i) {
 function exitSystem() {
   mode = "map";
   $("dock").classList.remove("hidden"); $("back").classList.remove("show");
-  $("hint").innerHTML = "<b>drag</b> to pan · <b>scroll / pinch</b> to zoom<br><b>click a star</b> to inspect · <b>double-click</b> to enter";
+  $("hint").innerHTML = "<b>drag</b> to pan · <b>scroll / pinch</b> to zoom<br><b>click a star</b> to inspect &amp; light up its jumps · <b>double-click</b> to enter";
   $("ctxTitle").textContent = "Procedural Galaxy";
   $("viewing").firstChild.textContent = `Sector ${systemName(seed ^ 0xA11)} `;
   selectNode(sysNode); // reopen the panel on the system we just left
@@ -455,8 +456,9 @@ $("count").addEventListener("input", () => { vCount = parseInt($("count").value)
 $("link").addEventListener("input", () => { vLink = parseFloat($("link").value); $("linkV").textContent = vLink.toFixed(2); buildGalaxy(); });
 $("arms").addEventListener("input", () => { vArms = parseInt($("arms").value) || 0; $("armsV").textContent = vArms === 0 ? "auto" : vArms; buildGalaxy(); });
 // Look knobs are live (no rebuild).
-$("nsize").addEventListener("input", () => { vNsize = parseFloat($("nsize").value); $("nsizeV").textContent = vNsize.toFixed(2) + "×"; G.galaxy_set_view(gal, vNsize, vHaze); });
-$("haze").addEventListener("input", () => { vHaze = parseFloat($("haze").value); $("hazeV").textContent = vHaze.toFixed(2) + "×"; G.galaxy_set_view(gal, vNsize, vHaze); });
+$("nsize").addEventListener("input", () => { vNsize = parseFloat($("nsize").value); $("nsizeV").textContent = vNsize.toFixed(2) + "×"; G.galaxy_set_view(gal, vNsize, vHaze, vLinkW); });
+$("haze").addEventListener("input", () => { vHaze = parseFloat($("haze").value); $("hazeV").textContent = vHaze.toFixed(2) + "×"; G.galaxy_set_view(gal, vNsize, vHaze, vLinkW); });
+$("lwidth").addEventListener("input", () => { vLinkW = parseFloat($("lwidth").value); $("lwidthV").textContent = vLinkW.toFixed(1) + "px"; G.galaxy_set_view(gal, vNsize, vHaze, vLinkW); });
 window.addEventListener("resize", setupCanvas);
 
 // ================================ BOOT =======================================

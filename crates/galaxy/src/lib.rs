@@ -248,10 +248,15 @@ pub struct Galaxy {
     pub arms: u32,
     pub twist: f32,    // log-spiral tightness
     pub asym_phi: f32, // direction of the m=1 lopsidedness
+    /// Adjacency (hyperlane neighbours) per node — the systems reachable in one
+    /// jump. Drives the jump-target highlight when a system is selected.
+    pub adj: Vec<Vec<u32>>,
     stars: Vec<FieldStar>,
     hii: Vec<Hii>,
     pub node_scale: f32,
     pub haze: f32,
+    /// Hyperlane draw width in px (view-only; part of the backdrop cache key).
+    pub link_width: f32,
     // Cached backdrop (the whole baked body + hyperlanes) keyed on camera + view;
     // reused by `render_map_cached` while the camera is still. `scratch` is the
     // reusable float HDR buffer the bake accumulates into before tone-mapping.
@@ -526,11 +531,14 @@ impl Galaxy {
             }
         }
 
-        // --- degree counts (hub-ness) from the finished edge list.
+        // --- degree counts (hub-ness) + adjacency list from the finished edges.
         let mut degree = vec![0u16; n];
+        let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
         for &(a, b) in &edges {
             degree[a as usize] = degree[a as usize].saturating_add(1);
             degree[b as usize] = degree[b as usize].saturating_add(1);
+            adj[a as usize].push(b);
+            adj[b as usize].push(a);
         }
 
         // --- assemble nodes.
@@ -621,20 +629,24 @@ impl Galaxy {
             arms,
             twist,
             asym_phi,
+            adj,
             stars,
             hii,
             node_scale: 1.0,
             haze: 1.0,
+            link_width: 1.0,
             bg_cache: Vec::new(),
             bg_key: None,
             scratch: Vec::new(),
         }
     }
 
-    /// Live view multipliers: glyph size scale and haze intensity (0 = off).
-    pub fn set_view(&mut self, node_scale: f32, haze: f32) {
+    /// Live view multipliers: glyph size scale, haze intensity (0 = off), and
+    /// hyperlane draw width in px (1 = thin single-pixel lanes).
+    pub fn set_view(&mut self, node_scale: f32, haze: f32, link_width: f32) {
         self.node_scale = node_scale.clamp(0.2, 4.0);
         self.haze = haze.clamp(0.0, 3.0);
+        self.link_width = link_width.clamp(1.0, 8.0);
     }
 
     /// Farthest node radius from the galactic centre (+margin) — for fit-zoom.
@@ -790,6 +802,70 @@ fn linef(buf: &mut [f32], w: u32, h: u32, ax: f32, ay: f32, bx: f32, by: f32, c:
     }
 }
 
+/// A width-`w_px` additive line into the float buffer — the same DDA as [`linef`]
+/// but stamped across a perpendicular band so hyperlanes can be drawn thicker.
+/// `w_px <= 1` degenerates to the single-pixel [`linef`].
+#[allow(clippy::too_many_arguments)]
+fn linef_wide(buf: &mut [f32], w: u32, h: u32, ax: f32, ay: f32, bx: f32, by: f32, c: Rgb, bright: f32, w_px: f32) {
+    if w_px <= 1.0 {
+        linef(buf, w, h, ax, ay, bx, by, c, bright);
+        return;
+    }
+    let (dx, dy) = (bx - ax, by - ay);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1e-3 {
+        addf(buf, w, h, ax as i32, ay as i32, c, bright);
+        return;
+    }
+    // Unit perpendicular to the lane, to offset the parallel strands.
+    let (nx, ny) = (-dy / len, dx / len);
+    let half = (w_px - 1.0) * 0.5;
+    let steps = len.ceil() as i32;
+    let (sx, sy) = (dx / steps as f32, dy / steps as f32);
+    let mut off = -half;
+    while off <= half + 1e-3 {
+        // Feather the strand brightness toward the edge of the band.
+        let edge = if half > 0.0 { 1.0 - 0.35 * (off.abs() / half) } else { 1.0 };
+        let (mut x, mut y) = (ax + nx * off, ay + ny * off);
+        for _ in 0..=steps {
+            addf(buf, w, h, x as i32, y as i32, c, bright * edge);
+            x += sx;
+            y += sy;
+        }
+        off += 1.0;
+    }
+}
+
+/// A width-`w_px` additive line straight onto the RGBA8 buffer — used for the
+/// bright jump-route highlight drawn over the (cached) backdrop.
+#[allow(clippy::too_many_arguments)]
+fn line_px_wide(out: &mut [u8], w: u32, h: u32, ax: f32, ay: f32, bx: f32, by: f32, c: Rgb, bright: f32, w_px: f32) {
+    let (dx, dy) = (bx - ax, by - ay);
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1e-3 {
+        add_px(out, w, h, ax as i32, ay as i32, c, bright);
+        return;
+    }
+    let (nx, ny) = (-dy / len, dx / len);
+    let half = (w_px - 1.0).max(0.0) * 0.5;
+    let steps = len.ceil() as i32;
+    let (sx, sy) = (dx / steps as f32, dy / steps as f32);
+    let mut off = -half;
+    loop {
+        let edge = if half > 0.0 { 1.0 - 0.4 * (off.abs() / half) } else { 1.0 };
+        let (mut x, mut y) = (ax + nx * off, ay + ny * off);
+        for _ in 0..=steps {
+            add_px(out, w, h, x as i32, y as i32, c, bright * edge);
+            x += sx;
+            y += sy;
+        }
+        off += 1.0;
+        if off > half + 1e-3 {
+            break;
+        }
+    }
+}
+
 // ===========================================================================
 // Backdrop bake: the M101 body (haze + H II knots + nucleus + star-field +
 // hyperlanes) accumulated in HDR, then tone-mapped. Time-independent → cached.
@@ -929,7 +1005,7 @@ fn paint_backdrop(out: &mut [u8], w: u32, h: u32, cam: &Camera, gal: &Galaxy, bu
         if ax.max(bx) < 0.0 || ax.min(bx) > wf || ay.max(by) < 0.0 || ay.min(by) > hf {
             continue;
         }
-        linef(buf, w, h, ax, ay, bx, by, [0.30, 0.38, 0.60], 0.05);
+        linef_wide(buf, w, h, ax, ay, bx, by, [0.30, 0.38, 0.60], 0.05, gal.link_width);
     }
 
     // --- tone-map HDR → RGBA8 (Reinhard roll-off + gamma + vignette). A small LUT
@@ -968,6 +1044,32 @@ fn paint_backdrop(out: &mut [u8], w: u32, h: u32, cam: &Camera, gal: &Galaxy, bu
 
 fn draw_glyphs(out: &mut [u8], w: u32, h: u32, cam: &Camera, gal: &Galaxy, t: f32, sel: i32, hover: i32) {
     let (wf, hf) = (w as f32, h as f32);
+
+    // --- jump-route highlight: when a system is selected, light up the lanes to
+    // every system reachable in one jump (its hyperlane neighbours) so the
+    // destinations you can travel to are obvious. Drawn UNDER the glyphs. ---
+    let neighbors: &[u32] = if sel >= 0 && (sel as usize) < gal.nodes.len() {
+        &gal.adj[sel as usize]
+    } else {
+        &[]
+    };
+    let is_neighbor = |i: usize| neighbors.iter().any(|&nb| nb as usize == i);
+    if !neighbors.is_empty() {
+        let s = &gal.nodes[sel as usize];
+        let (sx, sy) = to_screen(s.x, s.y, cam, w, h);
+        // Slow travelling pulse so the routes read as "active".
+        let pulse = 0.55 + 0.25 * (t * 2.4).sin();
+        let route_w = (gal.link_width + 1.5).max(2.0);
+        for &nb in neighbors {
+            let nd = &gal.nodes[nb as usize];
+            let (nx, ny) = to_screen(nd.x, nd.y, cam, w, h);
+            if sx.max(nx) < 0.0 || sx.min(nx) > wf || sy.max(ny) < 0.0 || sy.min(ny) > hf {
+                continue;
+            }
+            line_px_wide(out, w, h, sx, sy, nx, ny, [0.42, 0.80, 1.0], 0.45 * pulse, route_w);
+        }
+    }
+
     for (i, nd) in gal.nodes.iter().enumerate() {
         let (sx, sy) = to_screen(nd.x, nd.y, cam, w, h);
         // Glyph size is mostly constant on screen (a star map), nudged by
@@ -998,6 +1100,12 @@ fn draw_glyphs(out: &mut [u8], w: u32, h: u32, cam: &Camera, gal: &Galaxy, t: f3
             }
         }
 
+        // Jump-target ring on every neighbour of the selected system (cyan, to
+        // match the highlighted routes).
+        if i as i32 != sel && is_neighbor(i) {
+            let jr = glow + 3.0 + 0.8 * (t * 2.4 + nd.twinkle).sin();
+            ring(out, w, h, sx, sy, jr, [0.42, 0.80, 1.0], 0.7);
+        }
         if i as i32 == hover && hover != sel {
             ring(out, w, h, sx, sy, glow + 3.0, [0.75, 0.82, 0.95], 0.5);
         }
@@ -1026,9 +1134,9 @@ pub fn render_map(gal: &Galaxy, w: u32, h: u32, cam: &Camera, t: f32, sel: i32, 
 
 /// Cache key for the backdrop: fully determined by camera + view (NO time, NO
 /// selection), so a still camera reuses it byte-for-byte.
-type BgKey = [f32; 7];
+type BgKey = [f32; 8];
 fn bg_key(gal: &Galaxy, w: u32, h: u32, cam: &Camera) -> BgKey {
-    [w as f32, h as f32, cam.x, cam.y, cam.zoom, gal.haze, gal.seed as f32]
+    [w as f32, h as f32, cam.x, cam.y, cam.zoom, gal.haze, gal.link_width, gal.seed as f32]
 }
 
 /// Like [`render_map`] but caches the (time-independent) backdrop on the galaxy.
