@@ -40,33 +40,57 @@ done
 [ -n "$CRATE" ] || die "usage: scripts/make-artifact.sh <crate> [--out FILE] [--no-build]"
 
 HTML="$ROOT/crates/$CRATE/web/index.html"
-WASM="$ROOT/crates/$CRATE/web/$CRATE.wasm"
-[ -f "$HTML" ] || die "no demo at crates/$CRATE/web/index.html (try: solar, moon, asteroid, comet, star)"
+WEBDIR="$ROOT/crates/$CRATE/web"
+PRIMARY="$WEBDIR/$CRATE.wasm"
+[ -f "$HTML" ] || die "no demo at crates/$CRATE/web/index.html (try: solar, moon, asteroid, comet, star, galaxy)"
 
 OUT="${OUT:-$ROOT/dist/$CRATE.html}"
 
 command -v python3 >/dev/null 2>&1 || die "python3 is required (used to inline the wasm)"
 
-# --- build the wasm (unless told to reuse the committed one) ------------------
+# Some demos load MORE than their own wasm (e.g. galaxy embeds solar for the
+# drill-down, via a `loadWasm(url)` helper). Treat every *.wasm sibling in the
+# web dir as a module to inline; the crate to (re)build is the file's basename.
+shopt -s nullglob
+WASMS=()
+for w in "$WEBDIR"/*.wasm; do WASMS+=("$w"); done
+shopt -u nullglob
+
+# --- build the wasm(s) (unless told to reuse the committed ones) --------------
 if [ "$BUILD" -eq 1 ]; then
   command -v cargo >/dev/null 2>&1 || die "cargo not found; install Rust or pass --no-build"
   if ! (rustup target list --installed 2>/dev/null | grep -q wasm32-unknown-unknown); then
     die "wasm target missing — run: rustup target add wasm32-unknown-unknown (or pass --no-build)"
   fi
-  echo "==> building $CRATE.wasm (release, no-default-features)"
-  ( cd "$ROOT" && cargo build -q -p "$CRATE" --target wasm32-unknown-unknown --release --no-default-features )
-  cp "$ROOT/target/wasm32-unknown-unknown/release/$CRATE.wasm" "$WASM"
+  # Always build the primary crate; also rebuild any sibling-module crates
+  # (their .wasm already sits in the web dir — e.g. solar for galaxy).
+  BUILD_LIST=("$CRATE")
+  for w in "${WASMS[@]}"; do
+    name="$(basename "$w" .wasm)"
+    [ "$name" = "$CRATE" ] && continue
+    BUILD_LIST+=("$name")
+  done
+  for name in "${BUILD_LIST[@]}"; do
+    echo "==> building $name.wasm (release, no-default-features)"
+    ( cd "$ROOT" && cargo build -q -p "$name" --target wasm32-unknown-unknown --release --no-default-features )
+    cp "$ROOT/target/wasm32-unknown-unknown/release/$name.wasm" "$WEBDIR/$name.wasm"
+  done
+  shopt -s nullglob; WASMS=(); for w in "$WEBDIR"/*.wasm; do WASMS+=("$w"); done; shopt -u nullglob
 fi
-[ -f "$WASM" ] || die "no wasm at crates/$CRATE/web/$CRATE.wasm (drop --no-build to build it)"
+[ -f "$PRIMARY" ] || die "no wasm at crates/$CRATE/web/$CRATE.wasm (drop --no-build to build it)"
 
-# --- inline the wasm + strip the outer document wrapper -----------------------
+# Pass the primary wasm first (the single-module path uses it), then the rest.
+ORDERED=("$PRIMARY")
+for w in "${WASMS[@]}"; do [ "$w" = "$PRIMARY" ] || ORDERED+=("$w"); done
+
+# --- inline the wasm(s) + strip the outer document wrapper --------------------
 mkdir -p "$(dirname "$OUT")"
-python3 - "$HTML" "$WASM" "$OUT" <<'PY'
-import base64, re, sys
+python3 - "$HTML" "$OUT" "${ORDERED[@]}" <<'PY'
+import base64, os, re, sys
 
-html_path, wasm_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+html_path, out_path, wasm_paths = sys.argv[1], sys.argv[2], sys.argv[3:]
 html = open(html_path, encoding="utf-8").read()
-b64  = base64.b64encode(open(wasm_path, "rb").read()).decode("ascii")
+def b64(p): return base64.b64encode(open(p, "rb").read()).decode("ascii")
 
 # The Artifact host supplies <!doctype html><head></head><body>; keep only the
 # page content from <title> onward, and drop the closing wrapper tags.
@@ -77,23 +101,36 @@ html = html[i:]
 for tag in ("</head>", "<body>", "</body>", "</html>"):
     html = html.replace(tag, "")
 
-# Inline the wasm blob at the top of the module script, then instantiate from it
-# instead of fetching a sibling file (sandboxed hosts block cross-file fetches).
-if "<script type=\"module\">" not in html:
-    sys.exit("make-artifact: expected a <script type=\"module\"> block")
-html = html.replace('<script type="module">',
-                    '<script type="module">\nconst __WASM_B64 = "%s";' % b64, 1)
-html = re.sub(r'\n[ \t]*const res = await fetch\([^;]*\);', "", html, count=1)
-html = html.replace("await res.arrayBuffer()",
-                    "Uint8Array.from(atob(__WASM_B64), c => c.charCodeAt(0))")
+if '<script type="module">' not in html:
+    sys.exit('make-artifact: expected a <script type="module"> block')
+
+if "async function loadWasm" in html:
+    # Multi-module demo: a `loadWasm(url)` helper fetches each sibling wasm.
+    # Inline them all into a url->base64 map and instantiate from the map.
+    entries = ",\n".join('  "./%s": "%s"' % (os.path.basename(p), b64(p)) for p in wasm_paths)
+    html = html.replace('<script type="module">',
+                        '<script type="module">\nconst __WASM = {\n%s\n};' % entries, 1)
+    html = re.sub(r'\n[ \t]*const res = await fetch\([^;]*\);', "", html, count=1)
+    html = re.sub(r'\n[ \t]*if \(!res\.ok\)[^;]*;', "", html, count=1)
+    html = html.replace("await res.arrayBuffer()",
+                        "Uint8Array.from(atob(__WASM[url]), c => c.charCodeAt(0))")
+    token = "__WASM"
+else:
+    # Single-module demo: one top-level fetch of the crate's own wasm.
+    html = html.replace('<script type="module">',
+                        '<script type="module">\nconst __WASM_B64 = "%s";' % b64(wasm_paths[0]), 1)
+    html = re.sub(r'\n[ \t]*const res = await fetch\([^;]*\);', "", html, count=1)
+    html = html.replace("await res.arrayBuffer()",
+                        "Uint8Array.from(atob(__WASM_B64), c => c.charCodeAt(0))")
+    token = "__WASM_B64"
 
 if "fetch(" in html:
     sys.exit("make-artifact: a fetch() call survived — the page loads something other than its wasm")
-if "__WASM_B64" not in html:
+if token not in html:
     sys.exit("make-artifact: failed to inline the wasm blob")
 
 open(out_path, "w", encoding="utf-8").write(html)
-print("bytes: %d" % len(html))
+print("bytes: %d, modules: %d" % (len(html), len(wasm_paths)))
 PY
 
 SIZE="$(wc -c < "$OUT" | tr -d ' ')"

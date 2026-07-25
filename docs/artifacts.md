@@ -32,7 +32,7 @@ scripts/make-artifact.sh <crate> [--out FILE] [--no-build]
 
 | Argument      | Meaning                                                             |
 | ------------- | ------------------------------------------------------------------- |
-| `<crate>`     | a demo under `crates/<crate>/web/` — `solar`, `moon`, `asteroid`, `comet`, `star` |
+| `<crate>`     | a demo under `crates/<crate>/web/` — `solar`, `moon`, `asteroid`, `comet`, `star`, `galaxy` |
 | `--out FILE`  | output path (default `dist/<crate>.html`)                           |
 | `--no-build`  | skip the wasm rebuild; reuse the committed `crates/<crate>/web/<crate>.wasm` |
 
@@ -100,8 +100,15 @@ You'll get a private `claude.ai/code/artifact/…` URL you can open or share.
 - **Size.** The HTML grows by ~4/3 of the wasm size (base64). The demos are
   ~45–91 KB of wasm, so artifacts land around 60–150 KB — trivial.
 - **Only the `crates/<name>/web/` demos** follow the layout this script expects
-  (`solar`, `moon`, `asteroid`, `comet`, `star`). The `planet` and `bird` web
-  builds use different package names and directories and aren't wired in here.
+  (`solar`, `moon`, `asteroid`, `comet`, `star`, `galaxy`). The `planet` and
+  `bird` web builds use different package names and directories and aren't wired
+  in here.
+- **Multi-module demos work too.** `galaxy` embeds *two* wasm modules —
+  `galaxy.wasm` plus `solar.wasm` for the click-a-star drill-down — via a
+  `loadWasm(url)` helper. The script inlines **every `*.wasm` in the demo's web
+  dir** into a `const __WASM = { "./galaxy.wasm": …, "./solar.wasm": … }` map and
+  rewrites the helper to instantiate from it (and rebuilds each of those crates
+  on a default build). Single-module demos are unchanged.
 - **The landing page (`index.html`) is not artifact-able as-is** — it links to
   each demo's own page and loads several wasm modules for thumbnails, none of
   which survive flattening into one file. Generate the individual demos instead.
