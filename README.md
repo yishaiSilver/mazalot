@@ -3,7 +3,7 @@
 Procedural, seed-driven pixel-art planets in Rust — **zero art assets**. Every
 planet is generated from math per pixel, so a single seed always rebuilds the
 exact same world. The core algorithm compiles to both a native GIF/PNG generator
-and a ~42 KB WebAssembly module from **one shared codebase**.
+and a ~56 KB WebAssembly module from **one shared codebase**.
 
 There's also a companion **star** generator (a sibling of the planet renderer),
 a draggable **solar-system** view that composes a star with orbiting planets, a
@@ -43,6 +43,41 @@ a `--no-default-features` wasm build never sees `image`/`rand` and stays tiny.
 | `comet` | Eccentric-orbit comets with anti-sunward tails. |
 | `character` | A paper-doll character compositor (native only). |
 | `bird` | A fully separate creature generator: `--bin alien` (hybrid alien "genus" families) and `--bin bird` (naturalistic earth birds). Shares nothing with the planet crates. |
+
+### Who imports what
+
+● declared in that crate's `Cargo.toml` · ○ pulled in transitively · `render-io` is
+always behind the `native` feature, so the wasm build never sees it.
+
+| library crate | lines | planet | star | solar | moon | comet | asteroid |
+|---------------|------:|:------:|:----:|:-----:|:----:|:-----:|:--------:|
+| `noise-core`  |   146 |   ○    |  ●   |   ●   |  ●   |   ●   |    ●     |
+| `dither-core` |    31 |   ○    |  ●   |   ●   |  ●   |   ●   |    ●     |
+| `scene-core`  |   130 |   ○    |  ·   |   ●   |  ●   |   ●   |    ●     |
+| `planet-core` |   815 |   ●    |  ·   |   ●   |  ●   |   ·   |    ·     |
+| `sun-core`    |   124 |   ·    |  ·   |   ●   |  ·   |   ●   |    ·     |
+| `wasm-abi`    |    87 |   ●    |  ●   |   ●   |  ●   |   ●   |    ●     |
+| `render-io`   |   188 |   ●    |  ●   |   ●   |  ●   |   ●   |    ●     |
+| **`lib.rs`**  |       | **18** | 567  |  907  | 529  |  587  |   526    |
+| **`wasm.rs`** |       |   93   |  58  |  166  |  76  |   79  |    71    |
+
+The library layer is 7 crates / 1,521 lines and stacks in one direction only:
+
+```
+                        render-io ──── image (the only third-party dep)
+                        wasm-abi  ──── (nothing)
+
+noise-core ──┬── dither-core ──┐
+             │                 ├── planet-core ── planet, solar, moon
+             └── scene-core ───┤
+                               └── sun-core ───── solar, comet
+```
+
+`planet` is 18 lines because it is a face over `planet-core` — the same rlib `solar`
+and `moon` render their bodies with. Note that they depend on the **rlib**, not on
+the `planet` crate: `planet` is a cdylib whose `#[no_mangle]` exports (`render`,
+`alloc`, `dealloc`) would collide with each scene crate's own in the wasm build.
+Demo crates depend on library crates, never on each other.
 
 ## The planet system
 
