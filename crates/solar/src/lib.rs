@@ -194,6 +194,32 @@ const CORONA_REACH: f32 = 0.7;
 /// costly tile is baked once every several frames instead of every frame.
 const SUN_TQUANT: f32 = 0.08;
 
+/// Geometric quantum for the star-tile *render radius*. A live zoom changes the
+/// sun's on-screen radius every frame; baking at exactly that radius would re-run
+/// the (expensive) convection shader on every frame of the gesture. Instead we
+/// snap the render radius to a geometric ladder — each rung ~`SUN_RSTEP`× the last
+/// — and blit-scale the cached tile to the exact on-screen size. So one baked tile
+/// serves a whole *band* of zoom levels and is re-baked only when the radius
+/// crosses a rung: a handful of bakes over a full zoom sweep instead of one per
+/// frame. The blit keeps the sun the right size; only its rendered detail steps in
+/// ~`SUN_RSTEP` increments — the same exactness-for-reuse trade the boil clock and
+/// the nebula field already make, and imperceptible beside the existing pixelation.
+const SUN_RSTEP: f32 = 1.2;
+
+/// Snap a desired render radius to the nearest `SUN_RSTEP` geometric rung, pinned
+/// to `cap` at the top so a fully zoomed-in sun (radius clamped at the detail cap)
+/// stays on one stable tile. Within a rung's band this returns the *same* discrete
+/// radius every frame, so the cache key derived from it (and the blit scale that
+/// pairs with it) stay consistent as the live radius drifts across the band.
+fn quant_sun_radius(want: f32, cap: f32) -> f32 {
+    if want >= cap {
+        return cap;
+    }
+    let ln_step = SUN_RSTEP.ln();
+    let rung = (want.max(2.0).ln() / ln_step).round();
+    (rung * ln_step).exp().clamp(2.0, cap)
+}
+
 /// Emissive photosphere colour at a rotated surface point + limb factor.
 fn sun_surface(sk: &SunKind, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], t: f32, mu: f32, lod: bool) -> Rgb {
     let f = sk.gran;
@@ -1271,16 +1297,27 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
             if rad_px < 0.5 || offscreen(suncx, suncy, rad_px, 1.0 + CORONA_REACH) {
                 continue;
             }
-            let rad_render = (rad_px / sys.sun_pixel).clamp(2.0, maxr_sun);
+            let want = (rad_px / sys.sun_pixel).clamp(2.0, maxr_sun);
+            // Snap the render radius to a geometric rung so a live zoom reuses one
+            // baked tile across a band of frames instead of re-baking every frame
+            // (see SUN_RSTEP). The blit below scales that tile to the exact
+            // on-screen size, so only the rendered detail — not the sun's size —
+            // steps between rungs.
+            let rad_render = quant_sun_radius(want, maxr_sun);
             // A1: reuse the cached tile unless the render radius or the quantized
             // boil clock changed. Re-bake at the QUANTIZED clock so the cached
-            // tile matches its key exactly (same trick as the nebula field).
-            let key = [rad_render.round() as i32, (t_sun / SUN_TQUANT).round() as i32];
+            // tile matches its key exactly (same trick as the nebula field). The
+            // radius is keyed at 1/8-px so distinct rungs never collide onto one
+            // key (which would blit a mismatched tile), while a live radius drifting
+            // within a rung keeps the same key and reuses the tile.
+            let key = [(rad_render * 8.0).round() as i32, (t_sun / SUN_TQUANT).round() as i32];
             let mut sc = sys.sun_tile.borrow_mut();
             if sc.key != Some(key) || sc.tile.is_none() {
                 let tq = key[1] as f32 * SUN_TQUANT;
                 sc.tile = Some(render_sun_tile(sun, sys.seed, tq, rad_render));
                 sc.key = Some(key);
+                #[cfg(test)]
+                test_hooks::bump_sun_bakes();
             }
             blit(out, w, h, sc.tile.as_ref().unwrap(), suncx, suncy, rad_px / rad_render);
         } else {
@@ -1346,3 +1383,77 @@ pub fn planet_nearest_center(sys: &System, w: u32, h: u32, cam: &Camera, t: f32)
 // Browser (wasm) C-ABI glue — excluded from native builds. See wasm.rs.
 #[cfg(target_arch = "wasm32")]
 mod wasm;
+
+// Test-only counter for how many times the star tile is actually baked. Gated on
+// `cfg(test)` so it adds nothing to release builds; `draw_bodies` bumps it inside
+// the cache-miss branch. Lets the sweep test below assert that a live zoom reuses
+// the cached tile instead of re-baking every frame.
+#[cfg(test)]
+mod test_hooks {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SUN_BAKES: AtomicU32 = AtomicU32::new(0);
+    pub fn bump_sun_bakes() {
+        SUN_BAKES.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn reset() {
+        SUN_BAKES.store(0, Ordering::Relaxed);
+    }
+    pub fn count() -> u32 {
+        SUN_BAKES.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quant_radius_reuses_a_rung_and_pins_at_the_cap() {
+        let cap = 110.0;
+        // Zoomed in past the detail cap: the render radius is pinned exactly at the
+        // cap, so a deep-zoomed sun sits on one stable tile.
+        assert_eq!(quant_sun_radius(cap, cap), cap);
+        assert_eq!(quant_sun_radius(cap + 40.0, cap), cap);
+        // A small drift in the wanted radius snaps to the SAME discrete rung — this
+        // is what lets a live zoom reuse the cached tile across many frames.
+        assert_eq!(quant_sun_radius(40.0, cap), quant_sun_radius(41.5, cap));
+        // Rungs are monotonic and roughly SUN_RSTEP apart.
+        let lo = quant_sun_radius(20.0, cap);
+        let hi = quant_sun_radius(20.0 * SUN_RSTEP * SUN_RSTEP, cap);
+        assert!(hi > lo && (hi / lo - SUN_RSTEP * SUN_RSTEP).abs() < 0.1);
+    }
+
+    // A continuous zoom INTO the sun must bake the tile only a handful of times
+    // (once per rung crossed), not once per frame. The boil clock is held fixed so
+    // the only bakes counted are radius-driven — exactly what rung reuse removes.
+    #[test]
+    fn zoom_sweep_onto_sun_reuses_tile_instead_of_rebaking_each_frame() {
+        let sys = System::generate(7);
+        let (w, h) = (1000u32, 640u32);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+
+        // Sweep the SUB-CAP band (the sun growing from a dot up toward the detail
+        // cap), where the render radius changes every frame — this is the regime
+        // the rung reuse targets. We drive zoom directly so the sun's render radius
+        // climbs smoothly through ~10px → the cap.
+        let maxr_sun = (w.max(h) as f32 * 0.6).min(sys.sun_detail);
+        let frames = 120u32;
+        test_hooks::reset();
+        for i in 0..frames {
+            // rad_px = sun_radius · zoom; step zoom so rad_px rises across the band.
+            let rad_px = 10.0 + i as f32 * (maxr_sun - 10.0) / frames as f32;
+            let zoom = rad_px / (sys.sun_radius * sys.sun_size);
+            let cam = Camera { x: 0.0, y: 0.0, zoom };
+            render_system(&sys, w, h, &cam, 0.0, 0.0, 0.0, 0.0, 0.0, &mut buf);
+        }
+        let bakes = test_hooks::count();
+        println!("sub-cap zoom sweep: {bakes} sun bakes over {frames} frames");
+        // Pre-fix this was one bake per frame (radius tracked zoom exactly). With
+        // rung reuse it is the number of geometric rungs between the start radius
+        // and the detail cap — a small fraction of the frame count.
+        assert!(
+            bakes < frames / 4,
+            "expected far fewer bakes than frames, got {bakes}/{frames}"
+        );
+    }
+}
