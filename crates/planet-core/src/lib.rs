@@ -330,11 +330,65 @@ fn lightning_flash(sx: f32, sy: f32, angle: f32) -> (f32, Rgb) {
     (mag, col)
 }
 
-fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32) -> (Rgb, f32) {
+// ---------------------------------------------------------------------------
+// Level of detail
+// ---------------------------------------------------------------------------
+
+/// How much fBm detail a tile keeps.
+///
+/// A scene tile's noise is sampled in *disc-normalised* coordinates, so a bigger
+/// tile spreads the same field over more pixels: the finest octaves shrink to
+/// sub-pixel wobble and then disappear into the ordered dither. Past a point
+/// they cost their full price and change nothing you can see, which is what this
+/// drops. `sun-core` has done the same for the star since it was split out; the
+/// thresholds here are its (`size > 200`), and the native generators never reach
+/// them — solar's biggest planet tile is r≈12, moon's r≈85 — so `out/` is
+/// untouched by construction.
+///
+/// The two fields are tuned apart, and the split is the opposite of what it
+/// looks like it should be. Clouds are 61% of a `terran` frame, so cutting them
+/// is where the speed is — but measured against full detail, one dropped cloud
+/// octave moves 22% of the disc (mean 3.3/255) while one dropped *surface*
+/// octave moves 3% (mean 1.3). The soft layer is the one you notice, because it
+/// is broad and low-contrast and the eye reads its silhouette. So the surface
+/// octave goes first and clouds only follow past 400px.
+#[derive(Clone, Copy, PartialEq)]
+struct Lod {
+    surface: u32,
+    cloud: u32,
+}
+
+/// Every octave, always — the hero framing and any tile below the threshold.
+const LOD_FULL: Lod = Lod { surface: 0, cloud: 0 };
+
+impl Lod {
+    fn for_size(size: u32, enabled: bool) -> Lod {
+        if !enabled || size <= 200 {
+            LOD_FULL
+        } else if size <= 400 {
+            Lod { surface: 1, cloud: 0 }
+        } else {
+            Lod { surface: 1, cloud: 1 }
+        }
+    }
+    /// Octaves for the terrain/band field. Floored at 4: below that a
+    /// terrestrial world loses its coastlines, not just its grain.
+    #[inline(always)]
+    fn surf(self, n: u32) -> u32 {
+        n.saturating_sub(self.surface).max(4)
+    }
+    /// Octaves for the cloud field. Floored at 2 — fronts stay ragged.
+    #[inline(always)]
+    fn cld(self, n: u32) -> u32 {
+        n.saturating_sub(self.cloud).max(2)
+    }
+}
+
+fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32, lod: Lod) -> (Rgb, f32) {
     let (px, py, pz) = (sx + ofs[0], sy + ofs[1], sz + ofs[2]);
     let (mut col, mut emis) = match ct.base {
         Base::Terrestrial => {
-            let raw = fbm(px * ct.freq, py * ct.freq, pz * ct.freq, if ct.ridged { 5 } else { 6 });
+            let raw = fbm(px * ct.freq, py * ct.freq, pz * ct.freq, lod.surf(if ct.ridged { 5 } else { 6 }));
             let n = if ct.ridged { 1.0 - (2.0 * raw - 1.0).abs() } else { raw };
             let h = contrast(n, ct.contrast);
             let mut col = ramp(ct.stops, h);
@@ -343,7 +397,7 @@ fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32) -> 
             (col, 0.0)
         }
         Base::Cratered => {
-            let m = smoothstep(0.4, 0.6, fbm(px * 1.2, py * 1.2, pz * 1.2, 5));
+            let m = smoothstep(0.4, 0.6, fbm(px * 1.2, py * 1.2, pz * 1.2, lod.surf(5)));
             let base_col = mix(ct.dark, ct.light, m);
             let w = worley(px * ct.freq, py * ct.freq, pz * ct.freq);
             let bowl = smoothstep(0.0, 0.35, w);
@@ -360,7 +414,7 @@ fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32) -> 
             // continuously — the real gas-giant look, not a uniform wobble.
             let flow = angle * 0.16 * (sy * ct.bands * 0.5).sin();
             // Domain warp makes the band turbulence curl and marble like fluid.
-            let warp = fbm_warp((px + flow) * 1.3, py * 1.3, pz * 1.3, 5, 0.8);
+            let warp = fbm_warp((px + flow) * 1.3, py * 1.3, pz * 1.3, lod.surf(5), 0.8);
             let lat = sy + (warp - 0.5) * ct.turb;
             let band = 0.5 + 0.5 * (lat * ct.bands).sin();
             let mut col = mix(ct.dark, ct.light, band);
@@ -372,7 +426,7 @@ fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32) -> 
             (col, 0.0)
         }
         Base::Emissive => {
-            let n = contrast(fbm(px * ct.freq, py * ct.freq, pz * ct.freq, 6), 1.7);
+            let n = contrast(fbm(px * ct.freq, py * ct.freq, pz * ct.freq, lod.surf(6)), 1.7);
             // Molten flow: a slow noise field advects across the surface, so the
             // glow brightens and dims in drifting patches instead of pulsing.
             let flow = fbm(px * 2.2 + angle * 0.7, py * 2.2, pz * 2.2 - angle * 0.5, 3);
@@ -386,7 +440,7 @@ fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32) -> 
             // Storm bands churn: latitude-dependent shear + domain warp for
             // roiling, fluid-looking cloud cover.
             let flow = (0.5 + 0.3 * (sy * 3.0).cos()) * angle.sin();
-            let t = fbm_warp((px + flow) * 2.0, py * 2.0, pz * 2.0, 5, 0.7);
+            let t = fbm_warp((px + flow) * 2.0, py * 2.0, pz * 2.0, lod.surf(5), 0.7);
             let band = 0.5 + 0.5 * (sy * ct.bands + (t - 0.5) * 6.0 * ct.turb).sin();
             (mix(ct.dark, ct.light, clamp01(band * 0.6 + t * 0.4)), 0.0)
         }
@@ -580,6 +634,8 @@ struct Frame {
     /// Cut the planet out on transparent pixels — a tile a scene compositor can
     /// blit — instead of filling the frame with a starfield.
     sprite: bool,
+    /// Octave budget. The hero framing is always [`LOD_FULL`].
+    lod: Lod,
 }
 
 /// The hero framing's fixed key light, over the viewer's left shoulder.
@@ -593,7 +649,7 @@ fn key_light() -> [f32; 3] {
 fn render_ct(size: u32, ct: &PType, seed: u32, angle: f32, style: &Style, out: &mut [u8]) {
     // 0.375 (was 0.42) leaves orbital margin for moons and rings.
     let rad = (size as f32 * 24.0 / 64.0) * ct.radius_scale;
-    let frame = Frame { size, rad, light: key_light(), sprite: false };
+    let frame = Frame { size, rad, light: key_light(), sprite: false, lod: LOD_FULL };
     render_frame(&frame, ct, seed, angle, style, out);
 }
 
@@ -613,7 +669,12 @@ fn tile_style() -> Style {
 /// `light` must be a unit vector in the tile's screen basis (+x right, +y up,
 /// +z toward the viewer). `angle` turns the surface and advances the weather,
 /// exactly as in the hero framing.
-pub fn render_tile(type_idx: usize, seed: u32, angle: f32, light: [f32; 3], rad_px: f32) -> Tile {
+///
+/// `lod_enabled` turns on octave thinning once the tile passes 200px — the same
+/// switch `sun_core::render_star_tile` takes, and the same threshold. It only
+/// bites when a body is zoomed in far enough to be expensive; below that the
+/// tile is bit-identical either way. Pass `false` for reference output.
+pub fn render_tile(type_idx: usize, seed: u32, angle: f32, light: [f32; 3], rad_px: f32, lod_enabled: bool) -> Tile {
     let ct = &TYPES[type_idx % TYPES.len()];
     // Rings reach `ring_outer` disc radii sideways; a plain world needs only a
     // pixel of slack for its dark limb. `radius_scale` — which shrinks a ringed
@@ -622,13 +683,14 @@ pub fn render_tile(type_idx: usize, seed: u32, angle: f32, light: [f32; 3], rad_
     let margin = if ct.rings { rad_px * (ct.ring_outer - 1.0) + 1.5 } else { 1.5 };
     let size = (((rad_px + margin) * 2.0).ceil() as u32).max(6);
     let mut px = vec![0u8; (size * size * 4) as usize];
-    let frame = Frame { size, rad: rad_px, light, sprite: true };
+    let frame = Frame { size, rad: rad_px, light, sprite: true, lod: Lod::for_size(size, lod_enabled) };
     render_frame(&frame, ct, seed, angle, &tile_style(), &mut px);
     Tile { px, size }
 }
 
 fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, out: &mut [u8]) {
     let size = fr.size;
+    let lod = fr.lod;
     let (cx, cy) = (size as f32 / 2.0, size as f32 / 2.0);
     let ofs = seed_offsets(seed);
     let l = fr.light;
@@ -673,7 +735,7 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                 let sy = ny;
                 let sz = -nx * sina + nz * cosa;
 
-                let (mut col, emis) = surface(ct, sx, sy, sz, ofs, angle);
+                let (mut col, emis) = surface(ct, sx, sy, sz, ofs, angle, lod);
                 if ct.clouds > 0.0 {
                     // Clouds drift over the surface (2x = parallax, loops) and
                     // slowly billow — a periodic morph reveals new cloud structure
@@ -702,12 +764,12 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                     }
 
                     let dens = |ox: f32, oz: f32| {
-                        fbm((cx3 + ox) * 2.8, ny * 2.8 + ofs[1] + morph, (cz3 + oz) * 2.8 + morph, 4)
+                        fbm((cx3 + ox) * 2.8, ny * 2.8 + ofs[1] + morph, (cz3 + oz) * 2.8 + morph, lod.cld(4))
                     };
                     // Wispy, fractal cloud tops (domain-warped) so they break into
                     // ragged fronts instead of clumping into round blobs. Shadow
                     // uses the cheap plain density.
-                    let cloud = fbm_warp(cx3 * 2.8, ny * 2.8 + ofs[1] + morph, cz3 * 2.8 + morph, 4, 0.9);
+                    let cloud = fbm_warp(cx3 * 2.8, ny * 2.8 + ofs[1] + morph, cz3 * 2.8 + morph, lod.cld(4), 0.9);
 
                     let shadow = smoothstep(0.55, 0.72, dens(l[0] * 0.45, l[2] * 0.45));
                     let sh = 1.0 - 0.22 * shadow * ct.clouds;

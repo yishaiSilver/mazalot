@@ -396,13 +396,21 @@ per-pixel shader runs once per tile pixel. Two ways to keep it cheap:
   needs no code: the cap is already a live slider (`planet_detail`). At ~56 a
   full-screen planet is **~6 ms (170 fps)** instead of ~34 ms — the `bench` bin
   measures both.
-- **Octave LOD** (*option, not implemented for planets*) — if you want a high
-  detail cap *and* a cheap full-screen planet, drop the terrestrial/emissive fBm
-  from 6→3–4 octaves on large tiles, exactly as `render_sun_tile` already does
-  for the star (`lod = size > 200`). The catch: unlike the sun's diffuse boil, a
-  planet's surface *is* the detail, so it trades a little crispness and can
-  "pop" as the LOD threshold is crossed mid-zoom. Left as a deliberate choice
-  since pinning the cap low sidesteps the need.
+- **Octave LOD** — implemented, at `sun-core`'s threshold (`size > 200`) and
+  behind a toggle in the demo. Worth **9–19%** on a zoomed-in planet for a mean
+  change of 0.8–4.5/255 across the disc; one 1px step of spin already moves ~40%
+  of it with a mean near 10, so the LOD sits well inside the frame-to-frame noise
+  the eye accepts. Below 200px it is bit-identical, so `out/` never sees it —
+  solar's biggest native planet tile is r≈12, moon's r≈85.
+
+  The tuning is the opposite of what it looks like. Clouds are 61% of a `terran`
+  frame, so cutting them is where the speed is — but one dropped *cloud* octave
+  moves 22% of the disc (mean 3.3) against 3% (mean 1.3) for one dropped
+  *surface* octave. The broad low-contrast layer is what the eye reads as
+  silhouette, so the surface octave goes first and clouds only follow past 400px.
+
+  Keep it in proportion: 9–19% is barely above this machine's timing noise, and
+  pinning `planet_detail` low is still the 5–6× lever.
 
 ### SIMD noise
 

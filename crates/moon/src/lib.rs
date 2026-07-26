@@ -324,7 +324,7 @@ fn quant(o: Rgb, bx: f32) -> Rgb {
 /// worlds in its orbits, and the same shader the `planet` demo shows head-on;
 /// moon only pins the light to its fixed off-screen sun (`LIGHT_DIR`).
 fn render_parent_tile(type_idx: usize, seed: u32, spin_a: f32, rad_px: f32) -> Tile {
-    planet_core::render_tile(type_idx, seed, spin_a, LIGHT_DIR, rad_px)
+    planet_core::render_tile(type_idx, seed, spin_a, LIGHT_DIR, rad_px, true)
 }
 
 /// Moon surface albedo at a rotated surface point (no lighting yet): a grey/tinted

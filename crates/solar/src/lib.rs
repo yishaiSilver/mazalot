@@ -243,6 +243,9 @@ pub struct System {
     // Eccentricity multiplier (scales every planet's generated `e`; 0 = force
     // perfect circles, 1 = as generated, higher = exaggerate the ellipses).
     pub ecc: f32,
+    // Thin planet-tile fBm octaves once a tile passes 200px. Off changes nothing
+    // until a body is zoomed in far enough to be expensive. See `render_tile`.
+    pub lod: bool,
     // Cached backdrop (background + orbit paths) + the key it was rendered for,
     // reused by `render_system_cached` while the camera/view is unchanged.
     bg_cache: Vec<u8>,
@@ -349,7 +352,7 @@ impl System {
             seed, sun_kind, sun_radius, planets,
             spacing: 1.0, planet_size: 1.0, sun_size: 1.0, planet_pixel: 1.0, sun_pixel: 1.0,
             planet_detail: 160.0, sun_detail: 110.0, star_density: 0.5, star_parallax: 1.0,
-            orbit_width: 1.0, ecc: 1.0,
+            orbit_width: 1.0, ecc: 1.0, lod: true,
             bg_cache: Vec::new(), bg_key: None,
             neb: RefCell::new(BackdropCache::default()),
             sun_tile: RefCell::new(SunCache::default()),
@@ -394,6 +397,13 @@ impl System {
     /// planet's generated eccentricity, higher exaggerates the ellipses.
     pub fn set_eccentricity(&mut self, scale: f32) {
         self.ecc = scale.clamp(0.0, 2.5);
+    }
+
+    /// Planet-tile level of detail. `true` (the default) thins fBm octaves on
+    /// tiles past 200px; `false` renders every octave at every size, which is
+    /// the reference image and the thing worth A/B-ing against.
+    pub fn set_lod(&mut self, on: bool) {
+        self.lod = on;
     }
 
     /// The outermost extent (world units) with the current view multipliers —
@@ -700,7 +710,7 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
             // also churns faster.
             let spin_a = p.phase + p.spin * t_spin * TAU;
             let rad_render = (rad_px / sys.planet_pixel).clamp(2.0, maxr);
-            let tile = planet_core::render_tile(p.ptype, p.seed, spin_a, light, rad_render);
+            let tile = planet_core::render_tile(p.ptype, p.seed, spin_a, light, rad_render, sys.lod);
             blit(out, w, h, &tile, sx, sy, rad_px / rad_render);
         }
     }
