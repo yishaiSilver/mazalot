@@ -30,7 +30,7 @@ a `--no-default-features` wasm build never sees `image`/`rand` and stays tiny.
 | `planet-core` | **The** planet renderer — the only one in the workspace. The 26-type table, sphere shading, weather, rings, moons. One shader, two framings: a *hero* square frame (`render_rgba`) and a *scene sprite tile* (`render_tile`). `planet`, `solar` and `moon` are all framings of it. |
 | `sun-core` | The compact star tile (granulation + corona) used by `solar` and `comet`. |
 | `wasm-abi` | The raw C-ABI glue: `alloc`/`dealloc` and opaque-handle macros. Exports no symbols itself. |
-| `render-io` | The only crate that touches `image`: GIF/contact-sheet/poster helpers for the native bins. |
+| `render-io` | The only crate that touches `image`: GIF/contact-sheet/poster helpers for the native bins, plus the parallel GIF encoder that makes them fast — see [Parallel generation](#parallel-generation). |
 
 **Demo crates:**
 
@@ -59,14 +59,14 @@ always behind the `native` feature, so the wasm build never sees it.
 | `planet-core`      |   815 |   ●    |  ·   |   ●   |  ●   |   ·   |    ·     |
 | `sun-core`         |   124 |   ·    |  ·   |   ●   |  ·   |   ●   |    ·     |
 | `wasm-abi`         |    87 |   ●    |  ●   |   ●   |  ●   |   ●   |    ●     |
-| `render-io`        |   188 |   ●    |  ●   |   ●   |  ●   |   ●   |    ●     |
+| `render-io`        |   240 |   ●    |  ●   |   ●   |  ●   |   ●   |    ●     |
 | **`lib.rs`**       |       | **18** | 567  |  767  | 503  |  557  |   490    |
 | **`wasm.rs`**      |       |   93   |  58  |  166  |  76  |   79  |    71    |
 
 The library layer is 8 crates / 1,886 lines and stacks in one direction only:
 
 ```
-                          render-io ──── image (the only third-party dep)
+                          render-io ──── image, gif, rayon (the only third-party deps)
                           wasm-abi  ──── (nothing)
 
 noise-core ──┬── dither-core ──┬── background-core ── solar, moon, comet, asteroid
@@ -458,6 +458,49 @@ it sets a *radius*: cost goes as its square, so halving the slider quarters the
 shader work. At the same zoom, cap 32 is 5.8 ms, cap 64 is 17.8 ms and cap 160 is
 95 ms. The shipped default of 160 buys full six-octave detail on a screen-filling
 world and costs accordingly; drop it if you want the frame back.
+
+### Parallel generation
+
+The browser work above does not help the native generators, because they were
+never shader-bound. Profiling the whole pipeline found the shading to be **~9%**
+of it; the other ~85% was **GIF encoding** — NeuQuant palette quantization at
+`image`'s default `speed = 1`. A single file, planet's all-types grid GIF, was
+19s of a 30s run by itself.
+
+So `render-io` drives the `gif` crate directly instead of `image`'s `GifEncoder`.
+The encoder is one stateful writer, but the quantization of each frame is a pure
+function of that frame — so quantization fans out across cores with `rayon` and
+only the writes stay ordered and serial. Frame *production* is parallel too for
+the spinning-body family. On 4 cores:
+
+| generator | before | after | |
+|---|---:|---:|---:|
+| `planet`   | 30.8s | **8.7s** | 3.56× |
+| `sun`      | 12.5s | **3.5s** | 3.56× |
+| `solar`    | 17.1s | **4.9s** | 3.46× |
+| `comet`    | 19.3s | **5.2s** | 3.70× |
+| `asteroid` | 15.0s | **4.5s** | 3.37× |
+| `moon`     |  7.9s | **2.4s** | 3.27× |
+| `alien`    |  5.3s | **2.2s** | 2.41× |
+| **all 74 outputs** | **108s** | **32s** | **3.42×** |
+
+Every byte is unchanged, which is the whole constraint: `write_gif` mirrors
+`GifEncoder::convert_frame`/`encode_gif` step for step — same speed, same
+`delay / 10` truncation, same `Background` disposal, same empty global palette
+sized from the first frame, `set_repeat` before any frame. It is the one place
+in the workspace that has to stay byte-compatible with someone else's encoder,
+so changes there get checked against the `out/` hashes, not by eye.
+
+The scene generators (`solar`, `moon`, `comet`, `asteroid`) parallelize only
+their encoding: their frame closures borrow a `System`/`Belt`/`Scene` whose
+`RefCell` caches — draw order, the baked sun tile, the nebula — make it
+deliberately non-`Sync`. Rendering frames in parallel would mean one system per
+thread, which throws away exactly the caches that make a scene frame cheap. They
+still land near 3.5× because encoding was the bulk of it.
+
+Nothing here reaches the wasm builds: `render-io` sits behind the `native`
+feature, so a `--no-default-features` module still has **zero** third-party
+dependencies.
 
 ## Adding a planet type
 
