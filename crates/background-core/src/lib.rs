@@ -345,6 +345,14 @@ fn bake_cells(neb: &Nebula, field: &mut [[f32; 3]], si: i32, nw: u32, org: [i32;
     let n = neb.tints.len();
     let ta = neb.tints[(hash3(si, 1, 9) * n as f32) as usize % n];
     let tb = neb.tints[(hash3(si, 2, 9) * n as f32) as usize % n];
+    // The noise is 3D, but a nebula only ever samples one x/y plane of it — so
+    // WHERE that plane sits is what makes one seed's clouds a different shape
+    // rather than the same clouds slid sideways. Held constant across a bake so
+    // a scrolled-in strip lands on the same plane as the field it joins.
+    // 64 spans many lattice cells at this frequency, so two seeds land on
+    // uncorrelated slices rather than neighbouring ones.
+    let za = 4.2 + hash3(si, 7, 3) * 64.0;
+    let zb = 1.5 + hash3(si, 8, 3) * 64.0;
     let cell = neb.cell as i32;
     let f = 1.0 / 240.0;
     let [x0, y0, x1, y1] = rect;
@@ -352,9 +360,9 @@ fn bake_cells(neb: &Nebula, field: &mut [[f32; 3]], si: i32, nw: u32, org: [i32;
         let gy = ((org[1] + cy as i32) * cell) as f32 * f;
         for cx in x0..x1 {
             let gx = ((org[0] + cx as i32) * cell) as f32 * f;
-            let dens = smoothstep(0.50, 0.74, fbm(gx, gy, 4.2, 3)); // patchy -> not crowded
+            let dens = smoothstep(0.50, 0.74, fbm(gx, gy, za, 3)); // patchy -> not crowded
             field[(cy * nw + cx) as usize] = if dens > 0.0 {
-                let n2 = fbm(gx * 1.8 + 40.0, gy * 1.8 + 7.0, 1.5, 2);
+                let n2 = fbm(gx * 1.8 + 40.0, gy * 1.8 + 7.0, zb, 2);
                 let col = mix(ta, tb, clamp01((n2 - 0.35) * 2.2));
                 let k = dens * neb.strength; // zoom fade applied later at composite
                 [col[0] * k, col[1] * k, col[2] * k]
@@ -607,6 +615,68 @@ mod tests {
     #[test]
     fn cached_plain_ground_matches_a_fresh_paint() {
         agrees_with_uncached(&PLAIN, 137, 83, PANS);
+    }
+
+    /// Paint `seed`'s clouds over the SAME patch of world as every other seed,
+    /// by panning back exactly as far as its own drift offset carries it, and
+    /// return which px came out cloudy.
+    ///
+    /// The mask is what matters: it depends on the density field alone, so it
+    /// ignores the two tints the seed also picks. Two seeds agreeing here means
+    /// they are drawing one shape in two colours.
+    fn cloud_mask(seed: u32, w: u32, h: u32) -> Vec<bool> {
+        let neb = CLOUDY.nebula.unwrap();
+        // Undo `paint_backdrop`'s seeded offset: it adds hash3(si,5,2)*500 px to
+        // the drift, and a pan reaches the clouds scaled down by `scroll`.
+        let back = |salt| -(hash3(seed as i32, salt, 2) * 500.0) / neb.scroll;
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        paint_backdrop(&mut buf, w, h, &CLOUDY, seed, back(5), back(6), 1.0, 1.0, None);
+        // Base navy sums to 30; its dither swings ±6. 45 clears both.
+        buf.chunks_exact(4).map(|p| p[0] as u32 + p[1] as u32 + p[2] as u32 > 45).collect()
+    }
+
+    /// The seed has to change the SHAPE of the clouds, not just where they sit.
+    ///
+    /// This is a real bug caught late: the nebula's fBm is 3D, but both calls
+    /// pinned z to a constant, so every system in the game sampled one identical
+    /// plane. The seed only chose two tints and slid the sampling window by up to
+    /// 500 px — less than a viewport — so two systems could share ~90% of their
+    /// clouds. It looked seeded, because the colours differed.
+    ///
+    /// Comparing masks at a shared world position is what makes that visible: it
+    /// takes the tints and the offset out of the picture and leaves only the
+    /// field. Under the old code every pair below agreed on ~100% of px.
+    #[test]
+    fn the_seed_changes_the_clouds_not_just_their_position() {
+        // Big enough to hold real structure: the field runs at 1/240 px, so a
+        // frame much under this spans less than one lattice cell and comes out a
+        // single flat gradient — all cloud or none, regardless of seed.
+        let (w, h) = (900, 560);
+        let seeds = [3u32, 7, 21, 42];
+        let masks: Vec<_> = seeds.iter().map(|&s| cloud_mask(s, w, h)).collect();
+        let n = (w * h) as f32;
+        for i in 0..seeds.len() {
+            // A seed must also actually draw clouds, or two blank skies would
+            // "differ" by 0% and pass the pair check below for the wrong reason.
+            let cover = masks[i].iter().filter(|&&c| c).count() as f32 / n;
+            assert!(
+                (0.02..0.98).contains(&cover),
+                "seed {} covers {:.0}% of the frame — nearly blank or nearly solid",
+                seeds[i],
+                cover * 100.0
+            );
+            for j in i + 1..seeds.len() {
+                let differ = masks[i].iter().zip(&masks[j]).filter(|(a, b)| a != b).count() as f32 / n;
+                assert!(
+                    differ > 0.15,
+                    "seeds {} and {} draw the same cloud shape at the same world position \
+                     ({:.1}% of px differ) — the noise plane is not seeded",
+                    seeds[i],
+                    seeds[j],
+                    differ * 100.0
+                );
+            }
+        }
     }
 
     /// A resize has no sprite to slide — it must fall back to a full rebuild
