@@ -18,6 +18,26 @@
 //! camera, a body, or a clock: a caller passes the accumulated screen-space pan
 //! and whatever zoom-derived fades it wants.
 //!
+//! ## The backdrop is a scrolling sprite
+//!
+//! [`paint_backdrop`] is the expensive half, and it is not re-evaluated per
+//! frame. It depends on where the camera is, never on what time it is, so a
+//! frame is mostly the previous frame *moved* — and [`BackdropCache`] treats it
+//! that way, at two levels (see there for the split):
+//!
+//!   • **still, or panned less than a `quant`** — a memcpy of the last frame;
+//!   • **zoomed** — a re-composite, but nothing re-baked: the fade is applied
+//!     when the cloud sprite is read, so zoom never invalidates it;
+//!   • **panned** — a memmove of both sprites, then a repaint of only the strip
+//!     that scrolled into view, a percent or two of the screen;
+//!   • **resized, or jumped far enough that the views don't overlap** — the full
+//!     rebuild, which is what a pan used to cost every frame.
+//!
+//! The whole scheme rests on the backdrop being a function of where the clouds
+//! are, so that moving them moves it. That is why the nebula's dither travels
+//! with the clouds rather than being pinned to the screen, and why a scene that
+//! sets [`Backdrop::dither`] under a nebula opts out of the scrolled path.
+//!
 //! ## Parallax, and why it is screen-space
 //!
 //! A star layer is a fixed grid in SCREEN space, scrolled by `bgx`/`bgy` — the
@@ -142,6 +162,7 @@ where
     }
 }
 
+
 // ---------------------------------------------------------------------------
 // Ground + nebula
 // ---------------------------------------------------------------------------
@@ -156,8 +177,10 @@ pub struct Nebula {
     pub tints: &'static [Rgb],
     /// Bake resolution: one fBm sample per `cell`×`cell` px block.
     pub cell: u32,
-    /// The scroll offset is snapped to this many px, so a small pan (and every
-    /// zoom) reuses the previous bake instead of re-running the per-cell fBm.
+    /// The scroll offset is snapped to this many px, so a sub-tick pan (and
+    /// every zoom) reuses the previous frame outright. Use a whole number of px:
+    /// the offset indexes a baked sprite, so a fractional `quant` would round
+    /// and leave the clouds jittering by a px.
     pub quant: f32,
     /// Fraction of the camera's pan the clouds drift at — the slowest layer in
     /// the scene by some margin.
@@ -165,7 +188,9 @@ pub struct Nebula {
     /// Overall opacity of the baked field.
     pub strength: f32,
     /// Ordered-dither amplitude applied with the nebula, turning its gradient
-    /// into pixel-art stipple.
+    /// into pixel-art stipple. Anchored to the CLOUDS, not the screen, so the
+    /// stipple travels with them instead of the clouds crawling through a fixed
+    /// screen pattern — which is also what lets the whole layer be scrolled.
     pub dither: f32,
 }
 
@@ -176,105 +201,227 @@ pub struct Backdrop {
     /// Ordered-dither amplitude on the base fill, so a flat field still reads as
     /// pixel-art rather than a dead block. 0 = a perfectly flat fill (and then
     /// `base` round-trips exactly, so `[8.0/255.0, ..]` yields byte 8).
+    ///
+    /// Unlike the nebula's, this dither is pinned to the SCREEN — the ground
+    /// does not drift, so there is nothing for it to travel with. A scene that
+    /// sets both this and a `nebula` therefore gives up the scrolled-layer fast
+    /// path below, since its frame is then no longer a pure function of where
+    /// the clouds are. None currently does.
     pub dither: f32,
     /// `None` for a plain field of stars.
     pub nebula: Option<Nebula>,
 }
 
-/// Two nested caches over the backdrop, both exploiting that it "barely
-/// changes": it depends on the camera and the view knobs, never on animation
-/// time.
+/// Two nested sprite caches over the backdrop, both exploiting the same thing:
+/// the backdrop depends on where the camera is, never on what time it is, so a
+/// frame is mostly the previous frame *moved*.
 ///
-///   • `neb_field` — the low-res per-cell fBm, the most expensive single pass.
-///     Keyed on the scroll offset ONLY, so a pure zoom never re-bakes it.
-///   • `layer` — the full-res composite of ground + nebula. Keyed on scroll AND
-///     the zoom fade. This is the big one: on a drag it is reused as a memcpy,
-///     collapsing the O(pixels) fill to a copy so only the stars redraw.
+///   • `neb_field` — the low-res per-cell fBm. Indexed by absolute world cell,
+///     so a pan slides it and re-bakes only the strip that scrolled in.
+///   • `layer` — the full-res RGBA composite of ground + nebula, and the more
+///     expensive of the two by roughly 4:1. Scrolled the same way: on a drag it
+///     is memmoved and only the newly-exposed strip is re-composited, so a pan
+///     costs a sliver of a screenful instead of the whole thing.
+///
+/// Both survive zoom untouched — the zoom fade is applied when the field is
+/// read, so it is not baked in — and both fall back to a full rebuild on a
+/// resize or a jump big enough that the old and new views don't overlap.
 ///
 /// Stars are never cached here — they scroll every frame, they *are* the
 /// parallax, and they're cheap.
 #[derive(Default)]
 pub struct BackdropCache {
-    /// `[nw, nh, qx, qy]` the `neb_field` is valid for (zoom deliberately excluded).
-    neb_key: Option<[i32; 4]>,
+    /// `[nw, nh]` the `neb_field` is sized for.
+    neb_dims: Option<[i32; 2]>,
+    /// World cell coordinate of `neb_field[0]` — where the sprite is scrolled to.
+    neb_org: Option<[i32; 2]>,
     /// Low-res RGB nebula at full strength (density premultiplied, no zoom fade
     /// — that is applied per-pixel at composite time) — `nw * nh` entries.
     neb_field: Vec<[f32; 3]>,
-    /// `[w, h, qx, qy, quantized zoom fade]` the `layer` is valid for.
-    layer_key: Option<[i32; 5]>,
+    /// `[w, h, quantized zoom fade]` the `layer` is sized and shaded for.
+    layer_key: Option<[i32; 3]>,
+    /// Scroll offset in px the `layer` is composited at.
+    layer_org: Option<[i32; 2]>,
     /// Full-res RGBA ground + nebula (no stars) — `w * h * 4` bytes.
     layer: Vec<u8>,
 }
 
-/// Re-bake the cached nebula field if `[nw, nh, qx, qy]` moved. Stores it at
-/// FULL strength — the zoom fade is applied per-pixel at composite, which is
-/// exactly why the key can exclude zoom.
-fn ensure_nebula(neb: &Nebula, cache: &RefCell<BackdropCache>, si: i32, nw: u32, nh: u32, qx: i32, qy: i32) {
-    let key = [nw as i32, nh as i32, qx, qy];
+/// Slide a 2D buffer in place by `(dx, dy)` whole units — `unit` elements each,
+/// `nw` × `nh` of them — so that afterwards unit `(x, y)` holds what unit
+/// `(x + dx, y + dy)` did.
+///
+/// The units with no source, i.e. the strips that just scrolled into view, are
+/// left holding stale data for the caller to repaint. Shared by both caches:
+/// the cloud field scrolls in cells of one `[f32; 3]`, the composited layer in
+/// pixels of four bytes.
+fn scroll<T: Copy>(buf: &mut [T], nw: u32, nh: u32, unit: usize, dx: i32, dy: i32) {
+    let (nwi, nhi) = (nw as i32, nh as i32);
+    // Destination columns that have a source: x + dx must land inside the buffer.
+    let (x0, x1) = ((-dx).max(0), (nwi - dx).min(nwi));
+    if x1 <= x0 {
+        return;
+    }
+    let (run, stride) = ((x1 - x0) as usize * unit, nw as usize * unit);
+    for k in 0..nhi {
+        // Walk rows away from the source: reading ahead of the write when the
+        // buffer slides up, behind it when it slides down. Either way a row is
+        // copied before anything can clobber it.
+        let y = if dy >= 0 { k } else { nhi - 1 - k };
+        let sy = y + dy;
+        if sy < 0 || sy >= nhi {
+            continue; // scrolled in from off-buffer; the caller repaints it
+        }
+        let dst = y as usize * stride + x0 as usize * unit;
+        let src = sy as usize * stride + (x0 + dx) as usize * unit;
+        buf.copy_within(src..src + run, dst); // memmove: handles dy == 0 overlap
+    }
+}
+
+/// The two strips a scroll of `(dx, dy)` exposes in an `nw` × `nh` buffer, as
+/// half-open rects `[x0, y0, x1, y1)`. Either may be empty (`x0 == x1`).
+///
+/// When both axes moved the corner falls in both rects and is painted twice;
+/// that is a few dozen units, not worth the bookkeeping to avoid.
+fn exposed(nw: u32, nh: u32, dx: i32, dy: i32) -> [[u32; 4]; 2] {
+    let col = match dx {
+        d if d > 0 => [nw - d as u32, 0, nw, nh],
+        d if d < 0 => [0, 0, -d as u32, nh],
+        _ => [0, 0, 0, 0],
+    };
+    let row = match dy {
+        d if d > 0 => [0, nh - d as u32, nw, nh],
+        d if d < 0 => [0, 0, nw, -d as u32],
+        _ => [0, 0, 0, 0],
+    };
+    [col, row]
+}
+
+/// Bring the cached cloud sprite to world cell origin `org`, baking as little as
+/// possible. Stored at FULL strength — the zoom fade is applied per-pixel at
+/// composite, which is why zoom never invalidates it.
+///
+/// Three outcomes, cheapest first: already there (nothing), scrolled by a few
+/// cells (memmove plus the exposed strips), or a jump/resize (full bake).
+fn ensure_nebula(neb: &Nebula, cache: &RefCell<BackdropCache>, si: i32, nw: u32, nh: u32, org: [i32; 2]) {
+    let n = (nw * nh) as usize;
+    let dims = Some([nw as i32, nh as i32]);
     if let Ok(c) = cache.try_borrow() {
-        if c.neb_key == Some(key) && c.neb_field.len() == (nw * nh) as usize {
-            return; // hit — the clouds barely moved (or only the zoom changed)
+        if c.neb_dims == dims && c.neb_org == Some(org) && c.neb_field.len() == n {
+            return; // hit — the clouds haven't crossed a cell (or only zoom moved)
         }
     }
     let mut c = cache.borrow_mut();
-    c.neb_field.clear();
-    c.neb_field.resize((nw * nh) as usize, [0.0; 3]);
-    bake_nebula(neb, &mut c.neb_field, si, nw, nh, qx, qy);
-    c.neb_key = Some(key);
+    // A resize invalidates the sprite outright; otherwise it can be slid.
+    let prev = if c.neb_dims == dims && c.neb_field.len() == n { c.neb_org } else { None };
+    match prev {
+        // Scrolled, and the two views still overlap: this is the whole point — a
+        // drag pays for the sliver of new sky, not the screenful it already has.
+        Some([px, py]) if (org[0] - px).abs() < nw as i32 && (org[1] - py).abs() < nh as i32 => {
+            let (dx, dy) = (org[0] - px, org[1] - py);
+            scroll(&mut c.neb_field, nw, nh, 1, dx, dy);
+            for r in exposed(nw, nh, dx, dy) {
+                bake_cells(neb, &mut c.neb_field, si, nw, org, r);
+            }
+        }
+        _ => {
+            c.neb_field.clear();
+            c.neb_field.resize(n, [0.0; 3]);
+            bake_cells(neb, &mut c.neb_field, si, nw, org, [0, 0, nw, nh]);
+        }
+    }
+    c.neb_dims = dims;
+    c.neb_org = Some(org);
 }
 
 /// The per-cell fBm itself: patchy density thresholded out of one noise field,
 /// tinted by mixing the scene's two seeded colours with a second.
-fn bake_nebula(neb: &Nebula, field: &mut [[f32; 3]], si: i32, nw: u32, nh: u32, qx: i32, qy: i32) {
+///
+/// Bakes the half-open cell rect `[x0, y0, x1, y1)` of a field whose cell
+/// `(x, y)` is the cloud at world px `((org[0] + x) * cell, (org[1] + y) * cell)`
+/// — an absolute lattice, which is what lets the field be scrolled rather than
+/// rebuilt. Every visited slot is written, empty ones included: a scrolled field
+/// bakes over whatever the previous position left behind.
+fn bake_cells(neb: &Nebula, field: &mut [[f32; 3]], si: i32, nw: u32, org: [i32; 2], rect: [u32; 4]) {
     let n = neb.tints.len();
     let ta = neb.tints[(hash3(si, 1, 9) * n as f32) as usize % n];
     let tb = neb.tints[(hash3(si, 2, 9) * n as f32) as usize % n];
-    let (nox, noy) = (qx as f32 * neb.quant, qy as f32 * neb.quant);
+    let cell = neb.cell as i32;
     let f = 1.0 / 240.0;
-    for cy in 0..nh {
-        for cx in 0..nw {
-            let gx = ((cx * neb.cell) as f32 + nox) * f;
-            let gy = ((cy * neb.cell) as f32 + noy) * f;
+    let [x0, y0, x1, y1] = rect;
+    for cy in y0..y1 {
+        let gy = ((org[1] + cy as i32) * cell) as f32 * f;
+        for cx in x0..x1 {
+            let gx = ((org[0] + cx as i32) * cell) as f32 * f;
             let dens = smoothstep(0.50, 0.74, fbm(gx, gy, 4.2, 3)); // patchy -> not crowded
-            if dens > 0.0 {
+            field[(cy * nw + cx) as usize] = if dens > 0.0 {
                 let n2 = fbm(gx * 1.8 + 40.0, gy * 1.8 + 7.0, 1.5, 2);
                 let col = mix(ta, tb, clamp01((n2 - 0.35) * 2.2));
                 let k = dens * neb.strength; // zoom fade applied later at composite
-                field[(cy * nw + cx) as usize] = [col[0] * k, col[1] * k, col[2] * k];
-            }
+                [col[0] * k, col[1] * k, col[2] * k]
+            } else {
+                [0.0; 3]
+            };
         }
     }
 }
 
-/// Fill `out` with the ground, compositing `field` (may be empty) over it.
-fn composite(out: &mut [u8], w: u32, h: u32, cfg: &Backdrop, field: &[[f32; 3]], nw: u32, neb_amt: f32) {
-    let has_neb = !field.is_empty();
-    let (cell, neb_dither) = match &cfg.nebula {
-        Some(n) => (n.cell, n.dither),
-        None => (1, 0.0),
+/// Paint the ground and its clouds into the px rect `[x0, y0, x1, y1)` of an
+/// RGBA buffer `w` px wide.
+///
+/// `sub` is the scroll's leftover sub-cell offset, `[0, cell)` px on each axis:
+/// the cloud sprite is only positioned to whole cells, so the last few px of the
+/// drift are paid here, by reading it shifted. That is why the field is baked
+/// one cell wider and taller than the viewport needs. `phase` is the same idea
+/// for the dither — the offset that keeps its pattern anchored to the clouds.
+///
+/// Two loops rather than one with an `if`, because `cell` is a runtime value: a
+/// per-pixel `ix / cell` is a real integer division. The nebula path instead
+/// walks each row in the runs that share a field cell, so that division and the
+/// field load happen once per `cell` px, with the zoom fade folded in per run.
+#[allow(clippy::too_many_arguments)]
+fn composite(out: &mut [u8], w: u32, cfg: &Backdrop, field: &[[f32; 3]], nw: u32, sub: [u32; 2], phase: [u32; 2], neb_amt: f32, rect: [u32; 4]) {
+    let (base, bd) = (cfg.base, cfg.dither);
+    let [x0, y0, x1, y1] = rect;
+
+    // No clouds to draw — either this scene has none, or they have faded out.
+    // Then there is nothing to index and a row is a straight fill.
+    let Some(neb) = cfg.nebula.filter(|_| !field.is_empty()) else {
+        for iy in y0..y1 {
+            for ix in x0..x1 {
+                let d = if bd > 0.0 { bayer(ix, iy) * bd } else { 0.0 };
+                let idx = ((iy * w + ix) * 4) as usize;
+                out[idx] = (clamp01(base[0] + d) * 255.0) as u8;
+                out[idx + 1] = (clamp01(base[1] + d) * 255.0) as u8;
+                out[idx + 2] = (clamp01(base[2] + d) * 255.0) as u8;
+                out[idx + 3] = 255;
+            }
+        }
+        return;
     };
-    for iy in 0..h {
-        let nrow = (iy / cell) * nw;
-        for ix in 0..w {
-            let (mut r, mut g, mut b) = (cfg.base[0], cfg.base[1], cfg.base[2]);
-            if cfg.dither > 0.0 {
-                let d = bayer(ix, iy) * cfg.dither;
-                r += d;
-                g += d;
-                b += d;
+
+    let cell = neb.cell;
+    for iy in y0..y1 {
+        let nrow = ((iy + sub[1]) / cell) * nw;
+        let by = iy + phase[1];
+        let mut ix = x0;
+        while ix < x1 {
+            // The run of px sharing this field cell: it ends where the next cell
+            // starts, `(fx + 1) * cell` in field space, minus the sub-cell shift.
+            let fx = (ix + sub[0]) / cell;
+            let end = ((fx + 1) * cell - sub[0]).min(x1);
+            let c = field[(nrow + fx) as usize];
+            let (cr, cg, cb) = (c[0] * neb_amt, c[1] * neb_amt, c[2] * neb_amt);
+            for x in ix..end {
+                let bx = bayer(x + phase[0], by);
+                let d = bx * neb.dither; // dither -> pixel-art stipple
+                let g = if bd > 0.0 { bayer(x, iy) * bd } else { 0.0 };
+                let idx = ((iy * w + x) * 4) as usize;
+                out[idx] = (clamp01(base[0] + g + (cr + d).max(0.0)) * 255.0) as u8;
+                out[idx + 1] = (clamp01(base[1] + g + (cg + d).max(0.0)) * 255.0) as u8;
+                out[idx + 2] = (clamp01(base[2] + g + (cb + d).max(0.0)) * 255.0) as u8;
+                out[idx + 3] = 255;
             }
-            if has_neb {
-                let c = field[(nrow + ix / cell) as usize];
-                let d = bayer(ix, iy) * neb_dither; // dither -> pixel-art gradient
-                r += (c[0] * neb_amt + d).max(0.0);
-                g += (c[1] * neb_amt + d).max(0.0);
-                b += (c[2] * neb_amt + d).max(0.0);
-            }
-            let idx = ((iy * w + ix) * 4) as usize;
-            out[idx] = (clamp01(r) * 255.0) as u8;
-            out[idx + 1] = (clamp01(g) * 255.0) as u8;
-            out[idx + 2] = (clamp01(b) * 255.0) as u8;
-            out[idx + 3] = 255;
+            ix = end;
         }
     }
 }
@@ -285,8 +432,9 @@ fn composite(out: &mut [u8], w: u32, h: u32, cfg: &Backdrop, field: &[[f32; 3]],
 /// live parallax knob; `neb_amt` fades the clouds out as the camera zooms in
 /// (1.0 = full, at or below 0.02 the nebula is skipped and not even baked).
 ///
-/// Pass a `cache` to get the memcpy fast path on a still or slowly-dragging
-/// camera. Without one the result is identical, just recomputed every call.
+/// Pass a `cache` to get the sprite fast paths: a memcpy on a still camera, and
+/// on a drag a memmove plus a re-composite of only the strip that scrolled in.
+/// Without one the result is identical, just recomputed every call.
 /// `#[inline]` matters here: callers pass a `&'static Backdrop` const, so inlining
 /// lets the optimizer fold `nebula: None` away and strip the whole bake path from
 /// a scene that doesn't use one.
@@ -311,17 +459,30 @@ pub fn paint_backdrop(
     // fill that depends on nothing but its own size, so the scroll offset drops
     // out of the cache key and a pan stops invalidating it.
     let show = cfg.nebula.is_some() && neb_amt > 0.02;
-    let (nw, nh, qx, qy) = match cfg.nebula {
+    let (nw, nh, org, sub, phase, sx, sy) = match cfg.nebula {
         Some(neb) if show => {
             let np = neb.scroll * pan_scale; // clouds drift slowest on screen
+            let cell = neb.cell as i32;
+            // Where the clouds have drifted to, in whole px, snapped to `quant`.
+            let q = |v: f32, salt: i32| -> i32 {
+                (((v * np + hash3(si, salt, 2) * 500.0) / neb.quant).round() * neb.quant).round() as i32
+            };
+            let (sx, sy) = (q(bgx, 5), q(bgy, 6));
+            // Split the drift. The sprite is baked on the absolute cell lattice,
+            // so it scrolls by whole cells; the sub-cell remainder is applied
+            // when the field is READ, which needs one spare column and row.
             (
-                (w + neb.cell - 1) / neb.cell,
-                (h + neb.cell - 1) / neb.cell,
-                ((bgx * np + hash3(si, 5, 2) * 500.0) / neb.quant).round() as i32,
-                ((bgy * np + hash3(si, 6, 2) * 500.0) / neb.quant).round() as i32,
+                w.div_ceil(neb.cell) + 1,
+                h.div_ceil(neb.cell) + 1,
+                [sx.div_euclid(cell), sy.div_euclid(cell)],
+                [sx.rem_euclid(cell) as u32, sy.rem_euclid(cell) as u32],
+                // The dither rides along with the clouds, mod its 8-px period.
+                [sx.rem_euclid(8) as u32, sy.rem_euclid(8) as u32],
+                sx,
+                sy,
             )
         }
-        _ => (1, 1, 0, 0),
+        _ => (1, 1, [0, 0], [0, 0], [0, 0], 0, 0),
     };
 
     let Some(cache) = cache else {
@@ -329,37 +490,138 @@ pub fn paint_backdrop(
         let mut field = Vec::new();
         if let (true, Some(neb)) = (show, cfg.nebula) {
             field.resize((nw * nh) as usize, [0.0f32; 3]);
-            bake_nebula(&neb, &mut field, si, nw, nh, qx, qy);
+            bake_cells(&neb, &mut field, si, nw, org, [0, 0, nw, nh]);
         }
-        composite(out, w, h, cfg, &field, nw, neb_amt);
+        composite(out, w, cfg, &field, nw, sub, phase, neb_amt, [0, 0, w, h]);
         return;
     };
 
-    // Keyed on the scroll offset AND the quantized zoom fade: on a drag between
-    // offset ticks this whole pass is a memcpy, and only a large pan or a zoom
-    // step rebuilds it.
-    let layer_key = [w as i32, h as i32, qx, qy, if show { (neb_amt * 40.0).round() as i32 } else { -1 }];
-    let hit = {
-        let c = cache.borrow();
-        c.layer_key == Some(layer_key) && c.layer.len() == len
-    };
-    if hit {
-        out[..len].copy_from_slice(&cache.borrow().layer);
-        return;
-    }
-
-    // Miss. The per-cell fBm bake is itself cached and survives zoom, so a
-    // zoom-only rebuild skips it and just re-composites.
+    // The cloud sprite survives both zoom and pan, so this is usually free: a
+    // zoom-only frame bakes nothing at all, and a drag bakes one strip of cells.
     if let (true, Some(neb)) = (show, cfg.nebula) {
-        ensure_nebula(&neb, cache, si, nw, nh, qx, qy);
+        ensure_nebula(&neb, cache, si, nw, nh, org);
     }
-    {
-        let c = cache.borrow();
-        let field: &[[f32; 3]] = if show { &c.neb_field } else { &[] };
-        composite(out, w, h, cfg, field, nw, neb_amt);
+
+    let mut borrow = cache.borrow_mut();
+    let c = &mut *borrow;
+    // Sized and shaded for this frame? The fade is baked into the layer (unlike
+    // the field), so it belongs in the key; the scroll offset does not, because
+    // a scroll is repaired rather than invalidating.
+    let key = [w as i32, h as i32, if show { (neb_amt * 40.0).round() as i32 } else { -1 }];
+    let sized = c.layer_key == Some(key) && c.layer.len() == len;
+    if sized && c.layer_org == Some([sx, sy]) {
+        out[..len].copy_from_slice(&c.layer); // still, or panned less than a `quant`
+        return;
     }
-    let mut c = cache.borrow_mut();
-    c.layer.clear();
-    c.layer.extend_from_slice(&out[..len]);
-    c.layer_key = Some(layer_key);
+    if !sized {
+        c.layer.clear();
+        c.layer.resize(len, 0);
+    }
+    let field: &[[f32; 3]] = if show { &c.neb_field } else { &[] };
+
+    // A scrolled layer is only reusable if every pixel of it is a function of
+    // where the CLOUDS are — which is why the nebula's dither is anchored to
+    // them. A screen-pinned ground dither underneath would not survive the
+    // memmove, so such a scene re-composites in full.
+    let slide = match (sized, c.layer_org) {
+        (true, Some([px, py])) if cfg.dither == 0.0 => {
+            let (dx, dy) = (sx - px, sy - py);
+            (dx.abs() < w as i32 && dy.abs() < h as i32).then_some((dx, dy))
+        }
+        _ => None,
+    };
+    match slide {
+        Some((dx, dy)) => {
+            scroll(&mut c.layer, w, h, 4, dx, dy);
+            for r in exposed(w, h, dx, dy) {
+                composite(&mut c.layer, w, cfg, field, nw, sub, phase, neb_amt, r);
+            }
+        }
+        None => composite(&mut c.layer, w, cfg, field, nw, sub, phase, neb_amt, [0, 0, w, h]),
+    }
+    c.layer_key = Some(key);
+    c.layer_org = Some([sx, sy]);
+    out[..len].copy_from_slice(&c.layer);
+}
+
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TINTS: &[Rgb] = &[[0.30, 0.22, 0.48], [0.18, 0.30, 0.46], [0.42, 0.24, 0.30]];
+
+    /// solar's backdrop, near enough — the only one in the workspace with clouds.
+    const CLOUDY: Backdrop = Backdrop {
+        base: [0.031, 0.027, 0.068],
+        dither: 0.0,
+        nebula: Some(Nebula { tints: TINTS, cell: 8, quant: 2.0, scroll: 0.09, strength: 0.34, dither: 0.015 }),
+    };
+
+    /// A scene with a ground dither and no clouds — the other four crates.
+    const PLAIN: Backdrop = Backdrop { base: [0.02, 0.02, 0.05], dither: 0.02, nebula: None };
+
+    /// The uncached path is the reference: it bakes and composites the whole
+    /// frame from scratch. Every fast path — memcpy, scroll-and-patch, re-bake —
+    /// must land on exactly the same bytes, or a drag leaves streaks of stale
+    /// sky that no still frame would ever show.
+    fn agrees_with_uncached(cfg: &Backdrop, w: u32, h: u32, steps: &[(f32, f32, f32)]) {
+        let len = (w * h * 4) as usize;
+        let cache = RefCell::new(BackdropCache::default());
+        let (mut cached, mut fresh) = (vec![0u8; len], vec![0u8; len]);
+        for &(bgx, bgy, amt) in steps {
+            paint_backdrop(&mut cached, w, h, cfg, 7, bgx, bgy, 1.0, amt, Some(&cache));
+            paint_backdrop(&mut fresh, w, h, cfg, 7, bgx, bgy, 1.0, amt, None);
+            let bad = cached.iter().zip(&fresh).position(|(a, b)| a != b);
+            assert!(bad.is_none(), "cached backdrop diverged at byte {:?}, pan ({bgx}, {bgy}), fade {amt}", bad);
+        }
+    }
+
+    /// The clouds drift at `scroll` (0.09) of the pan, so these are chosen for
+    /// what they do to the SPRITE: a sub-quant nudge, a sub-cell tick, single-
+    /// and multi-cell slides, both directions at once, a reversal, a fade-only
+    /// change, and a jump past the field with no overlap left to reuse.
+    const PANS: &[(f32, f32, f32)] = &[
+        (0.0, 0.0, 1.0),      // first frame: full bake
+        (2.0, 0.0, 1.0),      // < 1 quant of drift: pure memcpy
+        (24.0, 0.0, 1.0),     // ~2 px: sub-cell, layer scrolls, field does not
+        (120.0, 0.0, 1.0),    // ~11 px: over a cell boundary
+        (120.0, 95.0, 1.0),   // vertical only
+        (400.0, 300.0, 1.0),  // both axes at once -> the double-baked corner
+        (120.0, 95.0, 1.0),   // back the other way: negative scroll
+        (120.0, 95.0, 0.55),  // fade only: layer rebuilds, sprite must not
+        (120.0, 95.0, 0.0),   // clouds off entirely
+        (120.0, 95.0, 1.0),   // and back on
+        (90000.0, -4000.0, 1.0), // fling: no overlap, full rebuild
+        (90011.0, -4000.0, 1.0), // and it scrolls correctly from there
+    ];
+
+    #[test]
+    fn cached_clouds_match_a_fresh_paint() {
+        // Deliberately not a multiple of `cell`, so the partial right/bottom
+        // cells are covered.
+        agrees_with_uncached(&CLOUDY, 137, 83, PANS);
+    }
+
+    #[test]
+    fn cached_plain_ground_matches_a_fresh_paint() {
+        agrees_with_uncached(&PLAIN, 137, 83, PANS);
+    }
+
+    /// A resize has no sprite to slide — it must fall back to a full rebuild
+    /// rather than reusing a field of the wrong stride.
+    #[test]
+    fn resizing_rebuilds_rather_than_reusing() {
+        let cache = RefCell::new(BackdropCache::default());
+        for &(w, h) in &[(137u32, 83u32), (64, 200), (137, 83), (301, 41)] {
+            let len = (w * h * 4) as usize;
+            let (mut cached, mut fresh) = (vec![0u8; len], vec![0u8; len]);
+            for &(bgx, bgy, amt) in PANS {
+                paint_backdrop(&mut cached, w, h, &CLOUDY, 7, bgx, bgy, 1.0, amt, Some(&cache));
+                paint_backdrop(&mut fresh, w, h, &CLOUDY, 7, bgx, bgy, 1.0, amt, None);
+                assert_eq!(cached, fresh, "{w}x{h} after resize, pan ({bgx}, {bgy})");
+            }
+        }
+    }
 }
