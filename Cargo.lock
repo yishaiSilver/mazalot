@@ -42,7 +42,6 @@ dependencies = [
  "image",
  "rand",
  "rand_chacha",
- "render-io",
 ]
 
 [[package]]

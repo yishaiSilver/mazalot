@@ -475,16 +475,18 @@ the spinning-body family. On 4 cores:
 
 | generator | before | after | |
 |---|---:|---:|---:|
-| `planet`   | 30.8s | **8.7s** | 3.56× |
-| `sun`      | 12.5s | **3.5s** | 3.56× |
-| `solar`    | 17.1s | **4.9s** | 3.46× |
-| `comet`    | 19.3s | **5.2s** | 3.70× |
-| `asteroid` | 15.0s | **4.5s** | 3.37× |
-| `moon`     |  7.9s | **2.4s** | 3.27× |
-| `alien`    |  5.3s | **2.2s** | 2.41× |
-| **all 74 outputs** | **108s** | **32s** | **3.42×** |
+| `comet`    | 19.6s | **5.3s** | 3.68× |
+| `planet`   | 31.2s | **8.7s** | 3.60× |
+| `sun`      | 13.1s | **3.7s** | 3.54× |
+| `solar`    | 17.6s | **5.1s** | 3.47× |
+| `asteroid` | 15.3s | **4.5s** | 3.40× |
+| `moon`     |  8.2s | **2.5s** | 3.32× |
+| **all six** | **105s** | **30s** | **3.52×** |
 
-Every byte is unchanged, which is the whole constraint: `write_gif` mirrors
+Counting `bird` and `character`, which are untouched, the whole `out/` build goes
+110.5s → 35.1s (3.15×).
+
+Every byte is unchanged, which is the whole constraint: `encode_gif` mirrors
 `GifEncoder::convert_frame`/`encode_gif` step for step — same speed, same
 `delay / 10` truncation, same `Background` disposal, same empty global palette
 sized from the first frame, `set_repeat` before any frame. It is the one place
@@ -497,6 +499,11 @@ their encoding: their frame closures borrow a `System`/`Belt`/`Scene` whose
 deliberately non-`Sync`. Rendering frames in parallel would mean one system per
 thread, which throws away exactly the caches that make a scene frame cheap. They
 still land near 3.5× because encoding was the bulk of it.
+
+`bird` is deliberately untouched. It renders creatures, not planets; it keeps its
+own inline GIF encoder and its independence from `render-io`, and it stays on the
+serial path. That is why the whole-pipeline figure lands below the per-generator
+one — `alien` is ~5s of it.
 
 Nothing here reaches the wasm builds: `render-io` sits behind the `native`
 feature, so a `--no-default-features` module still has **zero** third-party
