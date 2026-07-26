@@ -36,3 +36,7 @@ native = ["dep:image", "dep:render-io"]
 [[bin]]
 name = "sun"
 required-features = ["native"]
+
+[[bin]]
+name = "styles"
+required-features = ["native"]

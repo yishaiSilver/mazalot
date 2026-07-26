@@ -74,6 +74,7 @@
 
   <div class="panel">
     <h2>Controls</h2>
+    <div class="ctl"><label>Style</label><select id="style"></select></div>
     <div class="ctl"><label>Type</label><select id="type"></select></div>
     <div class="ctl"><label>Seed</label>
       <div class="rowflex"><input type="number" id="seed" min="0" value="1" /><button class="mini" id="rndseed" title="random seed">🎲</button></div>
@@ -99,6 +100,10 @@ const NAMES = [
   "blue giant","white star","yellow dwarf","orange dwarf",
   "red giant","red dwarf","white dwarf","sol",
 ];
+
+// Look patterns, in StarPattern::ALL order (index passed to wasm).
+const STYLES = ["realistic","pixel bands","plasma","cel toon","sunburst"];
+let styleIdx = 1; // default: pixel bands (what the user picked)
 
 // Slider defs in DISPLAY order; `pi` = parameter index into the wasm params array
 // (MUST match star::param). `g` starts a new group header.
@@ -170,7 +175,7 @@ function frame() {
   const pv = new Float32Array(wasm.memory.buffer, paramsPtr, NUM);
   for (const p of PARAMS) pv[p.pi] = parseFloat(sliders[p.pi].input.value);
   const dither = parseFloat($("dth").value);
-  wasm.render_params(bufPtr, NATIVE, typeIdx, seed, angle, paramsPtr, dither, spin);
+  wasm.render_pattern_params(bufPtr, NATIVE, typeIdx, seed, angle, styleIdx, paramsPtr, dither, spin);
   const view = new Uint8Array(wasm.memory.buffer, bufPtr, bufLen);
   imgData.data.set(view);
   octx.putImageData(imgData, 0, 0);
@@ -189,12 +194,15 @@ async function main() {
   NUM = wasm.num_params();
 
   NAMES.forEach((name, i) => { const o = document.createElement("option"); o.value = String(i); o.textContent = name; $("type").appendChild(o); });
+  STYLES.forEach((name, i) => { const o = document.createElement("option"); o.value = String(i); o.textContent = name; $("style").appendChild(o); });
+  $("style").value = String(styleIdx);
   buildSliders();
 
   paramsPtr = wasm.alloc(NUM * 4); // stable buffer, allocated before pixel buffer
   setResolution(80);
   randomize();
 
+  $("style").addEventListener("change", () => { styleIdx = parseInt($("style").value); });
   $("type").addEventListener("change", () => setType(parseInt($("type").value)));
   $("seed").addEventListener("input", () => { seed = (parseInt($("seed").value) || 0) >>> 0; $("sub").textContent = `seed ${seed} · type ${typeIdx}`; });
   $("rndseed").addEventListener("click", () => { seed = (Math.random() * 0xffffff) >>> 0; $("seed").value = seed; });
