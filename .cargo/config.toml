@@ -1,0 +1,18 @@
+# Every wasm build gets `simd128`.
+#
+# The lattice noise kernels in `noise-core` hash four lattice corners per
+# instruction on this target; without the feature they fall back to the portable
+# array path, which is SLOWER in wasm than the scalar code it replaced (measured:
+# `barren` 1.63 ms vs 1.40 ms at 64²). So this is not an optional speed-up to
+# opt into per build — leave it off and the browser demos regress.
+#
+# Setting it here rather than in `scripts/make-artifact.sh` means a plain
+# `cargo build --target wasm32-unknown-unknown` picks it up too, which is how the
+# demos' committed .wasm files get rebuilt.
+#
+# simd128 has shipped in every major browser since 2021 and is a hard
+# requirement of the committed modules. Note that it is NOT `relaxed-simd`:
+# relaxed mode would allow fused multiply-add, whose different rounding would
+# split the wasm output from the native generators' — see `lanes.rs`.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]
