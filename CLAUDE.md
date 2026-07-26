@@ -147,7 +147,7 @@ Run wasm builds **from the repo root** so `.cargo/config.toml` applies. It adds
   permits FMA, whose rounding would split wasm output from the native
   generators'. `lanes.rs` documents the rules that keep the two backends
   bit-identical — read it before adding an operation there.
-- **`render-io::write_gif` must stay byte-compatible with `image`.** It drives
+- **`render-io`'s `encode_gif` must stay byte-compatible with `image`.** It drives
   the `gif` crate directly — quantizing frames across cores with rayon, writing
   them serially — instead of using `image::codecs::gif::GifEncoder`, which is
   what makes the generators ~3.4× faster. It reproduces `GifEncoder`'s steps

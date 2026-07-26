@@ -16,13 +16,10 @@ crate-type = ["rlib", "cdylib"]
 image = { version = "0.25", default-features = false, features = ["png", "gif"], optional = true }
 rand = { version = "0.8", optional = true }
 rand_chacha = { version = "0.3", optional = true }
-# Shared native GIF encoding (parallel palette quantization). Only pulled in
-# by `native`, so the wasm build never sees it.
-render-io = { path = "../render-io", optional = true }
 
 [features]
 default = ["native"]
-native = ["dep:image", "dep:rand", "dep:rand_chacha", "dep:render-io"]
+native = ["dep:image", "dep:rand", "dep:rand_chacha"]
 
 [[bin]]
 name = "alien"

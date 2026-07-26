@@ -1,13 +1,10 @@
-//! render-io — the native `image`-crate orchestration shared by the generator
+//! render-io — the native `image`-crate orchestration shared by the space-crate
 //! bins: turning RGBA frames into GIFs, contact-sheet PNGs, and orbit/pan
 //! animations. Two families:
 //!   * "spinning body" (planet, star): [`write_spin_gif`], [`write_spin_grid_gif`],
 //!     [`write_contact_sheet`].
 //!   * "scene / camera" (solar, moon, comet, asteroid): [`fit_zoom`],
 //!     [`write_orbit_gif`], [`write_anim_gif`], [`write_poster`].
-//!
-//! plus bare [`write_gif`] for a bin that has already built its own frames —
-//! `bird`, which composes its own sheets and shares nothing else here.
 //!
 //! The per-frame render call and the (per-crate) `Camera` stay in each bin's
 //! closure; this crate only owns the `image`-crate calls. Every helper issues
@@ -28,7 +25,7 @@ type Res = Result<(), Box<dyn Error>>;
 
 /// `image`'s `GifEncoder::new` quality setting. 1 is "prioritize quality over
 /// performance at any cost", and it is most of this crate's runtime — see
-/// [`write_gif`].
+/// `encode_gif`.
 const GIF_SPEED: i32 = 1;
 
 /// Nearest-neighbour integer upscale (the bins' old `zoom`).
@@ -53,7 +50,7 @@ pub fn upscale_nearest(img: &RgbaImage, s: u32) -> RgbaImage {
 /// before any frame. That correspondence is what keeps every byte of `out/`
 /// unchanged, so if you touch this, re-check the hashes rather than eyeballing
 /// a GIF.
-pub fn write_gif(path: &str, delay_ms: u32, frames: Vec<RgbaImage>) -> Res {
+fn encode_gif(path: &str, delay_ms: u32, frames: Vec<RgbaImage>) -> Res {
     let quantized: Vec<gif::Frame<'static>> = frames
         .into_par_iter()
         .map(|img| {
@@ -131,7 +128,7 @@ pub fn write_spin_gif<F: Fn(f32) -> RgbaImage + Sync>(
             upscale_nearest(&render(angle), upscale)
         })
         .collect();
-    write_gif(path, delay_ms, imgs)
+    encode_gif(path, delay_ms, imgs)
 }
 
 /// The "all types spinning together" grid GIF. `count` cells `cols` wide over
@@ -155,7 +152,7 @@ pub fn write_spin_grid_gif<F: Fn(usize, f32) -> RgbaImage + Sync>(
             upscale_nearest(&grid, grid_upscale)
         })
         .collect();
-    write_gif(path, delay_ms, imgs)
+    encode_gif(path, delay_ms, imgs)
 }
 
 /// The contact-sheet PNG: a `rows` × `cols` grid of stills, upscaled + saved.
@@ -200,7 +197,7 @@ pub fn fit_zoom(ext: f32, w: u32, h: u32, margin: f32, vsquash: f32) -> f32 {
 /// and so is deliberately not `Sync`. Parallelising this would mean either a
 /// system per thread — losing exactly the caches that make a scene frame cheap —
 /// or making them thread-safe, which the wasm demos pay for and do not use.
-/// [`write_gif`] is still parallel, and encoding is the bulk of the cost.
+/// `encode_gif` is still parallel, and encoding is the bulk of the cost.
 pub fn write_orbit_gif<F: FnMut(u32, u32, f32) -> Vec<u8>>(
     path: &str,
     w: u32,
@@ -216,7 +213,7 @@ pub fn write_orbit_gif<F: FnMut(u32, u32, f32) -> Vec<u8>>(
         let buf = render(w, h, t);
         imgs.push(RgbaImage::from_raw(w, h, buf).expect("buffer size matches"));
     }
-    write_gif(path, delay_ms, imgs)
+    encode_gif(path, delay_ms, imgs)
 }
 
 /// General GIF driver for bespoke per-frame motion (the pan GIFs). The closure
@@ -237,7 +234,7 @@ pub fn write_anim_gif<F: FnMut(usize, usize, u32, u32) -> Vec<u8>>(
         let buf = render(f, frames, w, h);
         imgs.push(RgbaImage::from_raw(w, h, buf).expect("buffer size matches"));
     }
-    write_gif(path, delay_ms, imgs)
+    encode_gif(path, delay_ms, imgs)
 }
 
 /// Single still PNG at a fixed `t`. Scene reporting stays in the caller.
