@@ -18,7 +18,7 @@ dependencies** (except `render-io`, which is the one that owns `image`):
 
 | crate | what |
 |---|---|
-| `noise-core` | 3D value-noise, fBm, domain warp, Worley, colour/ramp math. Bottom of everything. |
+| `noise-core` | 3D value-noise, fBm, domain warp, Worley, colour/ramp math. Bottom of everything. The lattice kernels are four-lane (`lanes.rs`); see the SIMD gotcha below. |
 | `dither-core` | Bayer ordered dither + level quantization. |
 | `scene-core` | `Camera`, seeded `Rng`, `Tile` + `blit` alpha compositor. |
 | `background-core` | **The** backdrop — dithered ground, optional seeded nebula (baked + cached), parallax star layers. |
@@ -93,10 +93,11 @@ for c in planet solar moon comet asteroid bird character; do
   cargo run -q --release -p "$c" --bin "$c"
 done
 cargo run -q --release -p star --bin sun     # note: the bin is `sun`, not `star`
+cargo run -q --release -p bird --bin alien   # `bird` has two bins; this one is easy to miss
 (cd out && sha256sum *) | sort > /tmp/after.sha256
 ```
 
-`out/` is gitignored and holds 94 files. Hash it **before** you touch anything,
+`out/` is gitignored and holds 74 files. Hash it **before** you touch anything,
 again after, and diff. A refactor that is supposed to be behaviour-preserving
 should come out byte-identical; if something changed, you must be able to name
 which crate and why.
@@ -106,10 +107,22 @@ with the JS:
 
 ```bash
 cargo build -p solar --target wasm32-unknown-unknown --release --no-default-features
+node -e 'const m=new WebAssembly.Module(require("fs").readFileSync(process.argv[1]));
+         console.log(WebAssembly.Module.exports(m).map(e=>e.kind+" "+e.name).sort().join("\n"))' \
+     crates/solar/web/solar.wasm
 ```
 
-Then compare the exported `func` names before/after. Changing them breaks a demo
-silently, because the JS calls them by name.
+Compare that list before/after. Changing it breaks a demo silently, because the
+JS calls the exports by name.
+
+Node also runs the modules directly, which is the only way to check the *wasm*
+render path — `out/` only covers native. Instantiate with `{}` (there are no
+imports), call `alloc`/`render`/`dealloc`, and hash the pixel bytes; that
+checksum is to the wasm build what the `out/` hashes are to the native one, and
+you need it whenever you touch `noise-core`.
+
+Run wasm builds **from the repo root** so `.cargo/config.toml` applies. It adds
+`-C target-feature=+simd128`, which is required, not optional — see below.
 
 `cargo test --workspace` runs the handful of roster tests. It is fast; run it.
 
@@ -123,6 +136,22 @@ silently, because the JS calls them by name.
 - **Benchmark with a control.** This machine's timings swing ±60% between runs.
   Build the baseline in a throwaway `git worktree` and interleave the two binaries
   in one loop, using an untouched pass (e.g. solar's background) as the control.
+  For wasm, build the baseline worktree's module too and alternate `node` runs —
+  and watch that the worktree build is what you think it is: cargo picks up
+  `.cargo/config.toml` from the *working directory*, so a scratch crate built
+  outside the repo silently loses `simd128` and will look like a regression.
+- **`simd128` is load-bearing, not a bonus.** `noise-core`'s kernels are written
+  four-lane. With the feature they beat the old scalar code; without it, the
+  portable array fallback is *slower* in wasm than what it replaced. Never build
+  a demo module with it off. Do not reach for `relaxed-simd` to go further: it
+  permits FMA, whose rounding would split wasm output from the native
+  generators'. `lanes.rs` documents the rules that keep the two backends
+  bit-identical — read it before adding an operation there.
+- **Vector code is not automatically faster inlined.** `value_noise` runs ~28×
+  per pixel and had to be `#[inline(never)]` *on the vector path only* to stop
+  its `v128` temporaries spilling in the pixel loop — inlined it was slower than
+  scalar. Measure whole frames, not just the kernel: this one reversed sign
+  between a microbenchmark and a real frame.
 - `cargo build --workspace` warns about a `bench` output-filename collision between
   `planet` and `solar`. Pre-existing; ignore it.
 - `scripts/make-artifact.sh <crate>` bundles a demo into one self-contained HTML

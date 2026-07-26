@@ -23,7 +23,7 @@ a `--no-default-features` wasm build never sees `image`/`rand` and stays tiny.
 
 | Crate | What it is |
 |-------|------------|
-| `noise-core` | 3D value-noise + fBm + domain warp + Worley, and the color/ramp math. The bottom of everything. |
+| `noise-core` | 3D value-noise + fBm + domain warp + Worley, and the color/ramp math. The bottom of everything. The two lattice kernels hash four corners per instruction on wasm `simd128` — see [SIMD noise](#simd-noise). |
 | `dither-core` | Bayer ordered dithering and level quantization — the pixel-art output stage. |
 | `scene-core` | The scene-compositor kit: draggable `Camera`, seeded `Rng`, and the `Tile` + `blit` alpha compositor. |
 | `background-core` | Everything a scene paints *before* its bodies: the dithered navy ground, an optional seeded **nebula** (baked at low res into a world-indexed sprite that a pan scrolls rather than rebuilds), and **parallax star layers**. |
@@ -52,7 +52,7 @@ always behind the `native` feature, so the wasm build never sees it.
 
 | library crate      | lines | planet | star | solar | moon | comet | asteroid |
 |--------------------|------:|:------:|:----:|:-----:|:----:|:-----:|:--------:|
-| `noise-core`       |   146 |   ○    |  ●   |   ●   |  ●   |   ●   |    ●     |
+| `noise-core`       |   618 |   ○    |  ●   |   ●   |  ●   |   ●   |    ●     |
 | `dither-core`      |    31 |   ○    |  ●   |   ○   |  ●   |   ●   |    ●     |
 | `scene-core`       |   130 |   ○    |  ·   |   ●   |  ●   |   ●   |    ●     |
 | `background-core`  |   365 |   ·    |  ·   |   ●   |  ●   |   ●   |    ●     |
@@ -288,7 +288,8 @@ cd bird-web && python3 -m http.server 8000  # open http://localhost:8000/
 ```
 (All require the wasm target: `rustup target add wasm32-unknown-unknown`. The
 `--no-default-features` flag drops the native-only `image`/`rand` deps so the
-wasm build stays tiny.)
+wasm build stays tiny. `simd128` comes from `.cargo/config.toml` — run these from
+the repo root so cargo picks it up; see [SIMD noise](#simd-noise).)
 
 ### Web controls
 Type · Seed · Resolution · Spin, then live sliders for every parameter
@@ -402,6 +403,45 @@ per-pixel shader runs once per tile pixel. Two ways to keep it cheap:
   planet's surface *is* the detail, so it trades a little crispness and can
   "pop" as the LOD threshold is crossed mid-zoom. Left as a deliberate choice
   since pinning the cap low sidesteps the need.
+
+### SIMD noise
+
+Everything above is about doing the shader *less often*. This is about making it
+cheaper: `value_noise` and `worley` hash their lattice corners four at a time
+through a small four-lane shim (`crates/noise-core/src/lanes.rs`), which lowers
+to wasm `simd128` in the browser and to plain `[_; 4]` arrays everywhere else.
+Measured in V8 (64²/128² frames, ms):
+
+| | before | after |
+|---|---|---|
+| `terran` (clouds + aurora + storm) | 3.46 / 13.32 | **3.10 / 12.17** |
+| `gas_giant` (warped bands + spot)  | 3.13 / 12.32 | **2.71 / 11.00** |
+| `barren` (worley craters)          | 1.40 / 5.65  | **1.11 / 4.56** |
+| `sun-core` tile, r = 24 / 60 / 140 px | 2.88 / 15.6 / 85.5 | **2.40 / 13.1 / 71.0** |
+| `solar` scene frame @ 960×540      | 7.4          | **6.4** |
+
+Every rendered byte is unchanged — native `out/` hashes and the wasm pixel
+checksums both match the scalar code exactly, which is the point: the shim is
+written so the two backends cannot diverge (no FMA, no reassociation), and
+`cargo test -p noise-core` pins both kernels to the scalar definitions they
+replaced, bit-for-bit.
+
+Two results worth keeping, because both are counter-intuitive:
+
+- **`-C target-feature=+simd128` on its own does nothing.** LLVM will not
+  auto-vectorize these kernels; the flag alone produced byte-identical output at
+  identical speed. The lanes have to be written by hand.
+- **The four-lane `value_noise` is only a win when it is *not* inlined.** A pixel
+  evaluates it ~28 times, and inlined into the pixel loop its `v128` temporaries
+  spill badly enough to end up *slower* than scalar (4.12 ms vs 3.46). Out of
+  line it wins (3.10). `worley` is called once per pixel and wants ordinary
+  inlining. Hence the `cfg_attr` on `value_noise`.
+
+Without `simd128` the shim's portable path is slower **in wasm** than the scalar
+code it replaced (`barren` 1.63 vs 1.40 ms), so the feature is a requirement of
+the committed modules rather than a bonus — which is why it lives in
+`.cargo/config.toml` and not in a build script. Native is unaffected either way
+(it takes the array path, and measured within noise of before).
 
 ## Adding a planet type
 
