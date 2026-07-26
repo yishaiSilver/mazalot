@@ -14,7 +14,7 @@ driving a browser demo.
 A Cargo workspace under `crates/`, in two layers.
 
 **Library crates** hold shared machinery. They carry **no third-party
-dependencies** (except `render-io`, which is the one that owns `image`):
+dependencies** (except `render-io`, which owns `image`/`gif`/`rayon`):
 
 | crate | what |
 |---|---|
@@ -25,7 +25,7 @@ dependencies** (except `render-io`, which is the one that owns `image`):
 | `planet-core` | **The** planet renderer — 26-type table, sphere shader, weather, rings, moons. |
 | `sun-core` | The compact star tile (granulation + corona). |
 | `wasm-abi` | `alloc`/`dealloc` + opaque-handle macros for the C ABI. |
-| `render-io` | GIF/contact-sheet/poster helpers. The only crate that touches `image`. |
+| `render-io` | GIF/contact-sheet/poster helpers, and the parallel GIF encoder. The only crate that touches `image`. |
 
 They stack in one direction only — `noise-core` → `dither-core`/`scene-core` →
 `background-core`/`planet-core`/`sun-core`. See the import table in `README.md`.
@@ -147,6 +147,20 @@ Run wasm builds **from the repo root** so `.cargo/config.toml` applies. It adds
   permits FMA, whose rounding would split wasm output from the native
   generators'. `lanes.rs` documents the rules that keep the two backends
   bit-identical — read it before adding an operation there.
+- **`render-io::write_gif` must stay byte-compatible with `image`.** It drives
+  the `gif` crate directly — quantizing frames across cores with rayon, writing
+  them serially — instead of using `image::codecs::gif::GifEncoder`, which is
+  what makes the generators ~3.4× faster. It reproduces `GifEncoder`'s steps
+  exactly (speed 1, `delay / 10`, `Background` disposal, empty global palette
+  from the first frame, `set_repeat` first). If you touch it, or bump `image`
+  or `gif`, re-run the `out/` hashes — every GIF in the repo depends on that
+  correspondence, and a drift is invisible by eye.
+- **Rendering order is parallel now; keep frames independent.** The generators
+  run frames through rayon and `collect()` back into order, so output is
+  deterministic — but only because every frame closure is a pure function of its
+  index. A closure that accumulates across frames would silently produce garbage.
+  The scene bins are the exception and stay serial: their `System`/`Belt`/`Scene`
+  holds `RefCell` caches and is not `Sync` on purpose.
 - **Vector code is not automatically faster inlined.** `value_noise` runs ~28×
   per pixel and had to be `#[inline(never)]` *on the vector path only* to stop
   its `v128` temporaries spilling in the pixel loop — inlined it was slower than

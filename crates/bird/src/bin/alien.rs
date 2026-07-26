@@ -45,12 +45,10 @@
 //! anim: bob/blink/sway/wag/step/flap amplitudes                      I
 //! ─────────────────────────────────────────────────────────────────────────
 
-use image::codecs::gif::{GifEncoder, Repeat};
-use image::{imageops, Delay, Frame, Rgba, RgbaImage};
+use image::{imageops, Rgba, RgbaImage};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::f32::consts::TAU;
-use std::fs::File;
 
 const GRID: u32 = 30; // DESIGN-space resolution — all geometry is authored here
 const DETAIL: u32 = 2; // supersample factor: creatures rasterize at GRID*DETAIL cells
@@ -1260,14 +1258,12 @@ fn frame_tile(a: &Alien, i: u32, up: u32, f: u32) -> RgbaImage {
     tile
 }
 
+/// This bin renders nothing in common with the space crates, but its GIF write
+/// was a line-for-line copy of theirs, so it goes through the shared one — which
+/// quantizes frames across cores (the bulk of this bin's runtime) and is the
+/// single place that has to stay byte-compatible with `image`'s encoder.
 fn write_gif(path: &str, frames: Vec<RgbaImage>, delay_ms: u32) -> Result<(), Box<dyn std::error::Error>> {
-    let file = File::create(path)?;
-    let mut enc = GifEncoder::new(file);
-    enc.set_repeat(Repeat::Infinite)?;
-    for fr in frames {
-        enc.encode_frame(Frame::from_parts(fr, 0, 0, Delay::from_numer_denom_ms(delay_ms, 1)))?;
-    }
-    Ok(())
+    render_io::write_gif(path, delay_ms, frames)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
