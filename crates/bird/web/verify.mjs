@@ -2,10 +2,14 @@ import { readFileSync } from 'fs';
 const bytes = readFileSync(new URL('./bird.wasm', import.meta.url));
 const { instance } = await WebAssembly.instantiate(bytes, {});
 const w = instance.exports;
+// `bg` is the literal fill bird::render_rgba lays down off the creature — it is
+// written straight to the buffer, not dithered, so an exact match is right here.
 const size = 120, len = size * size * 4, bg = [10, 9, 16];
 const ptr = w.alloc(len);
 console.log('native_grid =', w.native_grid());
-const detail = w.default_detail ? w.default_detail() : 1.0;
+// The fallback only fires against a wasm predating the export; keep it on
+// bird::DEFAULT_DETAIL so a stale module still renders at the intended scale.
+const detail = w.default_detail ? w.default_detail() : 2.0;
 console.log('default_detail =', detail);
 // render a few frames/seeds; ensure a creature actually draws and animates
 let frameCounts = [];

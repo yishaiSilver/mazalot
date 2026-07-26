@@ -9,7 +9,11 @@ const { memory, alloc, render, render_params, param, num_params, type_count } = 
 const SIZE = 80;
 const nTypes = type_count();
 console.log(`type_count = ${nTypes}`);
-if (nTypes !== 8) throw new Error(`expected 8 star types, got ${nTypes}`);
+// Mirrors star::STYPES, which NAMES in index.html is index-aligned with. Pinned
+// rather than bounded: a new star type has to move all three, and a mismatch
+// here is the cheapest place to notice the demo's list went stale.
+const TYPE_COUNT = 8;
+if (nTypes !== TYPE_COUNT) throw new Error(`expected ${TYPE_COUNT} star types (star::STYPES), got ${nTypes}`);
 
 const len = SIZE * SIZE * 4;
 const ptr = alloc(len);
@@ -27,6 +31,11 @@ for (let i = 0; i < len; i += 4) {
 const total = SIZE * SIZE;
 console.log(`lit pixels: ${nonBg}/${total}`);
 if (allZero) throw new Error("buffer is all zero — render did nothing");
+// 10% is half the bare disc of a radius_scale-1.0 star (star::render_ct puts it
+// at 0.235*size, so π*0.235² ≈ 17%) — which is why the type rendered above has
+// to stay a full-size one. red_dwarf and white_dwarf shrink to 0.72 and 0.62 and
+// come in under this honestly; scale the threshold by radius_scale before
+// pointing the check at either.
 if (nonBg < total * 0.1) throw new Error("too few lit pixels — no star drawn");
 
 // param() + render_params() path: overriding params must change the output.

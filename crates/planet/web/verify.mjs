@@ -9,7 +9,11 @@ const { memory, alloc, render, type_count } = instance.exports;
 const SIZE = 64;
 const nTypes = type_count();
 console.log(`type_count = ${nTypes}`);
-if (nTypes !== 26) throw new Error(`expected 26 types, got ${nTypes}`);
+// Mirrors planet_core::TYPES, which NAMES in index.html is index-aligned with.
+// Pinned rather than bounded: a new archetype has to move all three, and a
+// mismatch here is the cheapest place to notice the demo's list went stale.
+const TYPE_COUNT = 26;
+if (nTypes !== TYPE_COUNT) throw new Error(`expected ${TYPE_COUNT} types (planet_core::TYPES), got ${nTypes}`);
 
 const len = SIZE * SIZE * 4;
 const ptr = alloc(len);
@@ -17,18 +21,38 @@ render(ptr, SIZE, 0 /*terran*/, 1 /*seed*/, 0.7 /*angle*/);
 
 const buf = new Uint8Array(memory.buffer, ptr, len);
 
+// Deep space is planet_core::star_bg's [9,8,20] — but that is the colour going
+// *into* `finalize`, which ordered-dithers every pixel to 22 levels
+// (dither_core::quant at the house strength 0.7) before it reaches the buffer.
+// The Bayer bias is under half a level, so each channel arrives on one of the
+// two steps bracketing the source and never on the raw value: comparing against
+// [9,8,20] literally matched nothing, counted the whole frame as planet, and
+// left the coverage check below unable to fail.
+const LEVELS = 22, DITHER = 0.7;                  // planet_core::finalize
+const step = (k) => Math.floor(Math.max(k, 0) / LEVELS * 255);
+const spaceSteps = (c) => {
+  const f = c / 255 * LEVELS, bias = 0.5 * DITHER; // |dither_core::bayer| < 0.5
+  return [step(Math.round(f - bias)), step(Math.round(f + bias))];
+};
+const SPACE = [9, 8, 20].map(spaceSteps);         // planet_core::star_bg
+const isSpace = (r, g, b) =>
+  SPACE[0].includes(r) && SPACE[1].includes(g) && SPACE[2].includes(b);
+
 // buffer must be non-empty and contain non-background pixels.
 let nonBg = 0;
 let allZero = true;
 for (let i = 0; i < len; i += 4) {
   const r = buf[i], g = buf[i + 1], b = buf[i + 2], a = buf[i + 3];
   if (r || g || b || a) allZero = false;
-  // space color is [9,8,20]; count anything clearly different as "planet/star"
-  if (!(r === 9 && g === 8 && b === 20)) nonBg++;
+  if (!isSpace(r, g, b)) nonBg++; // planet disc, ring or starfield speck
 }
 const total = SIZE * SIZE;
 console.log(`non-background pixels: ${nonBg}/${total}`);
 if (allZero) throw new Error("buffer is all zero — render did nothing");
+// The hero disc is 0.375*size across (planet_core::render_ct), so a full-size
+// world covers ~44% and even ringed_giant — the smallest at radius_scale 0.50 —
+// clears 20%. 10% is the floor every type has room above; an empty starfield
+// lands near 0.
 if (nonBg < total * 0.1) throw new Error("too few non-background pixels — no planet drawn");
 
 // Render a second, different type/seed and confirm it differs from the first.
