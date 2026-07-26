@@ -515,9 +515,16 @@ fn paint_background(
         pan_scale: parallax,
         far_fade: far_amt,
     };
-    // Every system shares one sky: the star hash takes no seed, so panning across
-    // two different systems shows the same constellations.
-    paint_stars(out, w, h, &sky, bgx, bgy, |cx, cy, salt| hash3(cx, cy, 17 + salt));
+    // Salt the star hash with the seed, so each system gets its own constellations.
+    // Mixed into the hash's third axis rather than added to the cell coordinates:
+    // offsetting the grid would give every system the SAME sky panned sideways,
+    // which is the trap the nebula's plane offset used to fall into. The 977
+    // stride clears the three layer salts, so one system's near layer can never
+    // come out as the next system's far one.
+    let sky_salt = (seed as i32).wrapping_mul(977);
+    paint_stars(out, w, h, &sky, bgx, bgy, move |cx, cy, salt| {
+        hash3(cx, cy, sky_salt.wrapping_add(17 + salt))
+    });
 }
 
 /// Dot in a planet's orbit path as a faint dashed ellipse around the sun.

@@ -16,7 +16,15 @@ const sys = system_new(7);
 const n = planet_count(sys);
 console.log(`planets = ${n}, sun kind = ${sun_kind_of(sys)}, extent = ${system_extent(sys).toFixed(0)}`);
 if (n < 3 || n > 10) throw new Error(`planet count out of range: ${n}`);
-for (let i = 0; i < n; i++) if (planet_kind_at(sys, i) > 9) throw new Error("bad planet kind index");
+// `planet_kind_at` indexes solar::ROSTER, which PLANET_NAMES in index.html is
+// aligned with — so the bound is that array's length, and it moves when a new
+// archetype is added to either. (It sat at 10 long after the roster passed it,
+// which is exactly the drift this check exists to catch.)
+const ROSTER_LEN = 26;
+for (let i = 0; i < n; i++) {
+  const k = planet_kind_at(sys, i);
+  if (k >= ROSTER_LEN) throw new Error(`planet kind ${k} is outside the ${ROSTER_LEN}-entry roster`);
+}
 
 // Fit the camera and render one frame; it must be a non-empty scene with a
 // clearly-lit central body (the star) plus starfield.

@@ -26,7 +26,7 @@ a `--no-default-features` wasm build never sees `image`/`rand` and stays tiny.
 | `noise-core` | 3D value-noise + fBm + domain warp + Worley, and the color/ramp math. The bottom of everything. |
 | `dither-core` | Bayer ordered dithering and level quantization — the pixel-art output stage. |
 | `scene-core` | The scene-compositor kit: draggable `Camera`, seeded `Rng`, and the `Tile` + `blit` alpha compositor. |
-| `background-core` | Everything a scene paints *before* its bodies: the dithered navy ground, an optional seeded **nebula** (baked at low res and cached), and **parallax star layers**. |
+| `background-core` | Everything a scene paints *before* its bodies: the dithered navy ground, an optional seeded **nebula** (baked at low res into a world-indexed sprite that a pan scrolls rather than rebuilds), and **parallax star layers**. |
 | `planet-core` | **The** planet renderer — the only one in the workspace. The 26-type table, sphere shading, weather, rings, moons. One shader, two framings: a *hero* square frame (`render_rgba`) and a *scene sprite tile* (`render_tile`). `planet`, `solar` and `moon` are all framings of it. |
 | `sun-core` | The compact star tile (granulation + corona) used by `solar` and `comet`. |
 | `wasm-abi` | The raw C-ABI glue: `alloc`/`dealloc` and opaque-handle macros. Exports no symbols itself. |
@@ -168,7 +168,8 @@ new work here is the layer on top:
   out (and are skipped) when you zoom in on a body. The backdrop depends only on
   the camera + view params (never on animation time), so it's **cached**: on a
   still camera — the common "watch it orbit" view — the whole background is a
-  `memcpy` and only the bodies re-render. This is why the fit view runs at ~110
+  `memcpy` and only the bodies re-render, and a drag scrolls the cached backdrop
+  and repaints only the edge that came into view. This is why the fit view runs at ~110
   fps native while orbiting (see Performance).
 - **Click to follow** — click a planet and the camera locks on and tracks it
   around its orbit; drag anywhere to release.
@@ -340,18 +341,36 @@ trick is applied at three scales.
 frame and O(pixels), yet almost entirely *stable*: it never depends on animation
 time, the nebula scrolls at only 9% of pan and its shape is zoom-independent, and
 the base navy is constant. Only the stars (a cheap O(cells) overlay) truly move.
-So it's cached in **three nested layers**, each keyed on what changes it:
-- **fBm nebula field** (low-res, costliest sub-pass) — keyed on the quantized
-  scroll offset *only*, so a pure **zoom never re-bakes it**. ~9 ms → ~0.
-- **Base-navy + nebula layer** (full-res, all but stars/orbits) — keyed on offset
-  **and** zoom-fade. On a drag it's reused as a `memcpy`, collapsing the ~6.5 ms
-  base-fill + composite.
+
+Time-quantizing alone only got a *still* camera cheap, though — the moment you
+dragged, every key changed and the whole backdrop was rebuilt. The fix is to stop
+treating a pan as invalidation: the backdrop is a function of *where* the camera
+is, so a panned frame is the previous frame **moved**. Both cached layers are
+therefore kept as **sprites indexed by world position**, and a drag memmoves them
+and repaints only the strip that scrolled into view:
+- **fBm nebula field** (low-res) — indexed by absolute world cell. A pan slides
+  it and re-bakes ~1% of it; a pure **zoom never re-bakes it at all**, because
+  the fade is applied when the sprite is read rather than baked in.
+- **Base-navy + nebula layer** (full-res, all but stars/orbits) — the dominant
+  cost of the two, by about 4:1. Scrolled the same way, so a drag costs a sliver
+  of a screenful instead of a full composite.
 - **Whole backdrop** (`render_system_cached`) — a still camera skips even the
   star overlay: the entire backdrop is one `memcpy`, only bodies re-render.
 
+Measured at 1000x640 (`cargo run --release -p solar --bin bench`), a fast drag
+went 4.9 ms → 0.33 ms, and the backdrop from 45% of a panning frame to 22%.
+
+What makes the sprites slide is that the whole layer is a function of where the
+*clouds* are — so the nebula's ordered dither is anchored to them rather than to
+the screen (which also stops the stipple crawling as they drift). A scene that
+sets `Backdrop::dither` under a nebula reintroduces a screen-pinned term and
+opts out of the scrolled path; none currently does.
+
 The first two layers live in `background_core::BackdropCache`, so any scene that
 grows a nebula inherits them; the third is solar's, since it also caches the
-orbit paths.
+orbit paths. `cargo test -p background-core` pins the fast paths to the uncached
+renderer byte-for-byte across a scripted pan — a scroll bug shows up as stale sky
+smeared across a drag and in no still frame, so it needs a test that pans.
 
 **Bodies** — with the background cached, bodies dominated, and the star's
 convection/corona shader (27-cell worley + fBm per pixel over a large tile) was

@@ -115,7 +115,7 @@ fn main() {
     println!("\n── fit breakdown (panning) ──────────────────");
     println!("  background total                  {:7.2} ms   {:5.1}%", t_bg, 100.0 * t_bg / t_full);
     println!("    ├ base fill + orbit paths       {:7.2} ms   {:5.1}%", t_base, 100.0 * t_base / t_full);
-    println!("    ├ nebula (bake amortized)       {:7.2} ms   {:5.1}%", nebula, 100.0 * nebula / t_full);
+    println!("    ├ nebula (sprite, amortized)    {:7.2} ms   {:5.1}%", nebula, 100.0 * nebula / t_full);
     println!("    └ stars (density 0.5)           {:7.2} ms   {:5.1}%", stars, 100.0 * stars / t_full);
     println!("  bodies (sun + {} planets)          {:7.2} ms   {:5.1}%", sys.planets.len(), bodies, 100.0 * bodies / t_full);
 
@@ -152,10 +152,13 @@ fn main() {
     println!("    │   └ stars (all 3 layers on)   {:7.2} ms   (fit: {:.2} ms)", z_stars, stars);
     println!("    └ bodies (tiny / culled)        {:7.2} ms   {:5.1}%", z_bodies, 100.0 * z_bodies / z_full);
 
-    // Nebula cache: the per-cell fBm bake vs reusing it. On a still/zooming
-    // camera the offset never ticks (nebula cached); on a slow drag it ticks
-    // rarely; only a fast fling re-bakes most frames.
-    println!("\n── nebula cache (bg only, density 0) ────────");
+    // Nebula sprite: the per-cell fBm bake vs scrolling the field it already has.
+    // The cloud sprite is indexed by absolute world cell, so a drag memmoves it
+    // and bakes only the strip that scrolled in — the cost of a pan stops
+    // tracking the bake and starts tracking the composite. Only a teleport (seed
+    // change, resize, fling past the field) still pays for a full bake, which is
+    // what every pan used to cost.
+    println!("\n── nebula sprite (bg only, density 0) ───────");
     set_density(&mut sys, 0.0);
     let bgcam = Camera { x: 1.0e7, y: 1.0e7, zoom: fz };
     let bake_ms = |sys: &System, step: f32, buf: &mut [u8]| -> f64 {
@@ -168,13 +171,16 @@ fn main() {
         }
         t.elapsed().as_secs_f64() * 1000.0 / FRAMES as f64
     };
-    let neb_still = bake_ms(&sys, 0.0, &mut buf); // never ticks -> cache always hit
-    let neb_drag = bake_ms(&sys, 3.0, &mut buf); // ~3 px/frame -> ticks ~1/7 frames
-    let neb_fling = bake_ms(&sys, 5000.0, &mut buf); // re-bakes every frame (old cost)
-    println!("  still / zooming (cache hit)       {:7.2} ms", neb_still);
-    println!("  slow drag (~1 bake / 7 frames)    {:7.2} ms", neb_drag);
-    println!("  re-bake every frame (was: always) {:7.2} ms", neb_fling);
-    println!("  => fBm bake saved when cached      {:6.2} ms/frame", (neb_fling - neb_still).max(0.0));
+    // Camera px/frame; the clouds drift at `scroll` (0.09) of that.
+    let neb_still = bake_ms(&sys, 0.0, &mut buf); // never moves -> layer memcpy
+    let neb_slow = bake_ms(&sys, 3.0, &mut buf); // clouds cross a cell ~1/30 frames
+    let neb_fast = bake_ms(&sys, 40.0, &mut buf); // ~1 strip bake / 2 frames
+    let neb_jump = bake_ms(&sys, 5000.0, &mut buf); // no overlap -> full bake, every frame
+    println!("  still / zooming (layer memcpy)    {:7.2} ms", neb_still);
+    println!("  slow drag   ( 3 px/frame)         {:7.2} ms", neb_slow);
+    println!("  fast drag   (40 px/frame)         {:7.2} ms", neb_fast);
+    println!("  teleport (full bake every frame)  {:7.2} ms   <- what every pan used to cost", neb_jump);
+    println!("  => bake avoided on a fast drag     {:6.2} ms/frame", (neb_jump - neb_fast).max(0.0));
     set_density(&mut sys, 0.5);
 
     // Resolution scaling (background is O(pixels)).
@@ -203,7 +209,7 @@ fn main() {
     set_density(&mut sys, 0.5);
 
     // Per-frame heap allocations in the hot path (informational).
-    println!("\nnote: the nebula field (~{} KB) is now cached on the System and reused",
-        ((W + 7) / 8) * ((H + 7) / 8) * 12 / 1024);
-    println!("      across frames; render_system still allocates a small draw-order Vec.");
+    println!("\nnote: the nebula sprite (~{} KB) lives on the System and is scrolled, not",
+        ((W + 7) / 8 + 1) * ((H + 7) / 8 + 1) * 12 / 1024);
+    println!("      rebuilt; render_system still allocates a small draw-order Vec.");
 }
