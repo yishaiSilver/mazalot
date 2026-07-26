@@ -391,6 +391,21 @@ quantizing it (the sun trick) would read as choppy.
 The cost scales with the **detail cap** — it bounds the tile resolution, and the
 per-pixel shader runs once per tile pixel. Two ways to keep it cheap:
 
+- **Let it pin itself.** The demo holds a render budget by walking the planet
+  detail cap down when a frame runs long and back up when it doesn't (*Hold 60
+  fps automatically*, on by default; the slider becomes the ceiling and the HUD
+  shows the effective value). Body tile resolution is by far the steepest knob
+  in the scene — following a planet at 20× zoom costs **53 ms at cap 160 and
+  10 ms at cap 64** — and it degrades the way pixel art wants to, by getting
+  chunkier rather than blurrier. A tile costs ~r², so the controller jumps
+  straight to `cap · sqrt(budget / measured)` instead of walking: it converges
+  in two ticks (~0.4 s) and settles just under budget.
+
+  Worth knowing what it is *not*: at that zoom the backdrop cache is worth only
+  ~0.5 ms whether it hits or misses, turning the starfield and nebula off
+  entirely changes nothing, and the sun's cap is irrelevant because the star is
+  culled once you are on a planet. It is the planet tile, all of it.
+
 - **Pin the detail cap low** (~56) — the tile stays small, so the fills-screen
   case never gets expensive in the first place. This is the intended default and
   needs no code: the cap is already a live slider (`planet_detail`). At ~56 a

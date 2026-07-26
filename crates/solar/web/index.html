@@ -123,6 +123,7 @@
     <div class="lbl" id="pfLoad">CPU – % of 60 fps</div>
     <div class="lbl" id="pfRes">– × –</div>
     <div id="pfBg" class="lbl">bg –</div>
+    <div id="pfAuto" class="lbl">detail –</div>
     <div class="bar"><i id="pfBar"></i></div>
   </div>
 </div>
@@ -155,6 +156,8 @@
     <div class="ctl"><label>Planets <b id="ppixV">1×</b></label><input type="range" id="ppix" min="1" max="6" step="1" value="1" /></div>
     <div class="ctl"><label>Sun <b id="spixV">1×</b></label><input type="range" id="spix" min="1" max="6" step="1" value="1" /></div>
     <div class="ctl"><label>Planet detail cap <b id="pdetV">160</b></label><input type="range" id="pdet" min="16" max="256" step="8" value="160" /></div>
+    <div class="ctl"><label for="auto">Hold 60 fps automatically <b id="autoV">on</b></label>
+      <input type="checkbox" id="auto" checked style="width:auto;accent-color:#f4b74a;cursor:pointer" /></div>
     <div class="ctl"><label>Sun detail cap <b id="sdetV">110</b></label><input type="range" id="sdet" min="16" max="176" step="8" value="110" /></div>
     <div class="ctl"><label for="lod">Octave LOD on big tiles <b id="lodV">on</b></label>
       <input type="checkbox" id="lod" checked style="width:auto;accent-color:#f4b74a;cursor:pointer" /></div>
@@ -222,6 +225,18 @@ let perfPrev = performance.now(), perfDrawn = 0, bgSig = "", bgRedrewInWindow = 
 // (structural — needs a rebuild). countAuto keeps the seed-derived count until
 // the user sets one.
 let vSpacing = 1, vPsize = 1, vSsize = 1, vPpix = 1, vSpix = 1, vPdetail = 160, vSdetail = 110, vStarDen = 0.5, vStarPar = 1;
+// Adaptive detail. Body tile resolution is by far the steepest cost knob in the
+// scene — measured, dropping the cap from 160 to 56 is a ~2x frame — and it
+// degrades the way pixel art wants to, by getting chunkier rather than blurrier.
+// The slider is the CEILING; this only ever walks below it, and walks back up
+// the moment there's headroom. `budget` is render-only ms: the rest of the frame
+// (putImageData, drawImage, compositing) needs the balance of the 16.7ms vsync
+// slot, and missing it is what pins you to exactly 30 fps.
+let autoDetail = true, effDetail = 160;
+// Render budget in ms. The vsync slot is 16.7; putImageData of a full-size
+// buffer plus the crisp drawImage upscale need the rest. Overshooting it is
+// what pins the demo to exactly 30 fps rather than degrading gracefully.
+const AUTO_BUDGET = 11, AUTO_FLOOR = 32;
 let vOrbitW = 1; // dashed orbit-path line thickness in px
 let vEcc = 1;    // eccentricity multiplier (0 = circular, 1 = as generated)
 let planetCount = 6, countAuto = true;
@@ -266,7 +281,7 @@ function fitView() {
 
 // Push the live view multipliers + detail caps into the current system.
 function applyView() {
-  if (sys) wasm.system_set_view(sys, vSpacing, vPsize, vSsize, vPpix, vSpix, vPdetail, vSdetail, vStarDen, vStarPar);
+  if (sys) wasm.system_set_view(sys, vSpacing, vPsize, vSsize, vPpix, vSpix, autoDetail ? effDetail : vPdetail, vSdetail, vStarDen, vStarPar);
 }
 
 // (Re)build the system for the current seed + planet count and re-apply the
@@ -371,6 +386,24 @@ function updatePerf(now, renderMs, frameMs) {
   $("pfLoad").textContent = `CPU ${load.toFixed(0)}% of 60 fps`;
   $("pfRes").textContent = `${curW}×${curH} · ${(px / 1000).toFixed(0)}k px`;
   $("pfBg").textContent = bgRedrewInWindow ? "backdrop redraw" : "backdrop cached ✓";
+  if (autoDetail && emaRender > 0.01) {
+    const was = effDetail;
+    // A tile costs ~r^2, so the cap that hits the budget is the current one
+    // scaled by sqrt(budget / measured) — one step instead of a slow walk.
+    // (Checked against the measured curve: cap 160 -> 53ms, 96 -> 20.5, 64 ->
+    // 10.1, which is r^2 plus a small fixed overhead.) Damped to 70% of the
+    // correction so the overhead term can't make it oscillate, and only acted
+    // on outside a dead band, so a frame sitting near budget stays put.
+    const ratio = AUTO_BUDGET / emaRender;
+    if (ratio < 0.9 || ratio > 1.35) {
+      const target = effDetail * (1 + 0.7 * (Math.sqrt(ratio) - 1));
+      effDetail = Math.max(AUTO_FLOOR, Math.min(vPdetail, Math.round(target / 8) * 8));
+    }
+    if (effDetail !== was) applyView();
+    $("pfAuto").textContent = `detail ${effDetail}${effDetail < vPdetail ? " (auto)" : ""}`;
+  } else if (!autoDetail) {
+    $("pfAuto").textContent = `detail ${vPdetail} (manual)`;
+  }
   bgRedrewInWindow = false;                      // reset for the next window
   const bar = $("pfBar");
   bar.style.width = Math.min(100, load).toFixed(0) + "%";
@@ -523,13 +556,20 @@ $("lod").addEventListener("change", () => {
   if (sys) wasm.system_set_lod(sys, on ? 1 : 0);
 });
 
+$("auto").addEventListener("change", () => {
+  autoDetail = $("auto").checked;
+  $("autoV").textContent = autoDetail ? "on" : "off";
+  effDetail = vPdetail;            // hand control back at the slider's value
+  applyView();
+});
+
 // Purely JS-side: animation rate and scene render density.
 $("speed").addEventListener("input", () => { orbitSpeed = parseFloat($("speed").value); $("speedV").textContent = orbitSpeed.toFixed(1) + "×"; });
 $("prot").addEventListener("input", () => { planetRot = parseFloat($("prot").value); $("protV").textContent = planetRot.toFixed(1) + "×"; });
 $("srot").addEventListener("input", () => { starRot = parseFloat($("srot").value); $("srotV").textContent = starRot.toFixed(1) + "×"; });
 $("pix").addEventListener("input", () => { pix = parseInt($("pix").value) || 1; $("pixV").textContent = pix + "×"; });
 // Detail caps (the "lower bound of pixelation"): live view params, no rebuild.
-liveMul("pdet", "pdetV", v => vPdetail = v, v => String(v | 0));
+liveMul("pdet", "pdetV", v => { vPdetail = v; effDetail = Math.min(effDetail, v); }, v => String(v | 0));
 liveMul("sdet", "sdetV", v => vSdetail = v, v => String(v | 0));
 liveMul("sden", "sdenV", v => vStarDen = v, v => v.toFixed(2) + "×");
 liveMul("spar", "sparV", v => vStarPar = v, v => v.toFixed(2) + "×");

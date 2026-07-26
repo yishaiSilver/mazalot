@@ -636,6 +636,14 @@ pub fn render_system_cached(sys: &mut System, w: u32, h: u32, cam: &Camera, bgx:
     draw_bodies(sys, w, h, cam, t_orbit, t_spin, t_sun, out);
 }
 
+/// World position of planet `i` at time `t` — the same query `planet_pos` makes
+/// over the C ABI, for callers on the Rust side (benchmarks, the native bins).
+pub fn planet_pos_of(sys: &System, i: usize, t: f32) -> (f32, f32) {
+    let p = &sys.planets[i];
+    let (x, y, _) = p.at(t, sys.spacing, sys.ecc);
+    (x, y)
+}
+
 /// One planet's memoized tile plus the key it was rendered for.
 #[derive(Default)]
 struct PlanetTile {
