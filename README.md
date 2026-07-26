@@ -184,6 +184,33 @@ launcher cell grids. Finally the **drive plumes** go on additively (turbulent,
 `1/r` flared, with shock diamonds) plus blinking red/green/white **navigation
 lights**, and the whole thing is ordered-dithered.
 
+### What makes a hull read as *built*
+
+Five rules do most of the work, and none of them is "more detail":
+
+- **The outline steps.** Large hulls quantize the length into 4–8 bands and hold
+  the width constant across each, so the silhouette steps like welded sections.
+  A smooth taper reads as a rocket; steps read as a ship. (The shading normal
+  still comes from the *smooth* profile, so a stepped hull doesn't facet.)
+- **The prow is lighter.** A light-value cap over the forward ~9–19% is the
+  cheapest possible cue for "this end is forward" — worth more than any amount
+  of nose detail.
+- **Mounted modules sit in a hard dark recess.** A smooth ambient-occlusion term
+  is far too gentle on its own; without a real dark lip, turrets and greebles
+  mush into the plate beneath them and the hull flattens.
+- **Rhythm beats density.** Identical modules repeated at a fixed pitch down both
+  flanks, with every 2nd or 3rd taking the livery accent, is what says
+  "industrial machine" rather than "enlarged fighter".
+- **Colour goes in a few big shapes.** Grey hull, one accent, spent on wing
+  panels and ladder rungs — and the accent is *warm* against the cool plate, so
+  it reads as markings instead of tinting the whole ship.
+
+These were arrived at by studying open-source top-down ship art, notably
+[Endless Sky](https://github.com/endless-sky/endless-sky)'s (CC BY-SA 4.0).
+Design principles aren't copyrightable; no pixels, geometry, palettes or assets
+were copied, and this crate — like every other one here — ships **no art at
+all**.
+
 **Add a spaceship class** = add a row to `CLASSES` in `crates/ship/src/lib.rs` —
 the web picker, the contact sheets, the scale lineup and the naval prefixes all
 pick it up automatically.

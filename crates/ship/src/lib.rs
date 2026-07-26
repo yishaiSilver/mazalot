@@ -60,6 +60,15 @@
 //! hull number / name    prefix by role+tier, 2-word ship name         S
 //! ─────────────────────────────────────────────────────────────────────────
 //!
+//! **Design reference.** The silhouette and colour-distribution rules were
+//! informed by studying open-source top-down ship art, notably Endless Sky's
+//! (CC BY-SA 4.0): outlines that step between welded sections instead of
+//! tapering; a lighter-value prow cap; hard dark recesses beneath mounted
+//! modules; identical modules repeated at a fixed pitch down both flanks; and
+//! colour spent in a few big shapes against an otherwise grey hull. Those are
+//! design principles, which copyright does not cover — no pixels, geometry,
+//! palettes or assets were copied, and this crate ships no art at all.
+//!
 //! Pipeline per frame (see [`Ship::render`]):
 //!   1. paint the backdrop (a faint hashed starfield + vignette),
 //!   2. for each pixel, rotate into ship space and resolve the topmost part
@@ -598,7 +607,7 @@ fn livery(l: Liv) -> Palette {
         // fleet grey with a cool cast. `accent` carries the bold colour (it's the
         // stripe); `trim` is fine detail and superstructure, so it stays light —
         // swapped, the navy blue lands on whole bridge blocks and reads as glass.
-        Liv::Naval => Palette { plate: [0.50, 0.54, 0.60], shade: [0.34, 0.37, 0.44], accent: [0.24, 0.44, 0.66], trim: [0.74, 0.78, 0.85], ..base },
+        Liv::Naval => Palette { plate: [0.50, 0.54, 0.60], shade: [0.34, 0.37, 0.44], accent: [0.82, 0.58, 0.20], trim: [0.74, 0.78, 0.85], ..base },
         // darker, greener naval — marine assault units
         Liv::Marine => Palette { plate: [0.38, 0.44, 0.40], shade: [0.25, 0.30, 0.28], accent: [0.74, 0.70, 0.38], trim: [0.52, 0.58, 0.50], ..base },
         // merchant: weathered white over rust-red boot topping
@@ -718,6 +727,10 @@ struct Hit {
     tone: f32,
     seed: u32,
     cells: (f32, f32),
+    /// Draw layer of the part that was hit — mounted modules get a dark recess.
+    layer: u8,
+    /// True only for the profiled main body (the prow cap keys off this).
+    hull: bool,
 }
 
 impl Part {
@@ -742,15 +755,19 @@ impl Part {
         }
     }
 
-    /// Resolve one un-mirrored sample. `prof` is the ship's hull profile.
-    fn hit_one(&self, prof: &[f32; 9], px: f32, py: f32) -> Option<Hit> {
+    /// Resolve one un-mirrored sample against `ship`'s hull profile.
+    fn hit_one(&self, ship: &Ship, px: f32, py: f32) -> Option<Hit> {
+        let prof = &ship.profile;
         match self.kind {
             Kind::Hull => {
                 let v = py + 0.5;
                 if !(0.0..=1.0).contains(&v) {
                     return None;
                 }
-                let hw = profile_at(prof, v) * self.hw;
+                // Silhouette from the (optionally stepped) width, but the shading
+                // normal from the SMOOTH profile — so a stepped hull still reads
+                // as a rounded tube instead of faceting at every band edge.
+                let hw = ship.half_width(v);
                 if hw <= 1e-5 || px.abs() > hw {
                     return None;
                 }
@@ -769,6 +786,8 @@ impl Part {
                     tone: self.tone,
                     seed: self.seed,
                     cells: self.cells,
+                    layer: self.layer,
+                    hull: matches!(self.kind, Kind::Hull),
                 })
             }
             Kind::Pod => {
@@ -795,6 +814,8 @@ impl Part {
                     tone: self.tone,
                     seed: self.seed,
                     cells: self.cells,
+                    layer: self.layer,
+                    hull: matches!(self.kind, Kind::Hull),
                 })
             }
             Kind::Slab => {
@@ -828,6 +849,8 @@ impl Part {
                     tone: self.tone,
                     seed: self.seed,
                     cells: self.cells,
+                    layer: self.layer,
+                    hull: matches!(self.kind, Kind::Hull),
                 })
             }
             Kind::Wing => {
@@ -854,6 +877,8 @@ impl Part {
                     tone: self.tone,
                     seed: self.seed,
                     cells: self.cells,
+                    layer: self.layer,
+                    hull: matches!(self.kind, Kind::Hull),
                 })
             }
             Kind::Disc => {
@@ -875,6 +900,8 @@ impl Part {
                     tone: self.tone,
                     seed: self.seed,
                     cells: self.cells,
+                    layer: self.layer,
+                    hull: matches!(self.kind, Kind::Hull),
                 })
             }
             Kind::Ring => {
@@ -899,6 +926,8 @@ impl Part {
                     tone: self.tone,
                     seed: self.seed,
                     cells: self.cells,
+                    layer: self.layer,
+                    hull: matches!(self.kind, Kind::Hull),
                 })
             }
             Kind::Bell => {
@@ -924,6 +953,8 @@ impl Part {
                     tone: self.tone,
                     seed: self.seed,
                     cells: self.cells,
+                    layer: self.layer,
+                    hull: matches!(self.kind, Kind::Hull),
                 })
             }
         }
@@ -1002,6 +1033,12 @@ pub struct Ship {
     /// Lit-porthole density (a slider can drive it, so it lives on the ship
     /// rather than being read back off the class).
     windows: f32,
+    /// How hard the silhouette steps between hull sections, 0 = smooth taper.
+    steps: f32,
+    /// Number of welded sections the length quantizes into when `steps` > 0.
+    step_n: f32,
+    /// Fraction of the length given a lighter prow cap.
+    prow: f32,
     /// Livery scheme: 0 spine stripe · 1 nose flash · 2 aft chevron · 3 none.
     stripe: u32,
     stripe_v: f32,
@@ -1149,6 +1186,12 @@ impl Ship {
             glow: hue_shift(c.glow, rng.range(-0.05, 0.05)),
         };
 
+        // Big, industrial and military hulls read as *built* when the outline
+        // steps between welded sections; small sleek craft stay smooth.
+        let blocky = matches!(c.role, Role::Freighter | Role::Industrial | Role::Carrier)
+            || (c.role == Role::Warship && c.len_m > 200.0);
+        let steps = if blocky { rng.range(0.55, 0.95) } else { rng.range(0.0, 0.28) };
+
         let mut s = Ship {
             class: ci,
             seed,
@@ -1160,6 +1203,9 @@ impl Ship {
             plumes: Vec::new(),
             lights: Vec::new(),
             windows,
+            steps,
+            step_n: rng.int(4, 8) as f32,
+            prow: rng.range(0.09, 0.19),
             stripe: rng.int(0, 3) as u32,
             stripe_v: rng.range(0.18, 0.72),
             hull_num: (rng.f() * 900.0) as u32 + 100,
@@ -1190,6 +1236,7 @@ impl Ship {
         s.add_launchers(launchers, &mut rng);
         s.add_dish(c, &mut rng);
         s.add_radiators(rads, &mut rng);
+        s.add_flank_ladder(c, &mut rng);
         s.add_greebles(greeble, &mut rng);
         s.add_engines(c, engines, &mut rng);
         s.add_lights(&mut rng);
@@ -1212,8 +1259,18 @@ impl Ship {
     }
 
     /// Half-width of the hull at `v` ∈ [0,1], in ship space.
+    ///
+    /// With `steps` > 0 the length is quantized into `step_n` bands and the
+    /// width is held constant across each, so the outline steps like welded
+    /// hull sections instead of tapering smoothly like a rocket.
     pub fn half_width(&self, v: f32) -> f32 {
-        profile_at(&self.profile, v) * self.beam
+        let smooth = profile_at(&self.profile, v) * self.beam;
+        if self.steps <= 0.001 {
+            return smooth;
+        }
+        let q = ((v.clamp(0.0, 1.0) * self.step_n).floor() + 0.5) / self.step_n;
+        let banded = profile_at(&self.profile, q) * self.beam;
+        lerp(smooth, banded, self.steps)
     }
 
     fn add_hull(&mut self, rng: &mut Rng) {
@@ -1316,9 +1373,9 @@ impl Ship {
             self.push(Part {
                 kind: Kind::Wing,
                 cx: root_x,
-                cy: v_root - 0.5 - chord * 0.30,
-                hw: span * 0.86,
-                hh: chord * 0.13,
+                cy: v_root - 0.5 - chord * 0.16,
+                hw: span * 0.88,
+                hh: chord * 0.30,
                 rot: 0.0,
                 p0: sweep * span * 1.25,
                 p1: taper,
@@ -1897,10 +1954,49 @@ impl Ship {
         }
     }
 
+    /// A ladder of identical modules repeated at a fixed pitch down both flanks.
+    /// Regular rhythm — not more detail — is what makes a big hull read as an
+    /// industrial machine rather than an enlarged fighter, so this is gated on
+    /// size rather than on any per-class flag.
+    fn add_flank_ladder(&mut self, c: &Class, rng: &mut Rng) {
+        if c.len_m < 150.0 {
+            return;
+        }
+        let n = rng.int(4, 9) as u32;
+        let (v0, v1) = (rng.range(0.24, 0.34), rng.range(0.74, 0.88));
+        // Every 2nd or 3rd rung takes the livery accent, which is what turns a
+        // repeated shape into a visible beat.
+        let beat = rng.int(2, 3) as u32;
+        let pitch = (v1 - v0) / n as f32;
+        for i in 0..n {
+            let v = v0 + pitch * (i as f32 + 0.5);
+            let hull = self.half_width(v);
+            if hull < 1e-4 {
+                continue;
+            }
+            self.push(Part {
+                kind: Kind::Slab,
+                cx: hull * 0.66,
+                cy: v - 0.5,
+                hw: hull * 0.30,
+                hh: pitch * 0.34,
+                rot: 0.0,
+                p0: 0.22,
+                p1: 0.0,
+                mat: if i % beat == 0 { Mat::Accent } else { Mat::Shade },
+                layer: L_SUPER,
+                mirror: true,
+                tone: 1.0,
+                seed: rng.sub(),
+                cells: (0.0, 0.0),
+            });
+        }
+    }
+
     /// Surface greebles — small plates, vents and blisters that break up the
     /// hull. Cheap, and the single biggest "this looks built" multiplier.
     fn add_greebles(&mut self, density: f32, rng: &mut Rng) {
-        let n = (density * 22.0).round() as i32;
+        let n = (density * 15.0).round() as i32;
         for _ in 0..n {
             let v = rng.range(0.10, 0.94);
             let hull = self.half_width(v);
@@ -2312,11 +2408,11 @@ impl Ship {
             if best.is_some() && p.layer < best_layer {
                 continue;
             }
-            if let Some(hit) = p.hit_one(&self.profile, sx, sy) {
+            if let Some(hit) = p.hit_one(self, sx, sy) {
                 best_layer = p.layer;
                 best = Some(hit);
             } else if p.mirror {
-                if let Some(mut hit) = p.hit_one(&self.profile, -sx, sy) {
+                if let Some(mut hit) = p.hit_one(self, -sx, sy) {
                     hit.n[0] = -hit.n[0];
                     hit.u = -hit.u;
                     best_layer = p.layer;
@@ -2436,6 +2532,12 @@ impl Ship {
             // pixel-art scale the blockiness IS the look.
             let grime = hash3((sx * 5.7).floor() as i32, (sy * 4.3).floor() as i32, hit.seed as i32 | 1);
             base = scale(base, 0.90 + 0.17 * grime);
+            // A lighter cap on the bow. Nearly every hand-drawn top-down ship
+            // does this, and it's the cheapest possible cue for "this end is
+            // forward" — far more legible than any amount of nose detail.
+            if hit.hull && hit.v < self.prow {
+                base = mix(base, self.pal.trim, 0.44 * smoothstep(self.prow, self.prow * 0.3, hit.v));
+            }
             // Livery stripes.
             base = self.livery_stripe(base, hit, sx);
             // Lit portholes down the flanks.
@@ -2470,6 +2572,13 @@ impl Ship {
         // Cool rim from the surrounding starfield.
         let rim = (1.0 - clamp01(n[2])).powi(3) * 0.30;
         c = add(c, scale(RIM, rim));
+        // A hard dark lip around anything MOUNTED on the hull. The smooth AO
+        // term above is far too gentle on its own — without this, turrets,
+        // decks and greebles mush into the plate underneath them and the whole
+        // hull flattens out. Cheap, and the single biggest legibility win.
+        if hit.layer >= L_SUPER && hit.h < 0.36 {
+            c = scale(c, lerp(0.42, 1.0, hit.h / 0.36));
+        }
         add(c, emissive)
     }
 
@@ -2482,8 +2591,8 @@ impl Ship {
         match self.stripe {
             // a stripe down the spine
             0 => {
-                if hit.u.abs() < 0.16 {
-                    mix(base, a, 0.75)
+                if hit.u.abs() < 0.19 {
+                    mix(base, a, 0.85)
                 } else {
                     base
                 }
@@ -2499,10 +2608,10 @@ impl Ship {
             // a band athwartships
             2 => {
                 let d = (hit.v - self.stripe_v).abs();
-                if d < 0.045 {
-                    mix(base, a, 0.8)
-                } else if d < 0.065 {
-                    mix(base, a, 0.35)
+                if d < 0.075 {
+                    mix(base, a, 0.9)
+                } else if d < 0.10 {
+                    mix(base, a, 0.4)
                 } else {
                     base
                 }
@@ -2510,8 +2619,8 @@ impl Ship {
             // twin racing stripes
             _ => {
                 let d = (hit.u.abs() - 0.62).abs();
-                if d < 0.07 {
-                    mix(base, a, 0.7)
+                if d < 0.13 {
+                    mix(base, a, 0.82)
                 } else {
                     base
                 }
