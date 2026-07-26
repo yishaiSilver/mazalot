@@ -261,6 +261,13 @@ pub struct System {
     sun_tile: RefCell<SunCache>,
     // Reused draw-order scratch (avoids a per-frame Vec alloc in `draw_bodies`).
     order: RefCell<Vec<(f32, i32)>>,
+    // Last tile rendered for each planet, plus the key it was rendered for. The
+    // sun has had this since it was cached; planets never did, so a system with
+    // its rotation slider at 0 was re-deriving byte-identical tiles every frame,
+    // forever. Keyed on the quantities the tile actually depends on, each
+    // quantized to a pixel of movement at the current radius.
+    planet_tiles: RefCell<Vec<PlanetTile>>,
+    pub memo: bool,
 }
 
 /// Memoized star tile. The star's convection cells + corona are the costliest
@@ -357,6 +364,8 @@ impl System {
             neb: RefCell::new(BackdropCache::default()),
             sun_tile: RefCell::new(SunCache::default()),
             order: RefCell::new(Vec::new()),
+            planet_tiles: RefCell::new(Vec::new()),
+            memo: true,
         }
     }
 
@@ -397,6 +406,13 @@ impl System {
     /// planet's generated eccentricity, higher exaggerates the ellipses.
     pub fn set_eccentricity(&mut self, scale: f32) {
         self.ecc = scale.clamp(0.0, 2.5);
+    }
+
+    /// Reuse a planet's last tile while nothing it depends on has moved by a
+    /// whole pixel. `false` re-renders every body every frame (the old
+    /// behaviour, and the reference to measure against).
+    pub fn set_memo(&mut self, on: bool) {
+        self.memo = on;
     }
 
     /// Planet-tile level of detail. `true` (the default) thins fBm octaves on
@@ -620,6 +636,13 @@ pub fn render_system_cached(sys: &mut System, w: u32, h: u32, cam: &Camera, bgx:
     draw_bodies(sys, w, h, cam, t_orbit, t_spin, t_sun, out);
 }
 
+/// One planet's memoized tile plus the key it was rendered for.
+#[derive(Default)]
+struct PlanetTile {
+    key: Option<[i64; 4]>,
+    tile: Option<Tile>,
+}
+
 /// Paint the backdrop: starfield + nebula, then the dashed orbit paths. Depends
 /// only on the camera + view params, never on animation time.
 fn draw_bg_orbits(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: f32, out: &mut [u8]) {
@@ -710,8 +733,29 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
             // also churns faster.
             let spin_a = p.phase + p.spin * t_spin * TAU;
             let rad_render = (rad_px / sys.planet_pixel).clamp(2.0, maxr);
-            let tile = planet_core::render_tile(p.ptype, p.seed, spin_a, light, rad_render, sys.lod);
-            blit(out, w, h, &tile, sx, sy, rad_px / rad_render);
+            // Quantize each axis to one pixel of movement at this radius: a
+            // tile that would land on the same pixels is the same tile.
+            let key = [
+                rad_render.round() as i64,
+                (spin_a * rad_render) as i64,
+                (light[1].atan2(light[0]) * rad_render) as i64,
+                p.ptype as i64,
+            ];
+            let mut cache = sys.planet_tiles.borrow_mut();
+            if cache.len() != sys.planets.len() {
+                cache.resize_with(sys.planets.len(), PlanetTile::default);
+            }
+            let slot = &mut cache[which as usize];
+            if !sys.memo || slot.key != Some(key) || slot.tile.is_none() {
+                // Release the previous tile BEFORE allocating the next. On a
+                // miss — which is every frame for the native generators, whose
+                // clock always advances — holding both alive costs the
+                // allocator its hot block and measured ~9% on `solar`'s bin.
+                drop(slot.tile.take());
+                slot.tile = Some(planet_core::render_tile(p.ptype, p.seed, spin_a, light, rad_render, sys.lod));
+                slot.key = Some(key);
+            }
+            blit(out, w, h, slot.tile.as_ref().unwrap(), sx, sy, rad_px / rad_render);
         }
     }
 }

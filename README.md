@@ -451,6 +451,33 @@ the committed modules rather than a bonus — which is why it lives in
 `.cargo/config.toml` and not in a build script. Native is unaffected either way
 (it takes the array path, and measured within noise of before).
 
+### Shader experiments
+
+Five ideas were built and measured against each other; three earned their place.
+Unlike everything above, these **change pixels** — the cost is stated for each.
+
+| experiment | best case | visual cost | kept |
+|---|---|---|:--:|
+| **Cheap warp inner field** — `fbm_warp`'s three displacement fields only bend the outer field's domain, so they run at 2 octaves instead of matching it | 16–38% on cloudy/banded worlds | 12–30% of the disc moves, mean 1.4–4.2/255 | ✅ |
+| **Night-side thinning** — past the terminator `shade` bottoms out at the 0.10 ambient floor, leaving ~3 of 22 levels, so the fine octaves and the whole cloud deck are skipped there | 8–35% | 3–7% of the disc, mean 0.03–0.9 | ✅ |
+| **Tile bbox** — a ringed giant's tile is 4.4r across for a 2r disc; bound each row to its content | 9–14% on ringed worlds | none — bit-exact | ✅ |
+| **Planet tile memo** — reuse a body's last tile while nothing it depends on has moved a whole pixel (the sun has done this for ages) | 16–35% at fit view, **65% paused when zoomed** | motion quantizes to ≤1px | ✅ |
+| **Cubic interpolant** — replace the quintic `smoother` | 0% — the hash dominates and the lerps are already vectorized | — | ❌ |
+| **Worley early-out** — skip cells whose bounding box is farther than the best hit so far | **3× slower**, despite skipping 19.4 of 27 cells exactly | none | ❌ |
+
+That last one is the useful negative: branchless four-lane SIMD beats a smarter
+scalar loop, and the per-call bookkeeping to decide what to skip costs more than
+the work it saves. Don't add branches to reclaim work from a vectorized kernel.
+
+For scale on the visual cost: one 1px step of axial spin already changes ~40% of
+a disc with a mean delta near 10. Across the whole shipped `planets_table.png`,
+all of this together moves **4.6% of pixels by a mean of 0.63/255**; the sun
+table is untouched (the `star` crate doesn't share this shader).
+
+Net: **13–20% off a wasm planet frame**, ~8% off a solar scene frame, and up to
+65% when the scene is parked. The native generators barely move (~1%), which is
+the encoder-bound result above showing up exactly where it should.
+
 ### Parallel generation
 
 The browser work above does not help the native generators, because they were
