@@ -636,11 +636,45 @@ works on its own:
 | `F_BAKED_SURFACE` | 20 — Terrestrial, Cratered, Emissive |
 | `F_BAKED_BANDS` | 4 — the gas giants |
 
-Because they change the picture rather than the pixel budget, none of the three
-is in `F_ALL`. The native generators keep the live shader and `out/` is byte-identical; the
+#### Putting the billowing back
+
+Freezing the deck cost two things: the storm swirl and the billowing morph. The
+morph is the one that mattered — it is what made weather form and dissipate
+rather than slide — and it is also the one nothing so far could express, because
+it translates the noise domain in y *and* z. That is the field evolving, not
+moving, and no lookup offset represents it.
+
+But a *stack* of maps does. `F_MORPH_LUT` bakes the deck at six points across
+the morph cycle and interpolates between the two that bracket the current value.
+The table is indexed by the morph value rather than by time, since it oscillates
+rather than advancing, so the lookup walks back and forth across six planes
+instead of running off the end of an ever-growing one.
+
+Adjacent phases are well correlated at the coarse octaves and independent at the
+fine ones, which is exactly what makes the interpolation read as a dissolve —
+cloud forming and dissipating — instead of a slide. Measured against the live
+deck, over a full spin:
+
+| | mean delta from live |
+|---|---:|
+| frozen | 7.56/255 |
+| **+ morph LUT** | **2.98/255** |
+
+**It recovers 61% of what freezing gave up, for 4% of the frame** (`terran`
+2.24× → 2.16×). The cost is memory and bake time, both 6×: at full width the
+deck is 6 MB for one planet, and the first frame at a new zoom pays six bakes
+instead of one.
+
+The storm swirl stays frozen. It runs on its own cycle, independent of the
+morph, so restoring it too would need the product of the two axes rather than
+the sum — 36 planes, not 12.
+
+Because they change the picture rather than the pixel budget, none of these
+switches is in `F_ALL`. The native generators keep the live shader and `out/` is byte-identical; the
 three web demos turn all three on at construction, behind one `Frozen weather`
 checkbox each. The planet lab exposes them separately (`Frozen cloud deck`,
-`Baked surface`, `Baked bands`) so each can be A/B'd on its own.
+`Baked surface`, `Baked bands`, `billow (morph LUT)`) so each can be A/B'd on
+its own — the last is nested under the deck, which it needs.
 
 ### Shader experiments
 

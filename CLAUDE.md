@@ -170,6 +170,12 @@ Run wasm builds **from the repo root** so `.cargo/config.toml` applies. It adds
   have none. `Emissive` splits instead — its rock field bakes, its flow stays
   live. `Banded` needed its drift re-expressed as a longitude rotation before it
   would bake at all, which is a look change and so has its own bit.
+- **An axis that cannot be a lookup offset can still be a lookup *table*.** The
+  cloud morph translates the noise domain in y and z — the field evolving — so no
+  single map holds it and no offset fakes it. Six maps across the cycle, indexed
+  by the morph value (it oscillates; do not index by time), recover 61% of what
+  freezing cost for 4% of the frame. Memory and bake go up by the phase count,
+  so the cache budget is sized for one zoomed planet's stack.
 - **A per-family optimization needs its gate checked one bit at a time.** The
   baked map was built only when `F_BAKED_CLOUDS` was set, so `F_BAKED_SURFACE`
   and `F_BAKED_BANDS` did nothing on their own — and the verification missed it

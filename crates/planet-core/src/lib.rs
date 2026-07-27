@@ -79,6 +79,30 @@ pub const F_BAKED_CLOUDS: u32 = 64;
 ///
 /// Like [`F_BAKED_CLOUDS`], deliberately outside [`F_ALL`].
 pub const F_BAKED_SURFACE: u32 = 128;
+/// Restore the cloud deck's billowing on top of [`F_BAKED_CLOUDS`], by baking
+/// the deck at several points along its morph cycle and interpolating.
+///
+/// The morph translates the noise domain in y **and** z — the field evolving,
+/// not moving — so no lookup offset represents it and no single map holds it.
+/// Discretizing that axis does: `MORPH_PHASES` maps across the cycle, indexed by
+/// the morph *value* rather than by time, since it oscillates rather than
+/// advancing. Costs one extra tap per plane and `MORPH_PHASES`x the memory and
+/// bake, and buys back the half of the deck's life that freezing took.
+///
+/// The storm swirl stays frozen: it runs on its own cycle, so restoring it too
+/// would need the product of the two axes rather than the sum.
+pub const F_MORPH_LUT: u32 = 512;
+/// How many points along the morph cycle [`F_MORPH_LUT`] bakes.
+///
+/// The morph spans ±0.6 of a lattice cell at the base octave, which is ±4.8 at
+/// the fourth — so adjacent phases are well correlated coarsely and independent
+/// finely, and the interpolation between them reads as cloud forming and
+/// dissipating rather than sliding. Six is where that still looks continuous;
+/// fewer and the dissolve steps.
+const MORPH_PHASES: u8 = 6;
+/// Half-width of the morph cycle: `angle.sin() * MORPH_SPAN`.
+const MORPH_SPAN: f32 = 0.6;
+
 /// OPTIMIZATION: bake `Base::Banded`, re-expressing its zonal drift as a
 /// rotation in longitude instead of a shear of the noise domain.
 ///
@@ -527,8 +551,11 @@ const SHEAR_STATIC: f32 = 0.0;
 struct CloudMap {
     w: u32,
     h: u32,
+    /// The deck's two fields, `phases` maps deep and phase-major: plane `k`
+    /// starts at `k * w * h`. `phases == 1` is the frozen deck.
     warp: Vec<u8>,
     dens: Vec<u8>,
+    phases: u8,
     /// The baked base surface, for the families whose base is one or two scalar
     /// fields rather than a colour. What they hold depends on `ct.base`, and a
     /// planet has exactly one base, so there is no ambiguity:
@@ -557,8 +584,9 @@ struct CloudMap {
 struct CloudKey {
     seed: u32,
     w: u32,
-    /// `(octaves, warp inner, storm_cells)` — `None` when the planet has no deck.
-    deck: Option<(u32, u32, u32)>,
+    /// `(octaves, warp inner, storm_cells, morph phases)` — `None` when the
+    /// planet has no deck.
+    deck: Option<(u32, u32, u32, u8)>,
     /// The baked base surface: `(lod thinning, shape hash, plane count)`.
     /// `None` when this planet's base is not baked — either its family cannot
     /// be, or the caller did not ask for it.
@@ -570,7 +598,7 @@ impl CloudKey {
     /// holds, three for the interleaved albedo.
     fn bytes(&self) -> usize {
         let texels = (self.w * (self.w / 2)) as usize;
-        texels * (2 * self.deck.is_some() as usize + self.base.map_or(0, |b| b.2 as usize))
+        texels * (2 * self.deck.map_or(0, |d| d.3 as usize) + self.base.map_or(0, |b| b.2 as usize))
     }
 }
 
@@ -583,7 +611,7 @@ const CLOUD_CACHE_SLOTS: usize = 8;
 /// ...but only up to a budget, because the slots are not the same size. Zoomed
 /// in, one map is 1 MB; eight of those is a heap growth in wasm for maps that
 /// are mostly off-screen. Whichever limit binds first wins.
-const CLOUD_CACHE_BYTES: usize = 12 << 20;
+const CLOUD_CACHE_BYTES: usize = 24 << 20;
 
 thread_local! {
     /// Per-thread, most-recently-used first. Native rendering fans frames across
@@ -610,7 +638,8 @@ fn cloud_map_w(rad: f32) -> u32 {
 fn cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, feat: u32, rad: f32) -> Option<Rc<CloudMap>> {
     let deck = (feat & F_BAKED_CLOUDS != 0 && ct.clouds > 0.0).then(|| {
         let o = lod.cld(4);
-        (o, warp_inner(feat, o), ct.storm_cells.to_bits())
+        let phases = if feat & F_MORPH_LUT != 0 { MORPH_PHASES } else { 1 };
+        (o, warp_inner(feat, o), ct.storm_cells.to_bits(), phases)
     });
     // Which switch owns a family's base, and how many planes it needs.
     let planes = match ct.base {
@@ -653,7 +682,13 @@ fn bake_cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, feat: u32, key
     let h = w / 2;
     let n = (w * h) as usize;
     let sized = |on: bool| if on { vec![0u8; n] } else { Vec::new() };
-    let (mut warp, mut dens) = (sized(key.deck.is_some()), sized(key.deck.is_some()));
+    let phases = key.deck.map_or(1, |d| d.3);
+    let deck_n = n * phases as usize;
+    let (mut warp, mut dens) = if key.deck.is_some() {
+        (vec![0u8; deck_n], vec![0u8; deck_n])
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let planes = key.base.map_or(0, |b| b.2);
     let mut base_a = sized(planes == 1 || planes == 2);
     let mut base_b = sized(planes == 2);
@@ -676,7 +711,7 @@ fn bake_cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, feat: u32, key
             let (sx, sz) = (r * cl, r * sl);
             let t = (j * w + i) as usize;
 
-            if let Some((oct, inner, _)) = key.deck {
+            if let Some((oct, inner, _, _)) = key.deck {
                 let (mut cx3, mut cz3) = (sx + ofs[0], sz + ofs[2]);
                 if ct.storm_cells > 0.0 {
                     for (vx, vz) in vort {
@@ -687,9 +722,18 @@ fn bake_cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, feat: u32, key
                         cz3 = vz + dx * ss + dz * sc;
                     }
                 }
-                let py = y * 2.8 + ofs[1];
-                warp[t] = q8(fbm_warp_inner(cx3 * 2.8, py, cz3 * 2.8, oct, inner, 0.9));
-                dens[t] = q8(fbm(cx3 * 2.8, py, cz3 * 2.8, oct));
+                for k in 0..phases as usize {
+                    // Phases are laid out across the morph's RANGE, not across
+                    // time: it oscillates, so the table is indexed by the value
+                    // and walked back and forth. One phase means morph 0, the
+                    // point the live cycle passes through twice a turn.
+                    let morph = morph_of_phase(k, phases);
+                    let py = y * 2.8 + ofs[1] + morph;
+                    let (zx, zz) = (cx3 * 2.8, cz3 * 2.8 + morph);
+                    let o = k * n + t;
+                    warp[o] = q8(fbm_warp_inner(zx, py, zz, oct, inner, 0.9));
+                    dens[o] = q8(fbm(zx, py, zz, oct));
+                }
             }
 
             if key.base.is_some() {
@@ -730,7 +774,18 @@ fn bake_cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, feat: u32, key
             }
         }
     }
-    CloudMap { w, h, warp, dens, base_a, base_b, surf }
+    CloudMap { w, h, warp, dens, phases, base_a, base_b, surf }
+}
+
+/// The morph value phase `k` of `phases` is baked at, spanning the full cycle.
+/// A single phase sits at 0 — the value the live cycle crosses twice a turn.
+#[inline(always)]
+fn morph_of_phase(k: usize, phases: u8) -> f32 {
+    if phases <= 1 {
+        0.0
+    } else {
+        MORPH_SPAN * (2.0 * k as f32 / (phases - 1) as f32 - 1.0)
+    }
 }
 
 #[inline(always)]
@@ -789,6 +844,35 @@ impl CloudMap {
         let ya = y0 as u32;
         let yb = (ya + 1).min(self.h - 1);
         ((ya * self.w) as usize, (yb * self.w) as usize, xa as usize, xb as usize, fx - x0, fy - y0)
+    }
+
+    /// Where in the phase table a morph value falls: the lower plane and the
+    /// blend to the next. Clamped, so the ends of the cycle hold rather than
+    /// wrap into each other.
+    #[inline(always)]
+    fn phase_at(&self, morph: f32) -> (usize, f32) {
+        if self.phases <= 1 {
+            return (0, 0.0);
+        }
+        let last = (self.phases - 1) as f32;
+        let t = ((morph / MORPH_SPAN + 1.0) * 0.5 * last).clamp(0.0, last);
+        let k = (t.floor() as usize).min(self.phases as usize - 2);
+        (k, t - k as f32)
+    }
+
+    /// Bilinear fetch from plane `k`, blended into plane `k + 1`.
+    ///
+    /// The two planes are independent noise at the fine octaves, so this is a
+    /// dissolve rather than a slide — which is what the morph was for: weather
+    /// that forms and dissipates instead of sliding rigidly.
+    #[inline(always)]
+    fn sample_phase(&self, tab: &[u8], k: usize, frac: f32, u: f32, v: f32) -> f32 {
+        let n = (self.w * self.h) as usize;
+        let a = self.sample(&tab[k * n..], u, v);
+        if frac <= 0.0 {
+            return a;
+        }
+        lerp(a, self.sample(&tab[(k + 1) * n..], u, v), frac)
     }
 
     /// Bilinear fetch of the interleaved albedo plane.
@@ -1392,7 +1476,8 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                         let px = nx * cc + nz * cs;
                         let pz = -nx * cs + nz * cc;
                         let v = (ny + 1.0) * 0.5;
-                        let cloud = m.sample(&m.warp, atan2_turns(pz, px), v);
+                        let (k, kf) = m.phase_at(angle.sin() * MORPH_SPAN);
+                        let cloud = m.sample_phase(&m.warp, k, kf, atan2_turns(pz, px), v);
                         let sh = if style.feat & F_CLOUD_SHADOW == 0 {
                             1.0
                         } else {
@@ -1403,7 +1488,7 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                             // tangential half of the same offset, which is the
                             // half that moves the shadow across the deck.
                             let (qx, qz) = (px + l[0] * 0.45, pz + l[2] * 0.45);
-                            let shadow = smoothstep(0.55, 0.72, m.sample(&m.dens, atan2_turns(qz, qx), v));
+                            let shadow = smoothstep(0.55, 0.72, m.sample_phase(&m.dens, k, kf, atan2_turns(qz, qx), v));
                             1.0 - 0.22 * shadow * ct.clouds
                         };
                         (cloud, sh)
@@ -1593,7 +1678,7 @@ mod cloud_tests {
     /// as a stationary band down the middle of every planet.
     #[test]
     fn cloud_map_sampling_is_exact_and_wraps() {
-        let m = CloudMap { w: 4, h: 2, warp: vec![0, 64, 128, 255, 10, 20, 30, 40], dens: vec![], base_a: vec![], base_b: vec![], surf: vec![] };
+        let m = CloudMap { w: 4, h: 2, warp: vec![0, 64, 128, 255, 10, 20, 30, 40], dens: vec![], phases: 1, base_a: vec![], base_b: vec![], surf: vec![] };
         for i in 0..4 {
             let u = (i as f32 + 0.5) / 4.0;
             let got = m.sample(&m.warp, u, 0.25);

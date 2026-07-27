@@ -770,7 +770,10 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
             // and an A/B measured the cache instead of the change.
             let feat = planet_core::F_ALL
                 | if sys.frozen_clouds {
-                    planet_core::F_BAKED_CLOUDS | planet_core::F_BAKED_SURFACE | planet_core::F_BAKED_BANDS
+                    planet_core::F_BAKED_CLOUDS
+                        | planet_core::F_BAKED_SURFACE
+                        | planet_core::F_BAKED_BANDS
+                        | planet_core::F_MORPH_LUT
                 } else {
                     0
                 };
