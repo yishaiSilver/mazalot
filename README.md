@@ -305,18 +305,23 @@ Measured natively (WASM in-browser runs ~2–3× slower):
 
 | @ 64px | per frame | vs a sprite |
 |---|---|---|
-| sprite blit (`memcpy`) | ~0.0003 ms | 1× |
-| planet, no weather (iron) | 0.67 ms | ~3,200× |
-| planet, full weather (terran) | 1.98 ms | ~9,400× |
-| lava (emissive) | 0.79 ms | ~3,800× |
+| sprite blit (`memcpy`) | ~0.0002 ms | 1× |
+| planet, no weather (iron) | 0.45 ms | ~2,500× |
+| planet, full weather (terran) | 1.49 ms | ~8,400× |
+| lava (emissive) | 0.64 ms | ~3,600× |
 
 **The weather is the cost** — domain warp on clouds/bands roughly triples the
 base planet. **The pixel-art pipeline is nearly free:** dithering, moons, and
 palette swaps together add **< 0.05 ms** (a few percent).
 
+Cost is **quadratic in the rendered size**, but not quite: the octave count is
+tied to what the pixel grid can resolve (see `planet_core::Lod`), so a small
+planet drops the octaves it could never have shown. A 64 px terran runs 3
+octaves of surface noise where a 256 px one runs 6.
+
 Implications:
-- **One planet live** (the web demo): comfortable — ~2 ms native, ~5–7 ms in WASM at 64 px, well under a 60 fps budget. Tightens above ~200 px.
-- **Many planets / a galaxy map**: don't render live. **Bake the ~30 spin frames once, then blit** (that ~0.0003 ms) — procedural variety at sprite-cheap playback.
+- **One planet live** (the web demo): comfortable — ~1.5 ms native, ~4–5 ms in WASM at 64 px, well under a 60 fps budget. Tightens above ~200 px.
+- **Many planets / a galaxy map**: don't render live. **Bake the ~30 spin frames once, then blit** (that ~0.0002 ms) — procedural variety at sprite-cheap playback.
 - **Cheaper weather:** dropping domain warp (back to plain fBm) roughly halves the weather cost.
 
 ### Profiling the solar system
@@ -382,26 +387,53 @@ extreme zoom the tile also drops its secondary-fBm octaves (below the dither
 floor at that size) for a cheaper re-bake. The per-frame draw-order `Vec` and the
 star tile's 577 KB alloc are both gone (reused/cached).
 
-Everything invalidates automatically the moment its key changes. **Remaining
-frontier:** a *planet* zoomed to fill the screen (~34 ms at a high detail cap).
-Planets aren't tile-cached because their axial rotation is the visible motion, so
-quantizing it (the sun trick) would read as choppy.
+Everything invalidates automatically the moment its key changes.
 
-The cost scales with the **detail cap** — it bounds the tile resolution, and the
-per-pixel shader runs once per tile pixel. Two ways to keep it cheap:
+**Zoomed-in planets.** Planets can't be tile-cached the way the star is — their
+axial rotation *is* the visible motion, and at any usable quantum the tile
+changes every frame anyway. So the zoomed-in case is attacked by doing less work
+per frame rather than by reusing frames, in three independent ways:
 
-- **Pin the detail cap low** (~56) — the tile stays small, so the fills-screen
-  case never gets expensive in the first place. This is the intended default and
-  needs no code: the cap is already a live slider (`planet_detail`). At ~56 a
-  full-screen planet is **~6 ms (170 fps)** instead of ~34 ms — the `bench` bin
-  measures both.
-- **Octave LOD** (*option, not implemented for planets*) — if you want a high
-  detail cap *and* a cheap full-screen planet, drop the terrestrial/emissive fBm
-  from 6→3–4 octaves on large tiles, exactly as `render_sun_tile` already does
-  for the star (`lod = size > 200`). The catch: unlike the sun's diffuse boil, a
-  planet's surface *is* the detail, so it trades a little crispness and can
-  "pop" as the LOD threshold is crossed mid-zoom. Left as a deliberate choice
-  since pinning the cap low sidesteps the need.
+- **Shade only what the compositor will read.** `scene_core::visible_tile_rect`
+  asks where a tile actually lands on screen and returns the sub-rect `blit` will
+  sample; `planet_core::render_tile_clipped` shades that and nothing else. A disc
+  twice the viewport height has ~70% of its tile hanging off the edge, and that
+  work simply stops happening. An empty rect is also the exact visibility test,
+  which replaced a blanket "2.2 body radii" cull margin that had to over-estimate
+  for ringed giants — and so kept rendering full-size tiles for plain worlds that
+  were already off-screen. Rows are further narrowed to the span the disc (and a
+  ringed world's ring ellipse) actually covers.
+- **Octaves finer than the pixel grid are dropped** (`planet_core::Lod`). A tile
+  puts one sphere radius across `rad` px, so a field sampled at `p · freq` has
+  its `k`-th octave land at `rad / (freq · 2^(k-1))` px. Under two pixels it is
+  past Nyquist — it cannot be resolved, and since the planet turns, what it
+  contributes is crawling speckle. This is a mip level, not a quality knob: a
+  planet 20 px across pays for three octaves, the same planet filling the screen
+  pays for six, and coastlines come out *steadier* than before. Separately, a
+  domain warp's displacement field only needs two octaves whatever the size
+  (`noise_core::fbm_warp_oct`), which alone turns a 4-octave `fbm_warp`'s 16
+  octave evaluations into 10.
+- **The compositor walks runs, not pixels.** At the upscales a zoomed-in scene
+  reaches, tens of consecutive destination px share one tile px, so `blit` fetches
+  the source, tests alpha and computes the blend factors once per run — and skips
+  a transparent run without touching the destination.
+
+Measured in the browser (V8, a 1680×944 render buffer — what the demo picks for a
+2560×1440 viewport — seed 7, detail cap 64):
+
+| | before | after |
+|---|---|---|
+| planet filling the viewport | 28.2 ms (35 fps) | **17.3 ms (58 fps)** |
+| planet at 2× the viewport | 31.6 ms (32 fps) | **9.4 ms (106 fps)** |
+| mid-zoom, several worlds past the cap | 39.2 ms (25 fps) | **17.1 ms (58 fps)** |
+| compositing one full-screen body | 10.6 ms | **2.2 ms** |
+| surface shader, median archetype | 633 ns/px | **361 ns/px** |
+
+**The detail cap is still the biggest single lever**, and it is worth knowing that
+it sets a *radius*: cost goes as its square, so halving the slider quarters the
+shader work. At the same zoom, cap 32 is 5.8 ms, cap 64 is 17.8 ms and cap 160 is
+95 ms. The shipped default of 160 buys full six-octave detail on a screen-filling
+world and costs accordingly; drop it if you want the frame back.
 
 ## Adding a planet type
 

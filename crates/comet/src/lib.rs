@@ -51,7 +51,7 @@ use background_core::{paint_backdrop, paint_stars, Backdrop, StarLayer, StarTint
 
 // Shared scene-compositor primitives (were previously copy-pasted here
 // byte-for-byte). Camera is part of this crate's public API, so re-export it.
-use scene_core::{blit, to_screen, Rng, Tile, ORBIT_FLATTEN};
+use scene_core::{blit, to_screen, visible_tile_rect, Rng, Tile, ORBIT_FLATTEN};
 pub use scene_core::Camera;
 
 // The compact star renderer is shared with `solar` via `sun-core`; comet keeps
@@ -93,8 +93,8 @@ const CORONA_REACH: f32 = 0.85;
 ///
 /// Thin wrapper over the shared `sun_core::render_star_tile`: comet always
 /// renders full detail (no LOD) and uses its own `CORONA_REACH`.
-fn render_star_tile(sk: &StarKind, seed: u32, t: f32, rad_px: f32) -> Tile {
-    sun_core::render_star_tile(sk, seed, t, rad_px, CORONA_REACH, false)
+fn render_star_tile(tile: &mut Tile, sk: &StarKind, seed: u32, t: f32, rad_px: f32, clip: [u32; 4]) {
+    sun_core::render_star_tile_into(tile, sk, seed, t, rad_px, CORONA_REACH, false, clip);
 }
 
 // ===========================================================================
@@ -284,8 +284,16 @@ impl CometScene {
         let rad_px = self.star_radius * cam.zoom;
         if rad_px >= 0.5 {
             let rad_render = rad_px.clamp(2.0, 120.0);
-            let tile = render_star_tile(sk, self.seed, t, rad_render);
-            blit(out, w, h, &tile, starx, stary, rad_px / rad_render);
+            let scale = rad_px / rad_render;
+            // Shade only what the compositor will read back: zoomed onto the
+            // star, most of its tile hangs off the viewport.
+            let tsize = sun_core::star_tile_size(rad_render, CORONA_REACH);
+            let clip = visible_tile_rect(tsize, w, h, starx, stary, scale);
+            if clip[2] != clip[0] {
+                let mut tile = Tile::default();
+                render_star_tile(&mut tile, sk, self.seed, t, rad_render, clip);
+                blit(out, w, h, &tile, starx, stary, scale);
+            }
         }
 
         for c in &self.comets {

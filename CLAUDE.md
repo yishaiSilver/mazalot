@@ -57,6 +57,25 @@ of it. If you find yourself writing a "simpler" planet shader for a new crate,
 add a framing to `planet-core` instead — that duplication has been removed once
 already.
 
+**Bodies go through the compositor's clip, not a hand-rolled cull.** A scene
+draws a body by asking `scene_core::visible_tile_rect` where its tile lands, and
+passing that rect back into `render_tile_clipped` / `render_tile_into` /
+`render_star_tile_into`. Two things follow, and both matter:
+
+- An **empty rect is the visibility test** — exact, and free. Do not add a
+  "body radius × some margin" off-screen check next to it. There was one; it had
+  to over-estimate for ringed giants and corona halos, so it kept rendering
+  full-price tiles for bodies that were entirely off-screen.
+- Pixels **outside the rect are not shaded**, so a tile is only valid for the
+  placement its clip came from. Anything that caches a tile must put the clip in
+  the cache key (`SunCache` does) — and then snap the rect outward to a grid
+  (`snap_out`), or a camera drifting a pixel a frame invalidates the cache every
+  frame and the caching buys nothing.
+
+`scene-core`'s tests pin the rect as a superset of what `blit` reads; a rect
+that under-reports by a pixel leaves an unshaded seam only visible at the zoom
+levels nobody screenshots.
+
 **One backdrop, likewise.** Every scene paints through `background-core`:
 `paint_backdrop` (ground + optional nebula) then `paint_stars`. A new scene crate
 supplies a `Backdrop` and a `Starfield` const and a closure that mixes its seed
@@ -115,6 +134,13 @@ silently, because the JS calls them by name.
 
 ## Gotchas
 
+- **Octave counts are derived, not fixed.** `planet_core::Lod` picks each fBm
+  field's octave count from the disc's pixel radius, dropping octaves whose
+  lattice cell falls under two pixels (past Nyquist — they can't be resolved, and
+  on a turning planet they read as crawling speckle). So the *same planet at a
+  different on-screen size is legitimately different pixels*, and a change that
+  moves a body's radius will move its imagery. That is working as intended; what
+  must stay stable is a body at a **fixed** radius.
 - **Float codegen is load-bearing.** Moving code between crates changes LTO and
   FMA-contraction decisions, which shifts pixels by a few /255 across dither
   quantization thresholds. This is not a logic bug, but it *will* break

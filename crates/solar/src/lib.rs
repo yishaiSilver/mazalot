@@ -46,7 +46,7 @@ use background_core::{
 // The scene-compositor kit: camera transform, seeded RNG, and the tile blitter
 // every body is drawn through. `Camera` is re-exported because it's part of this
 // crate's public API (the wasm glue + bins reference `solar::Camera`).
-use scene_core::{blit, to_screen, Rng, Tile, ORBIT_FLATTEN};
+use scene_core::{blit, to_screen, visible_tile_rect, Rng, Tile, ORBIT_FLATTEN};
 pub use scene_core::Camera;
 
 // The compact star-tile renderer, shared with `comet`. Aliased to `SunKind`
@@ -256,6 +256,11 @@ pub struct System {
     // so like the nebula its clock is quantized: on a still-ish sun the tile is
     // reused and only re-baked every few frames. See `draw_bodies`.
     sun_tile: RefCell<SunCache>,
+    // Reused planet-tile scratch. Planets can't be cached the way the star is —
+    // each is a different world and they all spin — but they can at least share
+    // one buffer instead of heap-allocating (and zero-filling) a fresh tile per
+    // body per frame. `render_tile_into` grows it as the zoom demands.
+    body_tile: RefCell<Tile>,
     // Reused draw-order scratch (avoids a per-frame Vec alloc in `draw_bodies`).
     order: RefCell<Vec<(f32, i32)>>,
 }
@@ -263,11 +268,15 @@ pub struct System {
 /// Memoized star tile. The star's convection cells + corona are the costliest
 /// per-pixel shader, but the boil is slow, so we key the tile on the render
 /// radius and a QUANTIZED boil clock and reuse it between re-bakes.
+///
+/// The clip rect is part of the key too: a clipped tile is only shaded where it
+/// was going to be seen, so it stops being valid the moment the star moves to a
+/// place that would show more of it.
 #[derive(Default)]
 struct SunCache {
-    /// `[quantized rad_render, quantized t_sun]` the `tile` is valid for.
-    key: Option<[i32; 2]>,
-    tile: Option<Tile>,
+    /// `[quantized rad_render, quantized t_sun, clip x0, y0, x1, y1]`.
+    key: Option<[i32; 6]>,
+    tile: Tile,
 }
 
 impl System {
@@ -353,6 +362,7 @@ impl System {
             bg_cache: Vec::new(), bg_key: None,
             neb: RefCell::new(BackdropCache::default()),
             sun_tile: RefCell::new(SunCache::default()),
+            body_tile: RefCell::new(Tile::default()),
             order: RefCell::new(Vec::new()),
         }
     }
@@ -430,11 +440,34 @@ fn pick_kind(rng: &mut Rng, want_band: u8) -> usize {
 // `planet-core` (called straight from `draw_bodies`).
 // ===========================================================================
 
-/// Render the star to a tile of diameter ~`2*rad_px` (+corona margin). Thin
-/// wrapper over the shared `sun-core` renderer, pinning solar's corona reach and
-/// enabling its large-tile LOD path. `true` = enable the LOD detail-thinning.
-fn render_sun_tile(sk: &SunKind, seed: u32, t: f32, rad_px: f32) -> Tile {
-    sun_core::render_star_tile(sk, seed, t, rad_px, CORONA_REACH, true)
+/// Grid the star's clip rect is snapped out to, in tile px.
+///
+/// The star tile is CACHED across frames (see [`SunCache`]), so its clip has to
+/// be part of the cache key — a tile shaded for one visible region is wrong for
+/// a larger one. But a clip that slides by a pixel as the camera drifts would
+/// then invalidate the cache every single frame, throwing away the boil-clock
+/// quantization that is the whole point of caching it. Rounding the rect OUTWARD
+/// to a grid keeps it a superset of what the compositor reads while holding it
+/// still across several frames of drift. 32 px is a few frames of a fast pan and
+/// costs at most a 31-px border of extra shading on a tile hundreds wide.
+const SUN_CLIP_GRID: u32 = 32;
+
+/// Round a visible-tile rect outward to [`SUN_CLIP_GRID`], clamped to the tile.
+fn snap_out(r: [u32; 4], size: u32) -> [u32; 4] {
+    let q = SUN_CLIP_GRID;
+    [
+        r[0] / q * q,
+        r[1] / q * q,
+        r[2].div_ceil(q).saturating_mul(q).min(size),
+        r[3].div_ceil(q).saturating_mul(q).min(size),
+    ]
+}
+
+/// Bake the star into `tile`, shading only `clip`. Thin wrapper over the shared
+/// `sun-core` renderer, pinning solar's corona reach and enabling its large-tile
+/// LOD path (`true` = thin the secondary octaves past 200 px).
+fn render_sun_tile(tile: &mut Tile, sk: &SunKind, seed: u32, t: f32, rad_px: f32, clip: [u32; 4]) {
+    sun_core::render_star_tile_into(tile, sk, seed, t, rad_px, CORONA_REACH, true, clip);
 }
 
 // ===========================================================================
@@ -644,15 +677,6 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
     let buf_cap = w.max(h) as f32 * 0.6;
     let maxr = buf_cap.min(sys.planet_detail);
     let maxr_sun = buf_cap.min(sys.sun_detail);
-    let (wf, hf) = (w as f32, h as f32);
-    // True if a body of on-screen radius `r` centred at (bx, by), padded by
-    // `pad`× for its corona/rings, lies fully outside the viewport — then we skip
-    // rendering its tile entirely (crucial when zoomed in, where most bodies fly
-    // off-screen but would otherwise still render full-size tiles).
-    let offscreen = |bx: f32, by: f32, r: f32, pad: f32| {
-        let e = r * pad;
-        bx + e < 0.0 || bx - e > wf || by + e < 0.0 || by - e > hf
-    };
 
     for idx in 0..order.len() {
         let which = order[idx].1;
@@ -661,28 +685,46 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
             // `sun_pixel`, then `blit` upsizes it by the same factor, so it
             // stays the same on-screen size but turns blockier.
             let rad_px = sys.sun_radius * sys.sun_size * cam.zoom;
-            if rad_px < 0.5 || offscreen(suncx, suncy, rad_px, 1.0 + CORONA_REACH) {
+            if rad_px < 0.5 {
                 continue;
             }
             let rad_render = (rad_px / sys.sun_pixel).clamp(2.0, maxr_sun);
-            // A1: reuse the cached tile unless the render radius or the quantized
-            // boil clock changed. Re-bake at the QUANTIZED clock so the cached
-            // tile matches its key exactly (same trick as the nebula field).
-            let key = [rad_render.round() as i32, (t_sun / SUN_TQUANT).round() as i32];
+            let scale = rad_px / rad_render;
+            // Ask the compositor which part of the tile it will read. An empty
+            // answer IS the visibility test — no hand-tuned corona margin — and
+            // a partial one is the shading we get to skip when the star spills
+            // off the viewport, which zoomed in is most of it.
+            let tsize = sun_core::star_tile_size(rad_render, CORONA_REACH);
+            let clip = visible_tile_rect(tsize, w, h, suncx, suncy, scale);
+            if clip[2] == clip[0] {
+                continue;
+            }
+            let clip = snap_out(clip, tsize); // hold the cache key still while panning
+            // A1: reuse the cached tile unless the render radius, the quantized
+            // boil clock or the visible region changed. Re-bake at the QUANTIZED
+            // clock so the cached tile matches its key exactly (same trick as the
+            // nebula field).
+            let key = [
+                rad_render.round() as i32,
+                (t_sun / SUN_TQUANT).round() as i32,
+                clip[0] as i32,
+                clip[1] as i32,
+                clip[2] as i32,
+                clip[3] as i32,
+            ];
             let mut sc = sys.sun_tile.borrow_mut();
-            if sc.key != Some(key) || sc.tile.is_none() {
+            if sc.key != Some(key) {
                 let tq = key[1] as f32 * SUN_TQUANT;
-                sc.tile = Some(render_sun_tile(sun, sys.seed, tq, rad_render));
+                render_sun_tile(&mut sc.tile, sun, sys.seed, tq, rad_render, clip);
                 sc.key = Some(key);
             }
-            blit(out, w, h, sc.tile.as_ref().unwrap(), suncx, suncy, rad_px / rad_render);
+            blit(out, w, h, &sc.tile, suncx, suncy, scale);
         } else {
             let p = &sys.planets[which as usize];
             let (wx, wy, _depth) = p.at(t_orbit, sys.spacing, sys.ecc);
             let (sx, sy) = to_screen(wx, wy, cam, w, h);
             let rad_px = p.radius * sys.planet_size * cam.zoom;
-            // Rings reach ~2 radii; pad generously so a ringed giant isn't clipped.
-            if rad_px < 0.5 || offscreen(sx, sy, rad_px, 2.2) {
+            if rad_px < 0.5 {
                 continue;
             }
             // Light comes from the sun: direction from planet toward the star,
@@ -700,8 +742,19 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
             // also churns faster.
             let spin_a = p.phase + p.spin * t_spin * TAU;
             let rad_render = (rad_px / sys.planet_pixel).clamp(2.0, maxr);
-            let tile = planet_core::render_tile(p.ptype, p.seed, spin_a, light, rad_render);
-            blit(out, w, h, &tile, sx, sy, rad_px / rad_render);
+            let scale = rad_px / rad_render;
+            // Same deal as the star: the compositor decides what is worth
+            // shading. This replaces the old blanket "2.2 radii" cull margin,
+            // which had to over-estimate for ringed giants and so kept plain
+            // worlds alive (rendering full tiles) well past the viewport edge.
+            let tsize = planet_core::tile_size(p.ptype, rad_render);
+            let clip = visible_tile_rect(tsize, w, h, sx, sy, scale);
+            if clip[2] == clip[0] {
+                continue;
+            }
+            let mut tile = sys.body_tile.borrow_mut();
+            planet_core::render_tile_into(&mut tile, p.ptype, p.seed, spin_a, light, rad_render, clip);
+            blit(out, w, h, &tile, sx, sy, scale);
         }
     }
 }

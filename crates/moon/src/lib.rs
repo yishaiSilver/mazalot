@@ -38,7 +38,7 @@ use std::f32::consts::TAU;
 
 use dither_core::bayer;
 use noise_core::{clamp01, contrast, fbm, hash3, mix, smoothstep, worley, Rgb};
-use scene_core::{blit, to_screen, Rng, Tile, ORBIT_FLATTEN};
+use scene_core::{blit, to_screen, visible_tile_rect, Rng, Tile, ORBIT_FLATTEN};
 
 // The shared deep-space backdrop, common to every scene crate.
 use background_core::{paint_backdrop, paint_stars, Backdrop, StarLayer, StarTints, Starfield};
@@ -265,39 +265,52 @@ impl MoonSystem {
         // upsizes the fixed-resolution tile (bigger blocks, no new detail). The
         // buffer term keeps tiles bounded when zoomed way in.
         let buf_cap = w.max(h) as f32 * 0.6;
-        let (wf, hf) = (w as f32, h as f32);
-        let offscreen = |bx: f32, by: f32, r: f32, pad: f32| {
-            let e = r * pad;
-            bx + e < 0.0 || bx - e > wf || by + e < 0.0 || by - e > hf
-        };
+        // One tile buffer for every body in the scene: `*_tile` resizes it as
+        // the zoom demands, instead of a fresh heap allocation per body per
+        // frame. Bodies are drawn one at a time, so they can share it.
+        let mut tile = Tile::default();
 
         let (pcx, pcy) = to_screen(0.0, 0.0, cam, w, h);
         for (_, which) in order {
             if which < 0 {
                 // The parent planet, at the world origin.
                 let rad_px = self.parent_radius * cam.zoom;
-                if rad_px < 0.5 || offscreen(pcx, pcy, rad_px, 1.3) {
+                if rad_px < 0.5 {
                     continue;
                 }
                 let rad_render = rad_px.clamp(2.0, buf_cap.min(200.0));
+                let scale = rad_px / rad_render;
+                // Let the compositor decide what is worth shading: an empty rect
+                // is the exact visibility test, and a partial one is the part of
+                // a zoomed-in planet that hangs off the viewport.
+                let tsize = planet_core::tile_size(self.parent_type, rad_render);
+                let clip = visible_tile_rect(tsize, w, h, pcx, pcy, scale);
+                if clip[2] == clip[0] {
+                    continue;
+                }
                 // One angle turns the surface and advances the weather alike —
                 // that is the planet shader's contract.
                 let spin_a = self.parent_spin * t * TAU;
-                let tile = render_parent_tile(self.parent_type, self.seed, spin_a, rad_render);
-                blit(out, w, h, &tile, pcx, pcy, rad_px / rad_render);
+                render_parent_tile(&mut tile, self.parent_type, self.seed, spin_a, rad_render, clip);
+                blit(out, w, h, &tile, pcx, pcy, scale);
             } else {
                 let m = &self.moons[which as usize];
                 let (wx, wy, _) = m.at(t);
                 let (sx, sy) = to_screen(wx, wy, cam, w, h);
                 let rad_px = m.radius * cam.zoom;
-                if rad_px < 0.5 || offscreen(sx, sy, rad_px, 1.5) {
+                if rad_px < 0.5 {
                     continue;
                 }
                 let rad_render = rad_px.clamp(2.0, buf_cap.min(120.0));
+                let scale = rad_px / rad_render;
+                let clip = visible_tile_rect(moon_tile_size(rad_render), w, h, sx, sy, scale);
+                if clip[2] == clip[0] {
+                    continue;
+                }
                 let mk = &MOONKINDS[m.kind];
                 let spin_a = m.phase + m.spin * t * TAU;
-                let tile = render_moon_tile(mk, m.seed, spin_a, t, rad_render);
-                blit(out, w, h, &tile, sx, sy, rad_px / rad_render);
+                render_moon_tile(&mut tile, mk, m.seed, spin_a, t, rad_render, clip);
+                blit(out, w, h, &tile, sx, sy, scale);
             }
         }
     }
@@ -323,8 +336,15 @@ fn quant(o: Rgb, bx: f32) -> Rgb {
 /// wrapper over `planet_core::render_tile` — the same call `solar` makes for the
 /// worlds in its orbits, and the same shader the `planet` demo shows head-on;
 /// moon only pins the light to its fixed off-screen sun (`LIGHT_DIR`).
-fn render_parent_tile(type_idx: usize, seed: u32, spin_a: f32, rad_px: f32) -> Tile {
-    planet_core::render_tile(type_idx, seed, spin_a, LIGHT_DIR, rad_px)
+fn render_parent_tile(
+    tile: &mut Tile,
+    type_idx: usize,
+    seed: u32,
+    spin_a: f32,
+    rad_px: f32,
+    clip: [u32; 4],
+) {
+    planet_core::render_tile_into(tile, type_idx, seed, spin_a, LIGHT_DIR, rad_px, clip);
 }
 
 /// Moon surface albedo at a rotated surface point (no lighting yet): a grey/tinted
@@ -351,19 +371,47 @@ fn moon_surface(mk: &MoonKind, sx: f32, sy: f32, sz: f32, ofs: [f32; 3]) -> Rgb 
 /// Render a moon to a lit RGBA tile. Airless: a pure Lambert term against the
 /// fixed sun, no atmosphere, no shadows cast — depth sorting alone handles
 /// occlusion by the parent.
-fn render_moon_tile(mk: &MoonKind, seed: u32, spin_a: f32, _t: f32, rad_px: f32) -> Tile {
-    let size = ((rad_px + 1.5) * 2.0).ceil() as u32;
-    let size = size.max(6);
+fn render_moon_tile(
+    tile: &mut Tile,
+    mk: &MoonKind,
+    seed: u32,
+    spin_a: f32,
+    _t: f32,
+    rad_px: f32,
+    clip: [u32; 4],
+) {
+    let size = moon_tile_size(rad_px);
+    let len = (size * size * 4) as usize;
+    if tile.size != size || tile.px.len() != len {
+        tile.px.clear();
+        tile.px.resize(len, 0);
+        tile.size = size;
+    }
     let c = size as f32 / 2.0;
     let ofs = seed_offsets(seed);
     let (sina, cosa) = spin_a.sin_cos();
     let l = LIGHT_DIR;
-    let mut px = vec![0u8; (size * size * 4) as usize];
+    let px = &mut tile.px;
 
-    for iy in 0..size {
-        for ix in 0..size {
+    let [clip_x0, clip_y0, clip_x1, clip_y1] =
+        [clip[0].min(size), clip[1].min(size), clip[2].min(size), clip[3].min(size)];
+    for iy in clip_y0..clip_y1 {
+        let ny = (c - (iy as f32 + 0.5)) / rad_px;
+        // Off the disc a moon tile is empty, so walk only the row's disc span
+        // and clear the rest — a reused buffer must not keep the last frame.
+        let half = (1.0 - ny * ny).max(0.0).sqrt() * rad_px + 1.0;
+        let x0 = clip_x0.max((c - half).floor().max(0.0) as u32);
+        let x1 = clip_x1.min((c + half).ceil().clamp(0.0, size as f32) as u32);
+        let row = (iy * size * 4) as usize;
+        let span = |a: u32, b: u32| row + (a * 4) as usize..row + (b * 4) as usize;
+        if x1 <= x0 {
+            px[span(clip_x0, clip_x1)].fill(0);
+            continue;
+        }
+        px[span(clip_x0, x0)].fill(0);
+        px[span(x1, clip_x1)].fill(0);
+        for ix in x0..x1 {
             let nx = (ix as f32 + 0.5 - c) / rad_px;
-            let ny = (c - (iy as f32 + 0.5)) / rad_px;
             let d2 = nx * nx + ny * ny;
 
             let mut o: Rgb = [0.0, 0.0, 0.0];
@@ -399,7 +447,12 @@ fn render_moon_tile(mk: &MoonKind, seed: u32, spin_a: f32, _t: f32, rad_px: f32)
             px[idx + 3] = (clamp01(a) * 255.0) as u8;
         }
     }
-    Tile { px, size }
+}
+
+/// Edge length of the tile [`render_moon_tile`] fills at this radius — needed
+/// before rendering, to ask the compositor what part of it will be seen.
+fn moon_tile_size(rad_px: f32) -> u32 {
+    (((rad_px + 1.5) * 2.0).ceil() as u32).max(6)
 }
 
 // ===========================================================================

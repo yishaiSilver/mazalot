@@ -70,20 +70,77 @@ pub fn render_star_tile(
     corona_reach: f32,
     lod_enabled: bool,
 ) -> Tile {
+    let size = star_tile_size(rad_px, corona_reach);
+    let mut tile = Tile { px: vec![0u8; (size * size * 4) as usize], size };
+    render_star_tile_into(&mut tile, sk, seed, t, rad_px, corona_reach, lod_enabled, [0, 0, size, size]);
+    tile
+}
+
+/// The edge length [`render_star_tile`] produces at this radius and corona
+/// reach. Needed up front to ask the compositor which part of the tile will be
+/// on screen (`scene_core::visible_tile_rect`).
+pub fn star_tile_size(rad_px: f32, corona_reach: f32) -> u32 {
     let margin = rad_px * corona_reach + 3.0;
-    let size = (((rad_px + margin) * 2.0).ceil() as u32).max(6);
+    (((rad_px + margin) * 2.0).ceil() as u32).max(6)
+}
+
+/// [`render_star_tile`] into a tile you already own, shading only `clip`
+/// (`[x0, y0, x1, y1)`, tile px) and clearing the rest.
+///
+/// Zoomed onto the star, most of its tile hangs off the viewport and the
+/// compositor never reads it; passing `scene_core::visible_tile_rect` here skips
+/// that work. Reusing the buffer also drops a per-bake heap allocation, which
+/// for a star at detail cap 110 is a ~580 KB zero-fill.
+#[allow(clippy::too_many_arguments)]
+pub fn render_star_tile_into(
+    tile: &mut Tile,
+    sk: &StarKind,
+    seed: u32,
+    t: f32,
+    rad_px: f32,
+    corona_reach: f32,
+    lod_enabled: bool,
+    clip: [u32; 4],
+) {
+    let size = star_tile_size(rad_px, corona_reach);
+    let len = (size * size * 4) as usize;
+    if tile.size != size || tile.px.len() != len {
+        tile.px.clear();
+        tile.px.resize(len, 0);
+        tile.size = size;
+    }
     let c = size as f32 / 2.0;
     let ofs = seed_offsets(seed, 220.0);
     // LOD: on a large (zoomed-in) tile, thin the secondary-fBm octaves.
     let lod = lod_enabled && size > 200;
     let (warp_oct, blotch_oct) = if lod { (1, 2) } else { (2, 3) };
     let corona_oct = if lod { 2 } else { 3 };
-    let mut px = vec![0u8; (size * size * 4) as usize];
+    let px = &mut tile.px;
 
-    for iy in 0..size {
-        for ix in 0..size {
+    // Everything past the corona is transparent, so a row only needs walking
+    // across the disc-plus-halo circle it intersects.
+    let reach = 1.0 + corona_reach;
+    let [clip_x0, clip_y0, clip_x1, clip_y1] = [
+        clip[0].min(size),
+        clip[1].min(size),
+        clip[2].min(size),
+        clip[3].min(size),
+    ];
+    for iy in clip_y0..clip_y1 {
+        let ny = (c - (iy as f32 + 0.5)) / rad_px;
+        let half = (reach * reach - ny * ny).max(0.0).sqrt() * rad_px + 1.0;
+        let x0 = clip_x0.max((c - half).floor().max(0.0) as u32);
+        let x1 = clip_x1.min((c + half).ceil().clamp(0.0, size as f32) as u32);
+        let row = (iy * size * 4) as usize;
+        let span = |a: u32, b: u32| row + (a * 4) as usize..row + (b * 4) as usize;
+        if x1 <= x0 {
+            px[span(clip_x0, clip_x1)].fill(0);
+            continue;
+        }
+        px[span(clip_x0, x0)].fill(0);
+        px[span(x1, clip_x1)].fill(0);
+        for ix in x0..x1 {
             let nx = (ix as f32 + 0.5 - c) / rad_px;
-            let ny = (c - (iy as f32 + 0.5)) / rad_px;
             let d2 = nx * nx + ny * ny;
             let r = d2.sqrt();
 
@@ -120,5 +177,4 @@ pub fn render_star_tile(
             px[idx + 3] = (clamp01(a) * 255.0) as u8;
         }
     }
-    Tile { px, size }
 }
