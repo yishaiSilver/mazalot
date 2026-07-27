@@ -12,7 +12,8 @@
 #                        (`planet`) and a scene sprite tile (`solar`, `moon`)
 #   crates/sun-core    — compact star renderer (shared by solar + comet)
 #   crates/wasm-abi    — the raw C-ABI alloc/dealloc + opaque-handle glue
-#   crates/render-io   — native GIF/PNG bin helpers (needs `image`)
+#   crates/render-io   — native GIF/PNG bin helpers + the tokio render pool
+#                        (needs `image`, `gif`, `tokio`)
 #
 #   crates/planet    — procedural planets (bins: planet, bench) + wasm
 #   crates/star      — procedural stars/suns (bin: sun) + wasm

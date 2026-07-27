@@ -16,10 +16,12 @@ A Cargo workspace under `crates/`. Each **demo crate** has the same three faces 
 `lib.rs` (pure render math), `wasm.rs` (a raw C-ABI cdylib face, **no
 wasm-bindgen**), and `src/bin/*` (native GIF/PNG generators behind a `native`
 feature) — and they share their common machinery through **library crates**
-rather than copy-pasting it. The library crates carry **no third-party deps**, so
-a `--no-default-features` wasm build never sees `image`/`rand` and stays tiny.
+rather than copy-pasting it. Every library crate on the render path carries **no
+third-party deps**; the one that does, `render-io`, sits behind `native`. So a
+`--no-default-features` wasm build never sees `image`/`gif`/`tokio`/`rand` and
+stays tiny.
 
-**Library crates (shared, dependency-free):**
+**Library crates (shared, dependency-free except `render-io`):**
 
 | Crate | What it is |
 |-------|------------|
@@ -30,7 +32,7 @@ a `--no-default-features` wasm build never sees `image`/`rand` and stays tiny.
 | `planet-core` | **The** planet renderer — the only one in the workspace. The 26-type table, sphere shading, weather, rings, moons. One shader, two framings: a *hero* square frame (`render_rgba`) and a *scene sprite tile* (`render_tile`). `planet`, `solar` and `moon` are all framings of it. |
 | `sun-core` | The compact star tile (granulation + corona) used by `solar` and `comet`. |
 | `wasm-abi` | The raw C-ABI glue: `alloc`/`dealloc` and opaque-handle macros. Exports no symbols itself. |
-| `render-io` | The only crate that touches `image`: GIF/contact-sheet/poster helpers for the native bins. |
+| `render-io` | The only crate with third-party deps (`image`, `gif`, `tokio`): GIF/contact-sheet/poster helpers for the native bins, plus the `parallel_map` render pool that `planet` and `star` fan their frames across. |
 
 **Demo crates:**
 
@@ -55,18 +57,18 @@ always behind the `native` feature, so the wasm build never sees it.
 | `noise-core`       |   146 |   ○    |  ●   |   ●   |  ●   |   ●   |    ●     |
 | `dither-core`      |    31 |   ○    |  ●   |   ○   |  ●   |   ●   |    ●     |
 | `scene-core`       |   130 |   ○    |  ·   |   ●   |  ●   |   ●   |    ●     |
-| `background-core`  |   365 |   ·    |  ·   |   ●   |  ●   |   ●   |    ●     |
+| `background-core`  |   697 |   ·    |  ·   |   ●   |  ●   |   ●   |    ●     |
 | `planet-core`      |   815 |   ●    |  ·   |   ●   |  ●   |   ·   |    ·     |
 | `sun-core`         |   124 |   ·    |  ·   |   ●   |  ·   |   ●   |    ·     |
 | `wasm-abi`         |    87 |   ●    |  ●   |   ●   |  ●   |   ●   |    ●     |
-| `render-io`        |   188 |   ●    |  ●   |   ●   |  ●   |   ●   |    ●     |
+| `render-io`        |   371 |   ●    |  ●   |   ●   |  ●   |   ●   |    ●     |
 | **`lib.rs`**       |       | **18** | 567  |  767  | 503  |  557  |   490    |
 | **`wasm.rs`**      |       |   93   |  58  |  166  |  76  |   79  |    71    |
 
-The library layer is 8 crates / 1,886 lines and stacks in one direction only:
+The library layer is 8 crates / 2,401 lines and stacks in one direction only:
 
 ```
-                          render-io ──── image (the only third-party dep)
+                          render-io ──── image, gif, tokio (the only third-party deps)
                           wasm-abi  ──── (nothing)
 
 noise-core ──┬── dither-core ──┬── background-core ── solar, moon, comet, asteroid

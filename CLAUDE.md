@@ -14,7 +14,7 @@ driving a browser demo.
 A Cargo workspace under `crates/`, in two layers.
 
 **Library crates** hold shared machinery. They carry **no third-party
-dependencies** (except `render-io`, which is the one that owns `image`):
+dependencies** (except `render-io`, which owns `image`, `gif` and `tokio`):
 
 | crate | what |
 |---|---|
@@ -25,7 +25,7 @@ dependencies** (except `render-io`, which is the one that owns `image`):
 | `planet-core` | **The** planet renderer — 26-type table, sphere shader, weather, rings, moons. |
 | `sun-core` | The compact star tile (granulation + corona). |
 | `wasm-abi` | `alloc`/`dealloc` + opaque-handle macros for the C ABI. |
-| `render-io` | GIF/contact-sheet/poster helpers. The only crate that touches `image`. |
+| `render-io` | GIF/contact-sheet/poster helpers + the tokio render pool. The only crate with third-party deps. |
 
 They stack in one direction only — `noise-core` → `dither-core`/`scene-core` →
 `background-core`/`planet-core`/`sun-core`. See the import table in `README.md`.
@@ -70,8 +70,23 @@ Share through an rlib. This is why `planet-core` exists as a crate separate from
 
 **Library crates stay third-party-free.** The wasm build is
 `--no-default-features`; anything reachable from `lib.rs` without the `native`
-feature ends up in the module. Keep `image`/`rand` behind `native` and behind
-`render-io`.
+feature ends up in the module. Keep `image`/`gif`/`tokio`/`rand` behind `native`
+and behind `render-io`.
+
+**The render pool is one level deep.** `render_io::parallel_map` runs jobs on a
+tokio blocking pool bounded at the core count, and a *nested* call runs serially
+on purpose — an outer job parked waiting on inner jobs could hold every slot
+while the inner work has none, which deadlocks. So fan out at whichever level
+has enough jobs to fill the pool and let the inner one collapse; `planet.rs`
+fanning out over whole GIFs while `write_spin_gif` fans out over frames is the
+intended shape. Jobs must be pure — the pool gives no ordering between them,
+only ordered results.
+
+**The scene bins stay off the pool.** `solar`/`moon`/`comet`/`asteroid` render
+through `RefCell` caches and use the serial `encode_gif`. That is not just
+thread-safety: giving `encode_gif` a tokio call changes its LTO unit enough to
+shift comet's dithered tail by a quantization level (see the float-codegen
+gotcha below). Parallelizing them means re-baselining their output on purpose.
 
 **Rosters name archetypes by string.** `solar::ROSTER` and `moon::PARENTS` refer
 to `planet-core` types by name (`"gas_giant"`, `"terran"`), resolved via

@@ -4,11 +4,20 @@ version = "0.1.0"
 edition = "2021"
 
 # Native GIF/PNG orchestration shared by the space-crate bins. Carries the
-# `image` dep (png+gif); only pulled in by each bin's `native` feature, so the
-# wasm build never sees it.
+# `image` dep (png+gif) and the `tokio` render pool; only pulled in by each
+# bin's `native` feature, so the wasm build never sees either.
 
 [lib]
 crate-type = ["rlib"]
 
 [dependencies]
+# `image`'s own GIF backend, pulled in directly so the per-frame NeuQuant
+# quantization can run on the pool separately from the (necessarily serial)
+# stream writer — see `encode_gif`. Cargo unifies this with image's copy, so it
+# is the same quantizer, not a second one.
+gif = "0.14"
 image = { version = "0.25", default-features = false, features = ["png", "gif"] }
+# Just the runtime: every render job is CPU-bound and goes to `spawn_blocking`,
+# so we need neither the work-stealing scheduler ("rt-multi-thread") nor any of
+# the I/O, time or macro features.
+tokio = { version = "1.53.1", default-features = false, features = ["rt"] }
