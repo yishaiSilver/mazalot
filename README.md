@@ -597,11 +597,50 @@ pixel — the filter is near identity and the difference stays on coastline pixe
 Past the 1024-texel cap it will start to soften them, exactly where you are most
 zoomed in.
 
-Because they change the picture rather than the pixel budget, `F_BAKED_CLOUDS`
-and `F_BAKED_SURFACE` are **not** in `F_ALL`. The native generators keep the live shader and `out/` is byte-identical; the
-three web demos turn both on at construction, behind one `Frozen weather`
-checkbox each. The planet lab exposes them separately (`Frozen cloud deck` and
-`Baked surface`) so either can be A/B'd on its own.
+#### The two families that advect
+
+That leaves the gas giants and the lava worlds, whose fields genuinely move.
+Neither needed to be frozen — they needed to be *decomposed*, and the split is
+different in each.
+
+`Base::Emissive` separates cleanly. Its 6-octave rock field `n` is static and
+bakes; the 3-octave `flow` that lights it advects in three dimensions — the
+field *evolving*, not moving — so it stays live at full rate. Six of nine
+octaves go and the glow still flows: **1.39–1.50×**, with nothing lost.
+
+`Base::Banded` is a coordinate change rather than an overlay. Its drift,
+`angle · 0.16 · sin(lat · bands / 2)`, is added to the sample's **x**, which
+slides the field through the sphere and so cannot be a lookup offset. Re-express
+the same rate as a rotation in *longitude* and the sample stays on the sphere:
+animating the bands becomes one subtraction from the texture coordinate. The
+bake is exact under that model, because `band` is a function of the warp and of
+`y`, and a longitude shift leaves `y` alone. Two planes, since the band and
+fine-detail fields drift at different rates (1.0 and 1.4). **1.86–2.03×**.
+
+`F_BAKED_BANDS` is its own switch because it changes what the motion *is*: the
+bands counter-rotate instead of shearing past each other. Measured, the two
+models differ by about as much as one frame of the animation differs from the
+next — 8.9% of pixels at mean 1.07/255 between models, against 9.1% between
+consecutive frames of the old one — and the new model animates at the same rate
+(9.0% frame to frame). So it reads as the same planet a moment later, not as a
+different planet. Whether it is *better* is a look question; the code comment
+has always described the intent as "adjacent latitude bands drift in opposite
+directions", which is what the rotation model actually does.
+
+Every type in the table is now covered by one of the three switches, and each
+works on its own:
+
+| switch | types |
+|---|---|
+| `F_BAKED_CLOUDS` | 12 — every world with a deck, plus the two shrouded ones |
+| `F_BAKED_SURFACE` | 20 — Terrestrial, Cratered, Emissive |
+| `F_BAKED_BANDS` | 4 — the gas giants |
+
+Because they change the picture rather than the pixel budget, none of the three
+is in `F_ALL`. The native generators keep the live shader and `out/` is byte-identical; the
+three web demos turn all three on at construction, behind one `Frozen weather`
+checkbox each. The planet lab exposes them separately (`Frozen cloud deck`,
+`Baked surface`, `Baked bands`) so each can be A/B'd on its own.
 
 ### Shader experiments
 

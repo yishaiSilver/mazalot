@@ -73,8 +73,27 @@ pub const F_BAKED_CLOUDS: u32 = 64;
 /// `Terrestrial` and `Cratered`, 15 of the 26 types. A gas giant's zonal jets
 /// and a lava world's molten flow advect with `angle` and stay live.
 ///
+/// Also covers `Emissive`, whose 6-octave rock field is static — only the
+/// 3-octave flow that lights it advects, and that stays live, so a lava world
+/// keeps flowing at full speed.
+///
 /// Like [`F_BAKED_CLOUDS`], deliberately outside [`F_ALL`].
 pub const F_BAKED_SURFACE: u32 = 128;
+/// OPTIMIZATION: bake `Base::Banded`, re-expressing its zonal drift as a
+/// rotation in longitude instead of a shear of the noise domain.
+///
+/// The drift `angle · 0.16 · sin(lat · bands / 2)` is added to the sample's *x*
+/// today, which slides the field through the sphere and so cannot be a lookup
+/// offset. As a longitude rate it stays on the sphere, and animating the bands
+/// costs one subtraction from the texture coordinate. The bake is exact under
+/// that model: `band` is a function of the warp and of `y`, and a shift in
+/// longitude leaves `y` alone.
+///
+/// Its own bit, and outside [`F_ALL`], because unlike the others it changes what
+/// the motion *is* — the bands counter-rotate rather than shearing past each
+/// other. That is arguably what the code always meant to do, but it does not
+/// look the same.
+pub const F_BAKED_BANDS: u32 = 256;
 /// Everything on — what every caller but the demo's ablation panel wants.
 pub const F_ALL: u32 = 63;
 
@@ -510,10 +529,23 @@ struct CloudMap {
     h: u32,
     warp: Vec<u8>,
     dens: Vec<u8>,
-    shroud: Vec<u8>,
-    /// Base albedo, RGB interleaved (3 bytes/texel) — see [`F_BAKED_SURFACE`].
-    /// Interleaved rather than three planes so one lookup touches one cache line
-    /// instead of three.
+    /// The baked base surface, for the families whose base is one or two scalar
+    /// fields rather than a colour. What they hold depends on `ct.base`, and a
+    /// planet has exactly one base, so there is no ambiguity:
+    ///
+    /// | base | `base_a` | `base_b` |
+    /// |---|---|---|
+    /// | `Cloudy` | finished band/turbulence mix factor | — |
+    /// | `Emissive` | the static rock field `n` | — |
+    /// | `Banded` | band mix factor | fine-detail mix factor |
+    ///
+    /// `Banded` needs two because its two fields drift at different rates (1.0
+    /// and 1.4), so one lookup offset cannot serve both.
+    base_a: Vec<u8>,
+    base_b: Vec<u8>,
+    /// Base albedo for `Terrestrial`/`Cratered`, RGB interleaved (3 bytes/texel)
+    /// — see [`F_BAKED_SURFACE`]. Interleaved rather than three planes so one
+    /// lookup touches one cache line instead of three.
     surf: Vec<u8>,
 }
 
@@ -527,10 +559,10 @@ struct CloudKey {
     w: u32,
     /// `(octaves, warp inner, storm_cells)` — `None` when the planet has no deck.
     deck: Option<(u32, u32, u32)>,
-    /// `(octaves, warp inner, bands, turb)` — `None` unless the base is `Cloudy`.
-    shroud: Option<(u32, u32, u32, u32)>,
-    /// `(lod thinning, shape hash)` — `None` unless the base is bakeable.
-    surf: Option<(u32, u64)>,
+    /// The baked base surface: `(lod thinning, shape hash, plane count)`.
+    /// `None` when this planet's base is not baked — either its family cannot
+    /// be, or the caller did not ask for it.
+    base: Option<(u32, u64, u8)>,
 }
 
 impl CloudKey {
@@ -538,10 +570,7 @@ impl CloudKey {
     /// holds, three for the interleaved albedo.
     fn bytes(&self) -> usize {
         let texels = (self.w * (self.w / 2)) as usize;
-        texels
-            * (2 * self.deck.is_some() as usize
-                + self.shroud.is_some() as usize
-                + 3 * self.surf.is_some() as usize)
+        texels * (2 * self.deck.is_some() as usize + self.base.map_or(0, |b| b.2 as usize))
     }
 }
 
@@ -579,21 +608,23 @@ fn cloud_map_w(rad: f32) -> u32 {
 /// The frozen layer for this planet, baked on first use and kept until the key
 /// moves. Returns `None` when the planet has no weather to freeze.
 fn cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, feat: u32, rad: f32) -> Option<Rc<CloudMap>> {
-    let deck = (ct.clouds > 0.0).then(|| {
+    let deck = (feat & F_BAKED_CLOUDS != 0 && ct.clouds > 0.0).then(|| {
         let o = lod.cld(4);
         (o, warp_inner(feat, o), ct.storm_cells.to_bits())
     });
-    let shroud = (ct.base == Base::Cloudy).then(|| {
-        let o = lod.surf(5);
-        (o, warp_inner(feat, o), ct.bands.to_bits(), ct.turb.to_bits())
-    });
-    let surf = (feat & F_BAKED_SURFACE != 0
-        && matches!(ct.base, Base::Terrestrial | Base::Cratered))
-    .then(|| (lod.surface, surf_shape_key(ct)));
-    if deck.is_none() && shroud.is_none() && surf.is_none() {
+    // Which switch owns a family's base, and how many planes it needs.
+    let planes = match ct.base {
+        Base::Terrestrial | Base::Cratered if feat & F_BAKED_SURFACE != 0 => 3,
+        Base::Emissive if feat & F_BAKED_SURFACE != 0 => 1,
+        Base::Cloudy if feat & F_BAKED_CLOUDS != 0 => 1,
+        Base::Banded if feat & F_BAKED_BANDS != 0 => 2,
+        _ => 0,
+    };
+    let base = (planes > 0).then(|| (lod.surface, base_shape_key(ct, feat), planes));
+    if deck.is_none() && base.is_none() {
         return None; // nothing to freeze
     }
-    let key = CloudKey { seed, w: cloud_map_w(rad), deck, shroud, surf };
+    let key = CloudKey { seed, w: cloud_map_w(rad), deck, base };
     CLOUD_CACHE.with(|c| {
         let mut cache = c.borrow_mut();
         if let Some(i) = cache.iter().position(|(k, _)| *k == key) {
@@ -611,20 +642,22 @@ fn cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, feat: u32, rad: f32
         {
             cache.pop();
         }
-        let m = Rc::new(bake_cloud_map(ct, seed, ofs, lod, &key));
+        let m = Rc::new(bake_cloud_map(ct, seed, ofs, lod, feat, &key));
         cache.insert(0, (key, Rc::clone(&m)));
         Some(m)
     })
 }
 
-fn bake_cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, key: &CloudKey) -> CloudMap {
+fn bake_cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, feat: u32, key: &CloudKey) -> CloudMap {
     let w = key.w;
     let h = w / 2;
     let n = (w * h) as usize;
     let sized = |on: bool| if on { vec![0u8; n] } else { Vec::new() };
     let (mut warp, mut dens) = (sized(key.deck.is_some()), sized(key.deck.is_some()));
-    let mut shroud = sized(key.shroud.is_some());
-    let mut surf = if key.surf.is_some() { vec![0u8; n * 3] } else { Vec::new() };
+    let planes = key.base.map_or(0, |b| b.2);
+    let mut base_a = sized(planes == 1 || planes == 2);
+    let mut base_b = sized(planes == 2);
+    let mut surf = if planes == 3 { vec![0u8; n * 3] } else { Vec::new() };
     // Vortex centers, hoisted: they are per-seed constants, and the live path
     // pays for them per pixel.
     let mut vort = [(0.0f32, 0.0f32); 2];
@@ -659,26 +692,45 @@ fn bake_cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, key: &CloudKey
                 dens[t] = q8(fbm(cx3 * 2.8, py, cz3 * 2.8, oct));
             }
 
-            if let Some((oct, inner, _, _)) = key.shroud {
-                // The whole of `Base::Cloudy`'s mix factor, not just its noise:
-                // `band` folds in only `y` and the field, both of which are
-                // known here, so the per-pixel cost collapses to one `mix`.
+            if key.base.is_some() {
                 let (px, py, pz) = (sx + ofs[0], y + ofs[1], sz + ofs[2]);
-                let flow = (0.5 + 0.3 * (y * 3.0).cos()) * SHEAR_STATIC;
-                let tv = fbm_warp_inner((px + flow) * 2.0, py * 2.0, pz * 2.0, oct, inner, 0.7);
-                let band = 0.5 + 0.5 * (y * ct.bands + (tv - 0.5) * 6.0 * ct.turb).sin();
-                shroud[t] = q8(band * 0.6 + tv * 0.4);
-            }
-
-            if key.surf.is_some() {
-                let col = static_albedo(ct, y, sx + ofs[0], y + ofs[1], sz + ofs[2], lod);
-                surf[t * 3] = q8(col[0]);
-                surf[t * 3 + 1] = q8(col[1]);
-                surf[t * 3 + 2] = q8(col[2]);
+                match ct.base {
+                    Base::Terrestrial | Base::Cratered => {
+                        let col = static_albedo(ct, y, px, py, pz, lod);
+                        surf[t * 3] = q8(col[0]);
+                        surf[t * 3 + 1] = q8(col[1]);
+                        surf[t * 3 + 2] = q8(col[2]);
+                    }
+                    Base::Cloudy => {
+                        // The whole of the mix factor, not just its noise: `band`
+                        // folds in only `y` and the field, both known here, so the
+                        // per-pixel cost collapses to one `mix`.
+                        let o = lod.surf(5);
+                        let flow = (0.5 + 0.3 * (y * 3.0).cos()) * SHEAR_STATIC;
+                        let tv = fbm_warp_inner((px + flow) * 2.0, py * 2.0, pz * 2.0, o, warp_inner(feat, o), 0.7);
+                        let band = 0.5 + 0.5 * (y * ct.bands + (tv - 0.5) * 6.0 * ct.turb).sin();
+                        base_a[t] = q8(band * 0.6 + tv * 0.4);
+                    }
+                    Base::Emissive => {
+                        // Only the rock field. The flow that lights it advects in
+                        // three dimensions and cannot be a lookup offset, so it
+                        // stays live — which is why a lava world still flows.
+                        base_a[t] = q8(contrast(fbm(px * ct.freq, py * ct.freq, pz * ct.freq, lod.surf(6)), 1.7));
+                    }
+                    Base::Banded => {
+                        // Baked at zero drift; the live path puts the drift back
+                        // as a longitude offset on the lookup.
+                        let o = lod.surf(5);
+                        let warp = fbm_warp_inner(px * 1.3, py * 1.3, pz * 1.3, o, warp_inner(feat, o), 0.8);
+                        let lat = y + (warp - 0.5) * ct.turb;
+                        base_a[t] = q8(0.5 + 0.5 * (lat * ct.bands).sin());
+                        base_b[t] = q8(smoothstep(0.55, 0.8, fbm(px * 4.0, py * 4.0, pz * 4.0, 4)));
+                    }
+                }
             }
         }
     }
-    CloudMap { w, h, warp, dens, shroud, surf }
+    CloudMap { w, h, warp, dens, base_a, base_b, surf }
 }
 
 #[inline(always)]
@@ -805,12 +857,14 @@ fn static_albedo(ct: &PType, sy: f32, px: f32, py: f32, pz: f32, lod: Lod) -> Rg
     }
 }
 
-/// Everything `static_albedo` reads, folded into one value the cache can compare.
+/// Everything a baked base plane depends on, folded into one value the cache can
+/// compare. Over-inclusive on purpose: a field that no family reads costs one
+/// hash step, while a field left out silently serves a stale map.
 ///
 /// `stops` is keyed by pointer: it is `&'static`, so its address identifies the
 /// palette without walking it. The rest are `f32` bit patterns, since `f32` is
 /// not `Eq` and a slider can move any of them.
-fn surf_shape_key(ct: &PType) -> u64 {
+fn base_shape_key(ct: &PType, feat: u32) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     let mut mix1 = |v: u64| {
         h ^= v;
@@ -823,6 +877,10 @@ fn surf_shape_key(ct: &PType) -> u64 {
     mix1(ct.stops.as_ptr() as usize as u64);
     mix1(ct.stops.len() as u64);
     mix1(ct.caps.to_bits() as u64);
+    mix1(ct.bands.to_bits() as u64);
+    mix1(ct.turb.to_bits() as u64);
+    // The warp's inner-octave count is a render mode, not a type field.
+    mix1(warp_inner(feat, 5) as u64);
     for c in ct.dark.iter().chain(ct.light.iter()) {
         mix1(c.to_bits() as u64);
     }
@@ -854,23 +912,46 @@ fn surface(
         }
         Base::Banded => {
             // Zonal jets: adjacent latitude bands drift in opposite directions,
-            // continuously — the real gas-giant look, not a uniform wobble.
+            // continuously — the real gas-giant look, not a uniform wobble. The
+            // rate is per-latitude and changes sign, which is what makes
+            // neighbouring bands shear past each other.
             let flow = angle * 0.16 * (sy * ct.bands * 0.5).sin();
-            // Domain warp makes the band turbulence curl and marble like fluid.
-            let o = lod.surf(5);
-            let warp = fbm_warp_inner((px + flow) * 1.3, py * 1.3, pz * 1.3, o, warp_inner(feat, o), 0.8);
-            let lat = sy + (warp - 0.5) * ct.turb;
-            let band = 0.5 + 0.5 * (lat * ct.bands).sin();
-            let mut col = mix(ct.dark, ct.light, band);
-            let fine = fbm((px + flow * 1.4) * 4.0, py * 4.0, pz * 4.0, 4);
-            col = mix(col, ct.light, smoothstep(0.55, 0.8, fine) * 0.35);
+            let (band, fine) = match baked.filter(|m| !m.base_b.is_empty()) {
+                Some(m) => {
+                    // Same rate, applied as a rotation in longitude rather than
+                    // a shift of the noise domain — one subtraction from the
+                    // texture coordinate and the bands turn for free. The unit
+                    // is a turn, and near the equator an arc of `flow` radians
+                    // on the unit sphere is the same distance the shear moved.
+                    let (u, v) = (atan2_turns(sz, sx), (sy + 1.0) * 0.5);
+                    let k = flow * (1.0 / TAU);
+                    // Two planes because the two fields drift at different rates.
+                    (m.sample(&m.base_a, u - k, v), m.sample(&m.base_b, u - k * 1.4, v))
+                }
+                None => {
+                    // Domain warp makes the band turbulence curl and marble like fluid.
+                    let o = lod.surf(5);
+                    let warp = fbm_warp_inner((px + flow) * 1.3, py * 1.3, pz * 1.3, o, warp_inner(feat, o), 0.8);
+                    let lat = sy + (warp - 0.5) * ct.turb;
+                    let fine = fbm((px + flow * 1.4) * 4.0, py * 4.0, pz * 4.0, 4);
+                    (0.5 + 0.5 * (lat * ct.bands).sin(), smoothstep(0.55, 0.8, fine))
+                }
+            };
+            let mut col = mix(mix(ct.dark, ct.light, band), ct.light, fine * 0.35);
             if ct.spot > 0.0 {
                 col = great_spot(col, sx, sy, sz, angle, ct.spot);
             }
             (col, 0.0)
         }
         Base::Emissive => {
-            let n = contrast(fbm(px * ct.freq, py * ct.freq, pz * ct.freq, lod.surf(6)), 1.7);
+            // The rock field holds still, so it bakes; the flow that lights it
+            // advects in three dimensions — the field *evolving*, not moving —
+            // and no lookup offset represents that, so it stays live at full
+            // rate. 6 of the 9 octaves go, and the glow still flows.
+            let n = match baked.filter(|m| !m.base_a.is_empty()) {
+                Some(m) => m.sample(&m.base_a, atan2_turns(sz, sx), (sy + 1.0) * 0.5),
+                None => contrast(fbm(px * ct.freq, py * ct.freq, pz * ct.freq, lod.surf(6)), 1.7),
+            };
             // Molten flow: a slow noise field advects across the surface, so the
             // glow brightens and dims in drifting patches instead of pulsing.
             let flow = fbm(px * 2.2 + angle * 0.7, py * 2.2, pz * 2.2 - angle * 0.5, 3);
@@ -886,8 +967,8 @@ fn surface(
             // the weather, so it is what F_BAKED_CLOUDS freezes here — and the
             // baked plane already holds the finished mix factor, so the frozen
             // path is a table read and nothing else.
-            let f = match baked.filter(|m| !m.shroud.is_empty()) {
-                Some(m) => m.sample(&m.shroud, atan2_turns(sz, sx), (sy + 1.0) * 0.5),
+            let f = match baked.filter(|m| !m.base_a.is_empty()) {
+                Some(m) => m.sample(&m.base_a, atan2_turns(sz, sx), (sy + 1.0) * 0.5),
                 None => {
                     let flow = (0.5 + 0.3 * (sy * 3.0).cos()) * angle.sin();
                     let o = lod.surf(5);
@@ -1205,7 +1286,10 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
     // Bake the frozen deck once, outside the loop. `cld`/`warp_inner` are the
     // same octave counts the live path would have used, so the two agree on
     // detail and differ only in that this one does not move.
-    let cloud_bake = if style.feat & F_BAKED_CLOUDS != 0 {
+    // Any one of the three switches can want a map, and each owns a different
+    // set of planes — gating the whole map on the cloud bit alone made the other
+    // two silently free, which an ablation panel reports as "costs nothing".
+    let cloud_bake = if style.feat & (F_BAKED_CLOUDS | F_BAKED_SURFACE | F_BAKED_BANDS) != 0 {
         cloud_map(ct, seed, ofs, lod, style.feat, rad)
     } else {
         None
@@ -1509,7 +1593,7 @@ mod cloud_tests {
     /// as a stationary band down the middle of every planet.
     #[test]
     fn cloud_map_sampling_is_exact_and_wraps() {
-        let m = CloudMap { w: 4, h: 2, warp: vec![0, 64, 128, 255, 10, 20, 30, 40], dens: vec![], shroud: vec![], surf: vec![] };
+        let m = CloudMap { w: 4, h: 2, warp: vec![0, 64, 128, 255, 10, 20, 30, 40], dens: vec![], base_a: vec![], base_b: vec![], surf: vec![] };
         for i in 0..4 {
             let u = (i as f32 + 0.5) / 4.0;
             let got = m.sample(&m.warp, u, 0.25);

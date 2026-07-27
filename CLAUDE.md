@@ -167,9 +167,15 @@ Run wasm builds **from the repo root** so `.cargo/config.toml` applies. It adds
   because building it means rendering one. Indexing by (longitude, y) instead
   makes the bake invariant to both, so one map serves every frame. If a new layer
   looks bakeable, check it for an `angle` term first: `Terrestrial`/`Cratered`
-  have none, `Banded`/`Emissive` advect and cannot be frozen without stopping the
-  thing that makes them look alive.
-- **`F_BAKED_CLOUDS` / `F_BAKED_SURFACE` are deliberately outside `F_ALL`.** Every other `F_*` bit is
+  have none. `Emissive` splits instead — its rock field bakes, its flow stays
+  live. `Banded` needed its drift re-expressed as a longitude rotation before it
+  would bake at all, which is a look change and so has its own bit.
+- **A per-family optimization needs its gate checked one bit at a time.** The
+  baked map was built only when `F_BAKED_CLOUDS` was set, so `F_BAKED_SURFACE`
+  and `F_BAKED_BANDS` did nothing on their own — and the verification missed it
+  for a whole commit because it always tested them with the cloud bit already on.
+  Hash each bit against `F_ALL` alone, not against `F_ALL | <the other bits>`.
+- **`F_BAKED_*` are deliberately outside `F_ALL`.** Every other `F_*` bit is
   either a feature the ablation panel switches off or an optimization that is
   invisible; these change the picture (frozen weather, baked albedo) to buy ~2.8x together.
   Keeping them out of `F_ALL` is what lets `out/` stay byte-identical while the
