@@ -769,7 +769,11 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
             // a pixel — so the demo's checkboxes looked dead on a slow world,
             // and an A/B measured the cache instead of the change.
             let feat = planet_core::F_ALL
-                | if sys.frozen_clouds { planet_core::F_BAKED_CLOUDS } else { 0 };
+                | if sys.frozen_clouds {
+                    planet_core::F_BAKED_CLOUDS | planet_core::F_BAKED_SURFACE
+                } else {
+                    0
+                };
             let key = [
                 rad_render.round() as i64,
                 (spin_a * rad_render) as i64,

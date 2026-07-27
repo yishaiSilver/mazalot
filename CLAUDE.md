@@ -161,11 +161,19 @@ Run wasm builds **from the repo root** so `.cargo/config.toml` applies. It adds
   index. A closure that accumulates across frames would silently produce garbage.
   The scene bins are the exception and stay serial: their `System`/`Belt`/`Scene`
   holds `RefCell` caches and is not `Sync` on purpose.
-- **`F_BAKED_CLOUDS` is deliberately outside `F_ALL`.** Every other `F_*` bit is
+- **The sphere map is the sprite idea that works.** A screen-space sprite strip
+  has to be re-baked for every (spin, light) pair and scales as r³ — at r=80 that
+  is 503 frames and 51 MB, and it breaks even only after a full revolution
+  because building it means rendering one. Indexing by (longitude, y) instead
+  makes the bake invariant to both, so one map serves every frame. If a new layer
+  looks bakeable, check it for an `angle` term first: `Terrestrial`/`Cratered`
+  have none, `Banded`/`Emissive` advect and cannot be frozen without stopping the
+  thing that makes them look alive.
+- **`F_BAKED_CLOUDS` / `F_BAKED_SURFACE` are deliberately outside `F_ALL`.** Every other `F_*` bit is
   either a feature the ablation panel switches off or an optimization that is
-  invisible; this one changes the picture (frozen weather) to buy ~2x. Keeping it
-  out of `F_ALL` is what lets `out/` stay byte-identical while the web demos run
-  with it. `System::frozen_clouds` / `MoonSystem::frozen_clouds` default to
+  invisible; these change the picture (frozen weather, baked albedo) to buy ~2.8x together.
+  Keeping them out of `F_ALL` is what lets `out/` stay byte-identical while the
+  web demos run with them. `System::frozen_clouds` / `MoonSystem::frozen_clouds` default to
   `false` for the same reason — the JS turns them on at construction.
 - **A render-mode flag has to be in the tile memo key.** `solar` caches a
   planet's last tile against its geometry; a flag that changes how the tile is

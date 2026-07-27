@@ -331,7 +331,8 @@ fn quant(o: Rgb, bx: f32) -> Rgb {
 /// worlds in its orbits, and the same shader the `planet` demo shows head-on;
 /// moon only pins the light to its fixed off-screen sun (`LIGHT_DIR`).
 fn render_parent_tile(type_idx: usize, seed: u32, spin_a: f32, rad_px: f32, frozen: bool) -> Tile {
-    let feat = planet_core::F_ALL | if frozen { planet_core::F_BAKED_CLOUDS } else { 0 };
+    let feat = planet_core::F_ALL
+        | if frozen { planet_core::F_BAKED_CLOUDS | planet_core::F_BAKED_SURFACE } else { 0 };
     planet_core::render_tile_features(type_idx, seed, spin_a, LIGHT_DIR, rad_px, true, feat)
 }
 

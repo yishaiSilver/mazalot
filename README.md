@@ -559,10 +559,49 @@ live path would have used, so the deck is exactly as detailed. It is a
 (`STORM_STATIC`) rather than churning. Worlds with thinner decks move less
 (`tundra` 8.9%, `desert` 5.6%).
 
-Because it changes the picture rather than the pixel budget, `F_BAKED_CLOUDS` is
-**not** in `F_ALL`. The native generators keep the animated deck and `out/` is
-byte-identical; the three web demos turn it on at construction, behind a
-checkbox in each (`Frozen weather`, and `Frozen cloud deck` in the planet lab).
+#### The same trick on the surface
+
+Once the map exists, the question is what else is a pure function of a direction
+on the sphere. The answer is most of the shader: `Base::Terrestrial` and
+`Base::Cratered` contain no `angle` term at all — 15 of the 26 types. So
+`F_BAKED_SURFACE` bakes their albedo into the same map, RGB interleaved.
+
+The two that stay live are the ones that genuinely advect: a gas giant's zonal
+jets drift by `angle · 0.16 · sin(lat · bands / 2)` and a lava world's glow is
+carried by a flow field. Freezing those would stop the bands sliding past each
+other, which is the whole look, so they keep paying.
+
+wasm, 160px tile, cumulative:
+
+| type | live | + frozen deck | + baked surface | total |
+|---|---:|---:|---:|---:|
+| `terran` | 91 fps | 155 fps | **215 fps** | 2.36× |
+| `ocean` | 95 fps | 167 fps | **222 fps** | 2.33× |
+| `barren` | 206 fps | 205 fps | **472 fps** | 2.29× |
+| `moon` | 206 fps | 207 fps | **464 fps** | 2.25× |
+| `iron` | 178 fps | 178 fps | **247 fps** | 1.39× |
+| `gas_giant` / `lava` | — | — | — | 1.00× |
+
+The cratered worlds double because Worley searches 27 cells per pixel and there
+is nothing else in their frame; `iron` gains least of the terrestrials because
+it has no cloud deck to have frozen first. In the scene, following a cloudy
+planet that fills a 1000×640 view: **52.2 → 18.5 ms, 19 → 54 fps (2.82×)**.
+
+It costs far less to look at than the frozen deck does — 1.3–5.6% of pixels move
+by a mean of 0.15–1.11/255, against the deck's 17.7% and 6.8. Nothing is
+*frozen* here that was moving; the only error is the `u8` texel and the bilinear
+filter. That filter is the one thing to watch: `ramp` is a hard step function, so
+every coastline is a colour discontinuity, and blending across one produces a
+shade that is not in the palette. At the width this bakes — about one texel per
+pixel — the filter is near identity and the difference stays on coastline pixels.
+Past the 1024-texel cap it will start to soften them, exactly where you are most
+zoomed in.
+
+Because they change the picture rather than the pixel budget, `F_BAKED_CLOUDS`
+and `F_BAKED_SURFACE` are **not** in `F_ALL`. The native generators keep the live shader and `out/` is byte-identical; the
+three web demos turn both on at construction, behind one `Frozen weather`
+checkbox each. The planet lab exposes them separately (`Frozen cloud deck` and
+`Baked surface`) so either can be A/B'd on its own.
 
 ### Shader experiments
 

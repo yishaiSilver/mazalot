@@ -67,6 +67,14 @@ pub const F_CHEAP_WARP: u32 = 32;
 /// picture rather than the pixel budget, so the native generators keep the
 /// animated deck and `out/` stays byte-identical. The web demos opt in.
 pub const F_BAKED_CLOUDS: u32 = 64;
+/// OPTIMIZATION: bake the base surface albedo into the sphere map as well.
+///
+/// Only the two families that are pure functions of a direction on the sphere —
+/// `Terrestrial` and `Cratered`, 15 of the 26 types. A gas giant's zonal jets
+/// and a lava world's molten flow advect with `angle` and stay live.
+///
+/// Like [`F_BAKED_CLOUDS`], deliberately outside [`F_ALL`].
+pub const F_BAKED_SURFACE: u32 = 128;
 /// Everything on — what every caller but the demo's ablation panel wants.
 pub const F_ALL: u32 = 63;
 
@@ -503,6 +511,10 @@ struct CloudMap {
     warp: Vec<u8>,
     dens: Vec<u8>,
     shroud: Vec<u8>,
+    /// Base albedo, RGB interleaved (3 bytes/texel) — see [`F_BAKED_SURFACE`].
+    /// Interleaved rather than three planes so one lookup touches one cache line
+    /// instead of three.
+    surf: Vec<u8>,
 }
 
 /// Everything the baked layer depends on. `clouds` is absent on purpose — it
@@ -517,13 +529,19 @@ struct CloudKey {
     deck: Option<(u32, u32, u32)>,
     /// `(octaves, warp inner, bands, turb)` — `None` unless the base is `Cloudy`.
     shroud: Option<(u32, u32, u32, u32)>,
+    /// `(lod thinning, shape hash)` — `None` unless the base is bakeable.
+    surf: Option<(u32, u64)>,
 }
 
 impl CloudKey {
-    /// Heap the baked map will occupy — one `u8` plane per field it holds.
+    /// Heap the baked map will occupy — one `u8` plane per scalar field it
+    /// holds, three for the interleaved albedo.
     fn bytes(&self) -> usize {
         let texels = (self.w * (self.w / 2)) as usize;
-        texels * (2 * self.deck.is_some() as usize + self.shroud.is_some() as usize)
+        texels
+            * (2 * self.deck.is_some() as usize
+                + self.shroud.is_some() as usize
+                + 3 * self.surf.is_some() as usize)
     }
 }
 
@@ -569,10 +587,13 @@ fn cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, feat: u32, rad: f32
         let o = lod.surf(5);
         (o, warp_inner(feat, o), ct.bands.to_bits(), ct.turb.to_bits())
     });
-    if deck.is_none() && shroud.is_none() {
+    let surf = (feat & F_BAKED_SURFACE != 0
+        && matches!(ct.base, Base::Terrestrial | Base::Cratered))
+    .then(|| (lod.surface, surf_shape_key(ct)));
+    if deck.is_none() && shroud.is_none() && surf.is_none() {
         return None; // nothing to freeze
     }
-    let key = CloudKey { seed, w: cloud_map_w(rad), deck, shroud };
+    let key = CloudKey { seed, w: cloud_map_w(rad), deck, shroud, surf };
     CLOUD_CACHE.with(|c| {
         let mut cache = c.borrow_mut();
         if let Some(i) = cache.iter().position(|(k, _)| *k == key) {
@@ -590,19 +611,20 @@ fn cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, feat: u32, rad: f32
         {
             cache.pop();
         }
-        let m = Rc::new(bake_cloud_map(ct, seed, ofs, &key));
+        let m = Rc::new(bake_cloud_map(ct, seed, ofs, lod, &key));
         cache.insert(0, (key, Rc::clone(&m)));
         Some(m)
     })
 }
 
-fn bake_cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], key: &CloudKey) -> CloudMap {
+fn bake_cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, key: &CloudKey) -> CloudMap {
     let w = key.w;
     let h = w / 2;
     let n = (w * h) as usize;
     let sized = |on: bool| if on { vec![0u8; n] } else { Vec::new() };
     let (mut warp, mut dens) = (sized(key.deck.is_some()), sized(key.deck.is_some()));
     let mut shroud = sized(key.shroud.is_some());
+    let mut surf = if key.surf.is_some() { vec![0u8; n * 3] } else { Vec::new() };
     // Vortex centers, hoisted: they are per-seed constants, and the live path
     // pays for them per pixel.
     let mut vort = [(0.0f32, 0.0f32); 2];
@@ -647,9 +669,16 @@ fn bake_cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], key: &CloudKey) -> Cloud
                 let band = 0.5 + 0.5 * (y * ct.bands + (tv - 0.5) * 6.0 * ct.turb).sin();
                 shroud[t] = q8(band * 0.6 + tv * 0.4);
             }
+
+            if key.surf.is_some() {
+                let col = static_albedo(ct, y, sx + ofs[0], y + ofs[1], sz + ofs[2], lod);
+                surf[t * 3] = q8(col[0]);
+                surf[t * 3 + 1] = q8(col[1]);
+                surf[t * 3 + 2] = q8(col[2]);
+            }
         }
     }
-    CloudMap { w, h, warp, dens, shroud }
+    CloudMap { w, h, warp, dens, shroud, surf }
 }
 
 #[inline(always)]
@@ -694,20 +723,47 @@ fn atan2_turns(z: f32, x: f32) -> f32 {
 }
 
 impl CloudMap {
-    /// Bilinear fetch. `u` is a turn about the axis (any real — it wraps), `v`
-    /// is `y` remapped to 0..1 and clamps, since there is nothing past a pole.
+    /// Texel addresses and weights for a bilinear fetch: `u` is a turn about the
+    /// axis (any real — it wraps), `v` is `y` remapped to 0..1 and clamps, since
+    /// there is nothing past a pole. Shared so the scalar and RGB fetches cannot
+    /// disagree about where a sample lands.
     #[inline(always)]
-    fn sample(&self, tab: &[u8], u: f32, v: f32) -> f32 {
+    fn addr(&self, u: f32, v: f32) -> (usize, usize, usize, usize, f32, f32) {
         let fx = (u - u.floor()) * self.w as f32 - 0.5; // wrap first: fx > -1
         let fy = (v * self.h as f32 - 0.5).clamp(0.0, self.h as f32 - 1.0);
         let (x0, y0) = (fx.floor(), fy.floor());
-        let (tx, ty) = (fx - x0, fy - y0);
         let xa = if x0 < 0.0 { self.w - 1 } else { x0 as u32 };
         let xb = if xa + 1 >= self.w { 0 } else { xa + 1 };
         let ya = y0 as u32;
         let yb = (ya + 1).min(self.h - 1);
-        let (ra, rb) = ((ya * self.w) as usize, (yb * self.w) as usize);
-        let (xa, xb) = (xa as usize, xb as usize);
+        ((ya * self.w) as usize, (yb * self.w) as usize, xa as usize, xb as usize, fx - x0, fy - y0)
+    }
+
+    /// Bilinear fetch of the interleaved albedo plane.
+    ///
+    /// Bilinear despite `ramp` being a hard step function, which makes every
+    /// coastline a colour discontinuity: at the width this bakes (~one texel per
+    /// pixel) the filter is close to identity, while nearest makes texels pop as
+    /// the planet turns. Past the 1024 cap it does soften those edges — that is
+    /// the visible cost, and it lands where you are most zoomed in.
+    #[inline(always)]
+    fn sample_rgb(&self, u: f32, v: f32) -> Rgb {
+        let (ra, rb, xa, xb, tx, ty) = self.addr(u, v);
+        let (ra, rb, xa, xb) = (ra * 3, rb * 3, xa * 3, xb * 3);
+        let mut out = [0.0f32; 3];
+        for (c, o) in out.iter_mut().enumerate() {
+            let top = lerp(self.surf[ra + xa + c] as f32, self.surf[ra + xb + c] as f32, tx);
+            let bot = lerp(self.surf[rb + xa + c] as f32, self.surf[rb + xb + c] as f32, tx);
+            *o = lerp(top, bot, ty) * (1.0 / 255.0);
+        }
+        out
+    }
+
+    /// Bilinear fetch. `u` is a turn about the axis (any real — it wraps), `v`
+    /// is `y` remapped to 0..1 and clamps, since there is nothing past a pole.
+    #[inline(always)]
+    fn sample(&self, tab: &[u8], u: f32, v: f32) -> f32 {
+        let (ra, rb, xa, xb, tx, ty) = self.addr(u, v);
         let top = lerp(tab[ra + xa] as f32, tab[ra + xb] as f32, tx);
         let bot = lerp(tab[rb + xa] as f32, tab[rb + xb] as f32, tx);
         lerp(top, bot, ty) * (1.0 / 255.0)
@@ -715,6 +771,64 @@ impl CloudMap {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Base albedo for `Terrestrial` and `Cratered`: a pure function of a direction
+/// on the sphere, with no `angle` term anywhere. That is exactly the property
+/// [`F_BAKED_SURFACE`] exploits, and the reason these two families can be baked
+/// while the banded and emissive ones cannot.
+///
+/// `sy` is the sphere point's y (the ice caps are a latitude band); `px/py/pz`
+/// are the same point with the seed offset already added, which is the domain
+/// the noise is sampled in.
+fn static_albedo(ct: &PType, sy: f32, px: f32, py: f32, pz: f32, lod: Lod) -> Rgb {
+    match ct.base {
+        Base::Cratered => {
+            let m = smoothstep(0.4, 0.6, fbm(px * 1.2, py * 1.2, pz * 1.2, lod.surf(5)));
+            let base_col = mix(ct.dark, ct.light, m);
+            let w = worley(px * ct.freq, py * ct.freq, pz * ct.freq);
+            let bowl = smoothstep(0.0, 0.35, w);
+            let rim = smoothstep(0.30, 0.42, w) * (1.0 - smoothstep(0.42, 0.60, w));
+            [
+                clamp01(base_col[0] * (0.55 + 0.45 * bowl) + rim * 0.30),
+                clamp01(base_col[1] * (0.55 + 0.45 * bowl) + rim * 0.30),
+                clamp01(base_col[2] * (0.55 + 0.45 * bowl) + rim * 0.30),
+            ]
+        }
+        // Terrestrial, and the fallback for anything that asks by mistake.
+        _ => {
+            let raw = fbm(px * ct.freq, py * ct.freq, pz * ct.freq, lod.surf(if ct.ridged { 5 } else { 6 }));
+            let n = if ct.ridged { 1.0 - (2.0 * raw - 1.0).abs() } else { raw };
+            let h = contrast(n, ct.contrast);
+            let col = ramp(ct.stops, h);
+            let cap = smoothstep(0.72, 0.9, sy.abs()) * ct.caps;
+            mix(col, [0.92, 0.95, 1.0], cap)
+        }
+    }
+}
+
+/// Everything `static_albedo` reads, folded into one value the cache can compare.
+///
+/// `stops` is keyed by pointer: it is `&'static`, so its address identifies the
+/// palette without walking it. The rest are `f32` bit patterns, since `f32` is
+/// not `Eq` and a slider can move any of them.
+fn surf_shape_key(ct: &PType) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix1 = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    mix1(ct.base as u64);
+    mix1(ct.freq.to_bits() as u64);
+    mix1(ct.contrast.to_bits() as u64);
+    mix1(ct.ridged as u64);
+    mix1(ct.stops.as_ptr() as usize as u64);
+    mix1(ct.stops.len() as u64);
+    mix1(ct.caps.to_bits() as u64);
+    for c in ct.dark.iter().chain(ct.light.iter()) {
+        mix1(c.to_bits() as u64);
+    }
+    h
+}
+
 fn surface(
     ct: &PType,
     sx: f32,
@@ -728,27 +842,15 @@ fn surface(
 ) -> (Rgb, f32) {
     let (px, py, pz) = (sx + ofs[0], sy + ofs[1], sz + ofs[2]);
     let (mut col, mut emis) = match ct.base {
-        Base::Terrestrial => {
-            let raw = fbm(px * ct.freq, py * ct.freq, pz * ct.freq, lod.surf(if ct.ridged { 5 } else { 6 }));
-            let n = if ct.ridged { 1.0 - (2.0 * raw - 1.0).abs() } else { raw };
-            let h = contrast(n, ct.contrast);
-            let mut col = ramp(ct.stops, h);
-            let cap = smoothstep(0.72, 0.9, sy.abs()) * ct.caps;
-            col = mix(col, [0.92, 0.95, 1.0], cap);
-            (col, 0.0)
-        }
-        Base::Cratered => {
-            let m = smoothstep(0.4, 0.6, fbm(px * 1.2, py * 1.2, pz * 1.2, lod.surf(5)));
-            let base_col = mix(ct.dark, ct.light, m);
-            let w = worley(px * ct.freq, py * ct.freq, pz * ct.freq);
-            let bowl = smoothstep(0.0, 0.35, w);
-            let rim = smoothstep(0.30, 0.42, w) * (1.0 - smoothstep(0.42, 0.60, w));
-            let col = [
-                clamp01(base_col[0] * (0.55 + 0.45 * bowl) + rim * 0.30),
-                clamp01(base_col[1] * (0.55 + 0.45 * bowl) + rim * 0.30),
-                clamp01(base_col[2] * (0.55 + 0.45 * bowl) + rim * 0.30),
-            ];
-            (col, 0.0)
+        // The two families that hold still. Everything below the `match` — the
+        // aurora, the lightning, the shading — still runs live; only the albedo
+        // comes out of the table.
+        Base::Terrestrial | Base::Cratered => {
+            let col = match baked.filter(|m| !m.surf.is_empty()) {
+                Some(m) => m.sample_rgb(atan2_turns(sz, sx), (sy + 1.0) * 0.5),
+                None => static_albedo(ct, sy, px, py, pz, lod),
+            };
+            (col, 0.0f32)
         }
         Base::Banded => {
             // Zonal jets: adjacent latitude bands drift in opposite directions,
@@ -1407,7 +1509,7 @@ mod cloud_tests {
     /// as a stationary band down the middle of every planet.
     #[test]
     fn cloud_map_sampling_is_exact_and_wraps() {
-        let m = CloudMap { w: 4, h: 2, warp: vec![0, 64, 128, 255, 10, 20, 30, 40], dens: vec![], shroud: vec![] };
+        let m = CloudMap { w: 4, h: 2, warp: vec![0, 64, 128, 255, 10, 20, 30, 40], dens: vec![], shroud: vec![], surf: vec![] };
         for i in 0..4 {
             let u = (i as f32 + 0.5) / 4.0;
             let got = m.sample(&m.warp, u, 0.25);

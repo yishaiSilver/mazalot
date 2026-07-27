@@ -185,6 +185,7 @@ const FEATURES = [
   { key: "night",    label: "Night-side thinning", bit: 16, opt: true },
   { key: "warp",     label: "Cheap warp inner",    bit: 32, opt: true },
   { key: "frozen",   label: "Frozen cloud deck",   add: 64, opt: true },
+  { key: "baksurf",  label: "Baked surface",       add: 128, opt: true },
 ];
 const on = new Set(FEATURES.map(f => f.key));   // everything on to begin with
 let FEAT_ALL = 63;
