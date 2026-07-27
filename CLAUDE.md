@@ -134,6 +134,14 @@ silently, because the JS calls them by name.
 
 ## Gotchas
 
+- **The star's corona is tabulated, not shaded.** `sun_core::Shade` samples the
+  halo's streamers, its falloff and the disc's limb darkening along one axis each,
+  once per bake — the halo is ~65% of a star tile's pixels and none of those
+  fields has per-pixel detail. The angular table is sized to the halo's outer
+  circumference ×2.2 (`diamond_angle` covers a turn in 4 units but not at a
+  constant rate — it is twice as steep at the diagonals). Shrink that factor and
+  you get angular stair-steps in the halo that no still frame makes obvious; the
+  crate's tests pin it against direct evaluation.
 - **Octave counts are derived, not fixed.** `planet_core::Lod` picks each fBm
   field's octave count from the disc's pixel radius, dropping octaves whose
   lattice cell falls under two pixels (past Nyquist — they can't be resolved, and

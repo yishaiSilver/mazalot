@@ -387,6 +387,30 @@ extreme zoom the tile also drops its secondary-fBm octaves (below the dither
 floor at that size) for a cheaper re-bake. The per-frame draw-order `Vec` and the
 star tile's 577 KB alloc are both gone (reused/cached).
 
+Caching does mean the cost arrives as a **spike**: most frames are a blit and one
+in ~5 pays the whole re-bake, so what matters for the star is the size of that
+one frame, not the average. Two things shrank it, and neither is the planets' fix
+— the star's fBm fields are so low-frequency that their octave counts are
+*already* under Nyquist at any scene radius:
+
+- **Its corona is the majority of the tile.** The halo annulus out to
+  `1 + corona_reach` radii is ~1.9× the disc's area, so ~65% of the shaded pixels
+  are corona (71.9k vs 38.0k at a 110 px radius) — and every one of them was
+  running a two-octave fBM and a `powf` to evaluate something that varies along
+  *one* axis. The streamers depend only on the angle around the limb, the falloff
+  only on the distance past it, and the disc's limb darkening only on `mu`, so
+  `sun_core::Shade` samples each along its own axis once per bake and interpolates.
+  Indexing the angular one needs a monotone angle, which `diamond_angle` gives for
+  a divide and a compare instead of an `atan2`.
+- **The old code recovered an angle with `atan2` only to feed it straight back
+  through `cos`/`sin`.** Out past the limb the unit direction is just `(nx, ny)/r`
+  — same field, three transcendentals cheaper, on those same 65% of pixels.
+
+Sun alone, in the browser at 1680×944, cap 110: **22.7 → 15.8 ms** per frame at a
+screen-filling zoom, **20.7 → 7.6 ms** when it overflows the viewport, with the
+re-bake spike roughly 59 → 38 ms. `sun-core`'s tests pin the tabulated fields
+against direct evaluation — exact to the byte from a 24 px radius up.
+
 Everything invalidates automatically the moment its key changes.
 
 **Zoomed-in planets.** Planets can't be tile-cached the way the star is — their
