@@ -173,3 +173,13 @@ pub extern "C" fn nearest_center(
     let cam = Camera { x: cam_x, y: cam_y, zoom };
     crate::planet_nearest_center(sys, w, h, &cam, t)
 }
+
+/// Freeze every planet's weather: 1 bakes each cloud deck once and reads it back
+/// per pixel (the default), 0 evaluates it live. Frozen is ~2x on a planet that
+/// fills the view, at the cost of the deck's billowing and its churning storms;
+/// the deck still rotates over the surface either way.
+#[no_mangle]
+pub extern "C" fn system_set_frozen_clouds(sys: *mut System, on: u32) {
+    let sys = unsafe { &mut *sys };
+    sys.set_frozen_clouds(on != 0);
+}

@@ -19,7 +19,9 @@
 //!     to its disc and lit from an arbitrary direction, ready for a compositor to
 //!     blit. This is what `solar` puts in orbit around its star.
 
-use std::f32::consts::{PI, TAU};
+use std::cell::RefCell;
+use std::f32::consts::{FRAC_PI_2, PI, TAU};
+use std::rc::Rc;
 
 pub use scene_core::Tile;
 
@@ -57,6 +59,14 @@ pub const F_STARFIELD: u32 = 8;
 pub const F_NIGHT_LOD: u32 = 16;
 /// OPTIMIZATION: run a domain warp's displacement fields at 2 octaves.
 pub const F_CHEAP_WARP: u32 = 32;
+/// OPTIMIZATION: freeze the cloud deck and read it from a baked map (see
+/// [`CloudMap`]). Costs the billowing and the churning storm cells; the deck
+/// still rotates over the surface at its own rate.
+///
+/// Deliberately NOT in [`F_ALL`]: it is the one switch here that changes the
+/// picture rather than the pixel budget, so the native generators keep the
+/// animated deck and `out/` stays byte-identical. The web demos opt in.
+pub const F_BAKED_CLOUDS: u32 = 64;
 /// Everything on — what every caller but the demo's ablation panel wants.
 pub const F_ALL: u32 = 63;
 
@@ -431,7 +441,291 @@ impl Lod {
     }
 }
 
-fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32, lod: Lod, feat: u32) -> (Rgb, f32) {
+// ---------------------------------------------------------------------------
+// Baked cloud deck (F_BAKED_CLOUDS)
+// ---------------------------------------------------------------------------
+//
+// The live deck costs 14 `value_noise` evaluations per pixel — a 4-octave
+// domain warp for the cloud tops (3 inner fields + 1 outer = 10) plus a plain
+// 4-octave field for the self-shadow (4). That is the single most expensive
+// thing on a cloudy planet, ~55% of a `terran` frame.
+//
+// All 14 collapse into two table reads the moment the deck stops *evolving*.
+// The deck already rotates at its own rate (2x the surface, so weather drifts
+// across the continents); what makes it per-frame work is the billowing morph
+// and the churning storm swirl, both driven by `angle`. Freeze those and the
+// density becomes a fixed function of a direction on the sphere — bakeable.
+//
+// The map is equirectangular in (longitude, y). y rather than latitude is
+// deliberate: the sphere point is (r·cos θ, y, r·sin θ) with r = √(1−y²), so a
+// row of the map is exactly a circle of constant y and the vertical axis needs
+// no transcendental at lookup time. It is also equal-area (Lambert), so texels
+// carry uniform detail instead of piling up at the poles.
+//
+// Stored as `u8`. The map feeds `smoothstep(0.52, 0.70, ·)`, an 0.18-wide ramp,
+// so one quantum of storage moves the result by 2.2% of the ramp — against a
+// dither step of 0.045 in the output, invisible.
+
+/// Where in its cycle the storm swirl is frozen.
+///
+/// Live, the eddies churn back and forth as `(angle · 0.6).sin()` — they spend
+/// most of the cycle part-wound and pass through 0 (no swirl at all) twice per
+/// turn. Baking the mean would straighten the cells out entirely, so this picks
+/// a well-wound state instead: high enough that the vortices read as storms,
+/// short of the peak where the tightest ones start to smear into rings.
+const STORM_STATIC: f32 = 0.7;
+
+/// Where the band shear is frozen.
+///
+/// `Base::Cloudy` shears the field along longitude by `(…).sin(angle)`, which
+/// is what makes its bands churn. Unlike the swirl there is nothing to lose by
+/// taking the zero of that cycle: the shear only *displaces* an already
+/// domain-warped field, so at zero the bands are exactly as turbulent, they
+/// just stop sliding past each other.
+const SHEAR_STATIC: f32 = 0.0;
+
+/// A frozen weather layer, equirectangular in (longitude, y) — see the notes
+/// above. Two kinds of planet get one, and a plane is empty when it does not
+/// apply:
+///
+/// * a **deck** over a solid surface (`clouds > 0`): `warp` is the
+///   domain-warped density that colours the cloud tops, `dens` the plain
+///   density the self-shadow reads.
+/// * a **shroud** that *is* the surface (`Base::Cloudy`): `shroud` is the
+///   finished band/turbulence mix factor, so the lookup lands one `mix` away
+///   from the pixel's colour.
+///
+/// Every plane covers the whole sphere, so one map serves every angle the
+/// planet will ever be seen at.
+struct CloudMap {
+    w: u32,
+    h: u32,
+    warp: Vec<u8>,
+    dens: Vec<u8>,
+    shroud: Vec<u8>,
+}
+
+/// Everything the baked layer depends on. `clouds` is absent on purpose — it
+/// only scales the deck's opacity after the lookup, so changing it re-uses the
+/// map. So is the light direction: the shadow tap moves, the field does not.
+/// The `f32`s that do matter are keyed by bit pattern, since `f32` is not `Eq`.
+#[derive(PartialEq, Clone, Copy)]
+struct CloudKey {
+    seed: u32,
+    w: u32,
+    /// `(octaves, warp inner, storm_cells)` — `None` when the planet has no deck.
+    deck: Option<(u32, u32, u32)>,
+    /// `(octaves, warp inner, bands, turb)` — `None` unless the base is `Cloudy`.
+    shroud: Option<(u32, u32, u32, u32)>,
+}
+
+impl CloudKey {
+    /// Heap the baked map will occupy — one `u8` plane per field it holds.
+    fn bytes(&self) -> usize {
+        let texels = (self.w * (self.w / 2)) as usize;
+        texels * (2 * self.deck.is_some() as usize + self.shroud.is_some() as usize)
+    }
+}
+
+/// How many baked layers to keep. A scene draws every planet in the system on
+/// the way to drawing one, so a one-deep cache would evict on every body and
+/// re-bake on the next — turning the optimization into a pessimization. Eight
+/// covers `solar`'s largest roster.
+const CLOUD_CACHE_SLOTS: usize = 8;
+
+/// ...but only up to a budget, because the slots are not the same size. Zoomed
+/// in, one map is 1 MB; eight of those is a heap growth in wasm for maps that
+/// are mostly off-screen. Whichever limit binds first wins.
+const CLOUD_CACHE_BYTES: usize = 12 << 20;
+
+thread_local! {
+    /// Per-thread, most-recently-used first. Native rendering fans frames across
+    /// rayon, so each worker bakes its own copies once and then reuses them for
+    /// every frame it is handed; wasm is single-threaded and bakes exactly once
+    /// per planet per zoom level.
+    static CLOUD_CACHE: RefCell<Vec<(CloudKey, Rc<CloudMap>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Map width for a disc of `rad` pixels, as a power of two.
+///
+/// The visible hemisphere is half the map, spread over `2·rad` pixels, so
+/// `w = 4·rad` puts one texel on one pixel. Rounding up to a power of two is
+/// what keeps solar's adaptive detail cap from re-baking on every nudge — the
+/// radius has to cross an octave before the key changes.
+fn cloud_map_w(rad: f32) -> u32 {
+    let want = (4.0 * rad).max(1.0);
+    let pow2 = 1u32 << (32 - (want as u32).leading_zeros()).min(31);
+    pow2.clamp(128, 1024)
+}
+
+/// The frozen layer for this planet, baked on first use and kept until the key
+/// moves. Returns `None` when the planet has no weather to freeze.
+fn cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, feat: u32, rad: f32) -> Option<Rc<CloudMap>> {
+    let deck = (ct.clouds > 0.0).then(|| {
+        let o = lod.cld(4);
+        (o, warp_inner(feat, o), ct.storm_cells.to_bits())
+    });
+    let shroud = (ct.base == Base::Cloudy).then(|| {
+        let o = lod.surf(5);
+        (o, warp_inner(feat, o), ct.bands.to_bits(), ct.turb.to_bits())
+    });
+    if deck.is_none() && shroud.is_none() {
+        return None; // nothing to freeze
+    }
+    let key = CloudKey { seed, w: cloud_map_w(rad), deck, shroud };
+    CLOUD_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        if let Some(i) = cache.iter().position(|(k, _)| *k == key) {
+            let hit = cache.remove(i);
+            let m = Rc::clone(&hit.1);
+            cache.insert(0, hit); // most-recently-used first
+            return Some(m);
+        }
+        // Evict before baking: at 1024x512 a map is 1 MB, and holding the old
+        // one while building the new one straddles a wasm heap growth.
+        let want = key.bytes();
+        while !cache.is_empty()
+            && (cache.len() >= CLOUD_CACHE_SLOTS
+                || cache.iter().map(|(k, _)| k.bytes()).sum::<usize>() + want > CLOUD_CACHE_BYTES)
+        {
+            cache.pop();
+        }
+        let m = Rc::new(bake_cloud_map(ct, seed, ofs, &key));
+        cache.insert(0, (key, Rc::clone(&m)));
+        Some(m)
+    })
+}
+
+fn bake_cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], key: &CloudKey) -> CloudMap {
+    let w = key.w;
+    let h = w / 2;
+    let n = (w * h) as usize;
+    let sized = |on: bool| if on { vec![0u8; n] } else { Vec::new() };
+    let (mut warp, mut dens) = (sized(key.deck.is_some()), sized(key.deck.is_some()));
+    let mut shroud = sized(key.shroud.is_some());
+    // Vortex centers, hoisted: they are per-seed constants, and the live path
+    // pays for them per pixel.
+    let mut vort = [(0.0f32, 0.0f32); 2];
+    for k in 0..2 {
+        vort[k] = (
+            (hash3(seed as i32, k as i32 * 7 + 1, 3) * 2.0 - 1.0) * 1.6 + ofs[0],
+            (hash3(seed as i32, k as i32 * 7 + 2, 3) * 2.0 - 1.0) * 1.6 + ofs[2],
+        );
+    }
+    for j in 0..h {
+        let y = -1.0 + 2.0 * (j as f32 + 0.5) / h as f32;
+        let r = (1.0 - y * y).max(0.0).sqrt();
+        for i in 0..w {
+            let lon = TAU * (i as f32 + 0.5) / w as f32;
+            let (sl, cl) = lon.sin_cos();
+            let (sx, sz) = (r * cl, r * sl);
+            let t = (j * w + i) as usize;
+
+            if let Some((oct, inner, _)) = key.deck {
+                let (mut cx3, mut cz3) = (sx + ofs[0], sz + ofs[2]);
+                if ct.storm_cells > 0.0 {
+                    for (vx, vz) in vort {
+                        let (dx, dz) = (cx3 - vx, cz3 - vz);
+                        let fall = (-(dx * dx + dz * dz) * 2.2).exp();
+                        let (ss, sc) = (fall * STORM_STATIC * 1.6 * ct.storm_cells).sin_cos();
+                        cx3 = vx + dx * sc - dz * ss;
+                        cz3 = vz + dx * ss + dz * sc;
+                    }
+                }
+                let py = y * 2.8 + ofs[1];
+                warp[t] = q8(fbm_warp_inner(cx3 * 2.8, py, cz3 * 2.8, oct, inner, 0.9));
+                dens[t] = q8(fbm(cx3 * 2.8, py, cz3 * 2.8, oct));
+            }
+
+            if let Some((oct, inner, _, _)) = key.shroud {
+                // The whole of `Base::Cloudy`'s mix factor, not just its noise:
+                // `band` folds in only `y` and the field, both of which are
+                // known here, so the per-pixel cost collapses to one `mix`.
+                let (px, py, pz) = (sx + ofs[0], y + ofs[1], sz + ofs[2]);
+                let flow = (0.5 + 0.3 * (y * 3.0).cos()) * SHEAR_STATIC;
+                let tv = fbm_warp_inner((px + flow) * 2.0, py * 2.0, pz * 2.0, oct, inner, 0.7);
+                let band = 0.5 + 0.5 * (y * ct.bands + (tv - 0.5) * 6.0 * ct.turb).sin();
+                shroud[t] = q8(band * 0.6 + tv * 0.4);
+            }
+        }
+    }
+    CloudMap { w, h, warp, dens, shroud }
+}
+
+#[inline(always)]
+fn q8(v: f32) -> u8 {
+    (clamp01(v) * 255.0 + 0.5) as u8
+}
+
+/// Longitude of `(x, z)` as a **turn** in `[-0.5, 0.5)` — `atan2(z, x) / τ`.
+///
+/// The one place this is used is a bilinear index into [`CloudMap`], so what
+/// matters is the error in texels, not in radians. The classic minimax cubic in
+/// `a²` peaks at 2.0e-4 rad (measured, at the 45° fold where the two branches
+/// meet and the error is a small step rather than a wobble). At the widest map
+/// this builds, 1024 texels to the turn, that is 0.034 of a texel — a fortieth
+/// of the filter's own smoothing, and far under the `u8` a texel is stored in.
+/// libm's correctly-rounded `atan2f` is the wrong tool for that, and it was 6%
+/// of a baked frame.
+///
+/// Plain `f32` arithmetic with no FMA, so wasm and native agree bit-for-bit —
+/// the same rule `noise-core`'s `lanes.rs` documents.
+#[inline(always)]
+fn atan2_turns(z: f32, x: f32) -> f32 {
+    const C: [f32; 3] = [-0.046_496_474, 0.159_314_22, -0.327_622_76];
+    let (ax, az) = (x.abs(), z.abs());
+    // Ratio of the smaller to the larger keeps the polynomial on [0, 1]. The
+    // max() is the origin guard: both zero yields 0, an arbitrary but finite
+    // longitude for a point that has none.
+    let (num, den, folded) = if ax >= az { (az, ax, false) } else { (ax, az, true) };
+    let a = num / den.max(f32::MIN_POSITIVE);
+    let s = a * a;
+    let mut r = ((C[0] * s + C[1]) * s + C[2]) * s * a + a; // atan(a), a in [0,1]
+    if folded {
+        r = FRAC_PI_2 - r;
+    }
+    if x < 0.0 {
+        r = PI - r;
+    }
+    if z < 0.0 {
+        r = -r;
+    }
+    r * (1.0 / TAU)
+}
+
+impl CloudMap {
+    /// Bilinear fetch. `u` is a turn about the axis (any real — it wraps), `v`
+    /// is `y` remapped to 0..1 and clamps, since there is nothing past a pole.
+    #[inline(always)]
+    fn sample(&self, tab: &[u8], u: f32, v: f32) -> f32 {
+        let fx = (u - u.floor()) * self.w as f32 - 0.5; // wrap first: fx > -1
+        let fy = (v * self.h as f32 - 0.5).clamp(0.0, self.h as f32 - 1.0);
+        let (x0, y0) = (fx.floor(), fy.floor());
+        let (tx, ty) = (fx - x0, fy - y0);
+        let xa = if x0 < 0.0 { self.w - 1 } else { x0 as u32 };
+        let xb = if xa + 1 >= self.w { 0 } else { xa + 1 };
+        let ya = y0 as u32;
+        let yb = (ya + 1).min(self.h - 1);
+        let (ra, rb) = ((ya * self.w) as usize, (yb * self.w) as usize);
+        let (xa, xb) = (xa as usize, xb as usize);
+        let top = lerp(tab[ra + xa] as f32, tab[ra + xb] as f32, tx);
+        let bot = lerp(tab[rb + xa] as f32, tab[rb + xb] as f32, tx);
+        lerp(top, bot, ty) * (1.0 / 255.0)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn surface(
+    ct: &PType,
+    sx: f32,
+    sy: f32,
+    sz: f32,
+    ofs: [f32; 3],
+    angle: f32,
+    lod: Lod,
+    feat: u32,
+    baked: Option<&CloudMap>,
+) -> (Rgb, f32) {
     let (px, py, pz) = (sx + ofs[0], sy + ofs[1], sz + ofs[2]);
     let (mut col, mut emis) = match ct.base {
         Base::Terrestrial => {
@@ -486,12 +780,21 @@ fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32, lod
         }
         Base::Cloudy => {
             // Storm bands churn: latitude-dependent shear + domain warp for
-            // roiling, fluid-looking cloud cover.
-            let flow = (0.5 + 0.3 * (sy * 3.0).cos()) * angle.sin();
-            let o = lod.surf(5);
-            let t = fbm_warp_inner((px + flow) * 2.0, py * 2.0, pz * 2.0, o, warp_inner(feat, o), 0.7);
-            let band = 0.5 + 0.5 * (sy * ct.bands + (t - 0.5) * 6.0 * ct.turb).sin();
-            (mix(ct.dark, ct.light, clamp01(band * 0.6 + t * 0.4)), 0.0)
+            // roiling, fluid-looking cloud cover. On a shrouded world this IS
+            // the weather, so it is what F_BAKED_CLOUDS freezes here — and the
+            // baked plane already holds the finished mix factor, so the frozen
+            // path is a table read and nothing else.
+            let f = match baked.filter(|m| !m.shroud.is_empty()) {
+                Some(m) => m.sample(&m.shroud, atan2_turns(sz, sx), (sy + 1.0) * 0.5),
+                None => {
+                    let flow = (0.5 + 0.3 * (sy * 3.0).cos()) * angle.sin();
+                    let o = lod.surf(5);
+                    let t = fbm_warp_inner((px + flow) * 2.0, py * 2.0, pz * 2.0, o, warp_inner(feat, o), 0.7);
+                    let band = 0.5 + 0.5 * (sy * ct.bands + (t - 0.5) * 6.0 * ct.turb).sin();
+                    clamp01(band * 0.6 + t * 0.4)
+                }
+            };
+            (mix(ct.dark, ct.light, f), 0.0)
         }
     };
 
@@ -726,8 +1029,8 @@ fn render_ct(size: u32, ct: &PType, seed: u32, angle: f32, style: &Style, out: &
 /// The style a scene sprite renders with: natural palette, the house dither, and
 /// no orbiting moons — a scene composites its own bodies, and moons would inflate
 /// every tile by a third to gain a one-pixel speck.
-fn tile_style() -> Style {
-    Style { palette: 0, dither: 0.7, moons: false, feat: F_ALL }
+fn tile_style(feat: u32) -> Style {
+    Style { palette: 0, dither: 0.7, moons: false, feat }
 }
 
 /// Render one planet as a **sprite tile**: the same shader as [`render_rgba`],
@@ -745,6 +1048,22 @@ fn tile_style() -> Style {
 /// bites when a body is zoomed in far enough to be expensive; below that the
 /// tile is bit-identical either way. Pass `false` for reference output.
 pub fn render_tile(type_idx: usize, seed: u32, angle: f32, light: [f32; 3], rad_px: f32, lod_enabled: bool) -> Tile {
+    render_tile_features(type_idx, seed, angle, light, rad_px, lod_enabled, F_ALL)
+}
+
+/// [`render_tile`] with the feature switches exposed — the scene framing's
+/// counterpart to [`render_rgba_features`]. A scene wants this for one bit in
+/// particular: [`F_BAKED_CLOUDS`], which is not in [`F_ALL`].
+#[allow(clippy::too_many_arguments)]
+pub fn render_tile_features(
+    type_idx: usize,
+    seed: u32,
+    angle: f32,
+    light: [f32; 3],
+    rad_px: f32,
+    lod_enabled: bool,
+    feat: u32,
+) -> Tile {
     let ct = &TYPES[type_idx % TYPES.len()];
     // Rings reach `ring_outer` disc radii sideways; a plain world needs only a
     // pixel of slack for its dark limb. `radius_scale` — which shrinks a ringed
@@ -754,7 +1073,7 @@ pub fn render_tile(type_idx: usize, seed: u32, angle: f32, light: [f32; 3], rad_
     let size = (((rad_px + margin) * 2.0).ceil() as u32).max(6);
     let mut px = vec![0u8; (size * size * 4) as usize];
     let frame = Frame { size, rad: rad_px, light, sprite: true, lod: Lod::for_size(size, lod_enabled) };
-    render_frame(&frame, ct, seed, angle, &tile_style(), &mut px);
+    render_frame(&frame, ct, seed, angle, &tile_style(feat), &mut px);
     Tile { px, size }
 }
 
@@ -780,6 +1099,15 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
     let has_atmo = ct.atmo != [0.0; 3];
     let rad = fr.rad;
     const RING_SQUASH: f32 = 0.38;
+
+    // Bake the frozen deck once, outside the loop. `cld`/`warp_inner` are the
+    // same octave counts the live path would have used, so the two agree on
+    // detail and differ only in that this one does not move.
+    let cloud_bake = if style.feat & F_BAKED_CLOUDS != 0 {
+        cloud_map(ct, seed, ofs, lod, style.feat, rad)
+    } else {
+        None
+    };
 
     // Precompute orbiting moons (mx, my, radius, depth, seed).
     let mut moons: [(f32, f32, f32, f32, f32); 2] = [(0.0, 0.0, 0.0, 0.0, 0.0); 2];
@@ -850,47 +1178,89 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                 // then snapped to 22 levels, so the fine octaves and the cloud
                 // layer cannot survive into the output. Drop them there.
                 let night = night_ok && diff <= 0.0 && (ct.aurora == 0.0 || sy.abs() < 0.52);
-                let (mut col, emis) =
-                    surface(ct, sx, sy, sz, ofs, angle, if night { LOD_NIGHT } else { lod }, style.feat);
+                // The night path drops surface octaves, which the map was not
+                // baked at — so past the terminator the shroud goes live. Both
+                // `Cloudy` types have lightning and so never take that path;
+                // this is belt and braces for a future row that does not.
+                let (mut col, emis) = surface(
+                    ct,
+                    sx,
+                    sy,
+                    sz,
+                    ofs,
+                    angle,
+                    if night { LOD_NIGHT } else { lod },
+                    style.feat,
+                    if night { None } else { cloud_bake.as_deref() },
+                );
                 if ct.clouds > 0.0 && !night {
-                    // Clouds drift over the surface (2x = parallax, loops) and
-                    // slowly billow — a periodic morph reveals new cloud structure
-                    // so weather forms and dissipates rather than sliding rigidly.
+                    // The deck rotates at 2x the surface either way — that is
+                    // the parallax that makes weather read as a separate layer,
+                    // and it loops. What the two paths disagree about is whether
+                    // the field itself also evolves as it turns.
                     let (cs, cc) = (angle * 2.0).sin_cos();
-                    let mut cx3 = nx * cc + nz * cs + ofs[0];
-                    let mut cz3 = -nx * cs + nz * cc + ofs[2];
-                    let morph = angle.sin() * 0.6;
+                    let (cloud, sh) = if let Some(m) = cloud_bake.as_deref().filter(|m| !m.warp.is_empty()) {
+                        // Frozen: one direction on the sphere, two table reads.
+                        // `ofs` is folded into the bake, so what the map wants
+                        // is the bare rotated sphere point.
+                        let px = nx * cc + nz * cs;
+                        let pz = -nx * cs + nz * cc;
+                        let v = (ny + 1.0) * 0.5;
+                        let cloud = m.sample(&m.warp, atan2_turns(pz, px), v);
+                        let sh = if style.feat & F_CLOUD_SHADOW == 0 {
+                            1.0
+                        } else {
+                            // The live shadow reads the plain field 0.45 toward
+                            // the light, which steps off the sphere. The map
+                            // holds directions only, so the displaced point is
+                            // read at its own longitude and the same y: the
+                            // tangential half of the same offset, which is the
+                            // half that moves the shadow across the deck.
+                            let (qx, qz) = (px + l[0] * 0.45, pz + l[2] * 0.45);
+                            let shadow = smoothstep(0.55, 0.72, m.sample(&m.dens, atan2_turns(qz, qx), v));
+                            1.0 - 0.22 * shadow * ct.clouds
+                        };
+                        (cloud, sh)
+                    } else {
+                        // Live: the deck also slowly billows — a periodic morph
+                        // reveals new structure so weather forms and dissipates
+                        // rather than sliding rigidly.
+                        let mut cx3 = nx * cc + nz * cs + ofs[0];
+                        let mut cz3 = -nx * cs + nz * cc + ofs[2];
+                        let morph = angle.sin() * 0.6;
 
-                    // Rotating storm cells: swirl the cloud field around a couple
-                    // of seeded vortex centers, spinning with the animation.
-                    if ct.storm_cells > 0.0 {
-                        for k in 0..2 {
-                            let vx = (hash3(seed as i32, k * 7 + 1, 3) * 2.0 - 1.0) * 1.6 + ofs[0];
-                            let vz = (hash3(seed as i32, k * 7 + 2, 3) * 2.0 - 1.0) * 1.6 + ofs[2];
-                            let (dx, dz) = (cx3 - vx, cz3 - vz);
-                            let fall = (-(dx * dx + dz * dz) * 2.2).exp();
-                            // Bounded (periodic) swirl: the eddy churns back and forth
-                            // rather than winding into ever-tighter rings as `angle`
-                            // grows unbounded on the continuously-running web.
-                            let sw = fall * (angle * 0.6).sin() * 1.6 * ct.storm_cells;
-                            let (ss, sc) = sw.sin_cos();
-                            cx3 = vx + dx * sc - dz * ss;
-                            cz3 = vz + dx * ss + dz * sc;
+                        // Rotating storm cells: swirl the cloud field around a couple
+                        // of seeded vortex centers, spinning with the animation.
+                        if ct.storm_cells > 0.0 {
+                            for k in 0..2 {
+                                let vx = (hash3(seed as i32, k * 7 + 1, 3) * 2.0 - 1.0) * 1.6 + ofs[0];
+                                let vz = (hash3(seed as i32, k * 7 + 2, 3) * 2.0 - 1.0) * 1.6 + ofs[2];
+                                let (dx, dz) = (cx3 - vx, cz3 - vz);
+                                let fall = (-(dx * dx + dz * dz) * 2.2).exp();
+                                // Bounded (periodic) swirl: the eddy churns back and forth
+                                // rather than winding into ever-tighter rings as `angle`
+                                // grows unbounded on the continuously-running web.
+                                let sw = fall * (angle * 0.6).sin() * 1.6 * ct.storm_cells;
+                                let (ss, sc) = sw.sin_cos();
+                                cx3 = vx + dx * sc - dz * ss;
+                                cz3 = vz + dx * ss + dz * sc;
+                            }
                         }
-                    }
 
-                    let dens = |ox: f32, oz: f32| {
-                        fbm((cx3 + ox) * 2.8, ny * 2.8 + ofs[1] + morph, (cz3 + oz) * 2.8 + morph, lod.cld(4))
-                    };
-                    // Wispy, fractal cloud tops (domain-warped) so they break into
-                    // ragged fronts instead of clumping into round blobs. Shadow
-                    // uses the cheap plain density.
-                    let co = lod.cld(4);
-                    let cloud = fbm_warp_inner(cx3 * 2.8, ny * 2.8 + ofs[1] + morph, cz3 * 2.8 + morph, co, warp_inner(style.feat, co), 0.9);
+                        let dens = |ox: f32, oz: f32| {
+                            fbm((cx3 + ox) * 2.8, ny * 2.8 + ofs[1] + morph, (cz3 + oz) * 2.8 + morph, lod.cld(4))
+                        };
+                        // Wispy, fractal cloud tops (domain-warped) so they break into
+                        // ragged fronts instead of clumping into round blobs. Shadow
+                        // uses the cheap plain density.
+                        let co = lod.cld(4);
+                        let cloud = fbm_warp_inner(cx3 * 2.8, ny * 2.8 + ofs[1] + morph, cz3 * 2.8 + morph, co, warp_inner(style.feat, co), 0.9);
 
-                    let sh = if style.feat & F_CLOUD_SHADOW == 0 { 1.0 } else {
-                        let shadow = smoothstep(0.55, 0.72, dens(l[0] * 0.45, l[2] * 0.45));
-                        1.0 - 0.22 * shadow * ct.clouds
+                        let sh = if style.feat & F_CLOUD_SHADOW == 0 { 1.0 } else {
+                            let shadow = smoothstep(0.55, 0.72, dens(l[0] * 0.45, l[2] * 0.45));
+                            1.0 - 0.22 * shadow * ct.clouds
+                        };
+                        (cloud, sh)
                     };
                     col = [col[0] * sh, col[1] * sh, col[2] * sh];
 
@@ -991,5 +1361,74 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
             out[idx + 2] = (clamp01(px[2]) * 255.0) as u8;
             out[idx + 3] = if fr.sprite { (clamp01(a) * 255.0) as u8 } else { 255 };
         }
+    }
+}
+
+#[cfg(test)]
+mod cloud_tests {
+    use super::*;
+
+    /// The fast longitude has to be good to well under a texel of the widest
+    /// map (1024), or the frozen deck would shear along the seam where the
+    /// approximation's fold sits.
+    #[test]
+    fn atan2_turns_tracks_libm() {
+        let mut worst: f32 = 0.0;
+        for i in 0..2000 {
+            let a = (i as f32 / 2000.0) * TAU - PI;
+            // Sweep radii too: the polynomial is fed a ratio, so a near-axis
+            // point is a different case from a diagonal one.
+            for &r in &[1.0f32, 0.05, 8.0] {
+                let (x, z) = (r * a.cos(), r * a.sin());
+                let want = z.atan2(x) * (1.0 / TAU);
+                let got = atan2_turns(z, x);
+                // Both wrap at ±0.5; compare the shorter way round.
+                let d = (got - want).abs();
+                worst = worst.max(d.min(1.0 - d));
+            }
+        }
+        // 1024 texels to the turn, so a texel is 9.8e-4 of a turn. The cubic
+        // lands at 3.3e-5 (2.0e-4 rad); the bound is where it stops being
+        // negligible against the bilinear filter, not where it sits today.
+        assert!(worst < 1.0e-4, "worst {worst} turns");
+    }
+
+    #[test]
+    fn atan2_turns_handles_axes_and_origin() {
+        for (z, x, want) in [(0.0, 1.0, 0.0), (1.0, 0.0, 0.25), (0.0, -1.0, 0.5), (-1.0, 0.0, -0.25)] {
+            let got: f32 = atan2_turns(z, x);
+            assert!((got - want).abs() < 1e-5, "atan2_turns({z}, {x}) = {got}, want {want}");
+        }
+        assert!(atan2_turns(0.0, 0.0).is_finite());
+    }
+
+    /// A bilinear fetch dead on a texel centre must return that texel, and the
+    /// longitude axis must wrap rather than clamp — a clamped seam would show
+    /// as a stationary band down the middle of every planet.
+    #[test]
+    fn cloud_map_sampling_is_exact_and_wraps() {
+        let m = CloudMap { w: 4, h: 2, warp: vec![0, 64, 128, 255, 10, 20, 30, 40], dens: vec![], shroud: vec![] };
+        for i in 0..4 {
+            let u = (i as f32 + 0.5) / 4.0;
+            let got = m.sample(&m.warp, u, 0.25);
+            assert!((got - m.warp[i] as f32 / 255.0).abs() < 1e-6, "texel {i}: {got}");
+        }
+        // Half a texel before column 0 blends columns 3 and 0, not 0 and 0.
+        let seam = m.sample(&m.warp, 0.0, 0.25);
+        let want = (255.0 + 0.0) / 2.0 / 255.0;
+        assert!((seam - want).abs() < 1e-6, "seam {seam}, want {want}");
+        // And a whole turn later is the same place.
+        assert_eq!(m.sample(&m.warp, 0.0, 0.25), m.sample(&m.warp, 1.0, 0.25));
+        assert_eq!(m.sample(&m.warp, 0.3, 0.25), m.sample(&m.warp, -0.7, 0.25));
+    }
+
+    /// The map is the whole sphere, so one bake serves every angle — and the
+    /// cache must not rebuild for a change that cannot move it.
+    #[test]
+    fn cloud_map_cache_keys_on_what_it_depends_on() {
+        let w = cloud_map_w(128.0);
+        assert_eq!(w, cloud_map_w(200.0), "same octave of radius must reuse the bake");
+        assert!(cloud_map_w(4096.0) <= 1024, "capped");
+        assert!(cloud_map_w(1.0) >= 128, "floored");
     }
 }

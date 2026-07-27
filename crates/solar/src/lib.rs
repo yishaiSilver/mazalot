@@ -246,6 +246,17 @@ pub struct System {
     // Thin planet-tile fBm octaves once a tile passes 200px. Off changes nothing
     // until a body is zoomed in far enough to be expensive. See `render_tile`.
     pub lod: bool,
+    // Freeze each planet's weather into a baked map instead of evaluating it per
+    // pixel per frame — ~2x on a cloudy world, ~2.6x on a shrouded one, at the
+    // cost of the deck's billowing and its churning storm cells. The deck still
+    // rotates over the surface. See `planet_core::F_BAKED_CLOUDS`.
+    //
+    // OFF by default, and deliberately: this is the one switch here that changes
+    // the picture rather than the pixel budget, so the native generators keep the
+    // animated deck and `out/` stays byte-identical. The web demo turns it on at
+    // construction — it runs continuously and is shader-bound, which is the case
+    // the trade was made for.
+    pub frozen_clouds: bool,
     // Cached backdrop (background + orbit paths) + the key it was rendered for,
     // reused by `render_system_cached` while the camera/view is unchanged.
     bg_cache: Vec<u8>,
@@ -359,7 +370,7 @@ impl System {
             seed, sun_kind, sun_radius, planets,
             spacing: 1.0, planet_size: 1.0, sun_size: 1.0, planet_pixel: 1.0, sun_pixel: 1.0,
             planet_detail: 160.0, sun_detail: 110.0, star_density: 0.5, star_parallax: 1.0,
-            orbit_width: 1.0, ecc: 1.0, lod: true,
+            orbit_width: 1.0, ecc: 1.0, lod: true, frozen_clouds: false,
             bg_cache: Vec::new(), bg_key: None,
             neb: RefCell::new(BackdropCache::default()),
             sun_tile: RefCell::new(SunCache::default()),
@@ -420,6 +431,14 @@ impl System {
     /// the reference image and the thing worth A/B-ing against.
     pub fn set_lod(&mut self, on: bool) {
         self.lod = on;
+    }
+
+    /// Freeze the weather. `true` bakes each planet's cloud deck once and reads
+    /// it back per pixel; `false` (the default) evaluates it live, which is what
+    /// the native generators do and the picture to A/B against. The web demo
+    /// switches it on at construction.
+    pub fn set_frozen_clouds(&mut self, on: bool) {
+        self.frozen_clouds = on;
     }
 
     /// The outermost extent (world units) with the current view multipliers —
@@ -647,7 +666,7 @@ pub fn planet_pos_of(sys: &System, i: usize, t: f32) -> (f32, f32) {
 /// One planet's memoized tile plus the key it was rendered for.
 #[derive(Default)]
 struct PlanetTile {
-    key: Option<[i64; 4]>,
+    key: Option<[i64; 5]>,
     tile: Option<Tile>,
 }
 
@@ -743,11 +762,20 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
             let rad_render = (rad_px / sys.planet_pixel).clamp(2.0, maxr);
             // Quantize each axis to one pixel of movement at this radius: a
             // tile that would land on the same pixels is the same tile.
+            //
+            // The two RENDER-MODE flags belong in the key as much as the
+            // geometry does. Without them, flipping a toggle keeps serving the
+            // tile rendered under the old one until the planet happens to move
+            // a pixel — so the demo's checkboxes looked dead on a slow world,
+            // and an A/B measured the cache instead of the change.
+            let feat = planet_core::F_ALL
+                | if sys.frozen_clouds { planet_core::F_BAKED_CLOUDS } else { 0 };
             let key = [
                 rad_render.round() as i64,
                 (spin_a * rad_render) as i64,
                 (light[1].atan2(light[0]) * rad_render) as i64,
                 p.ptype as i64,
+                feat as i64 | (sys.lod as i64) << 32,
             ];
             let mut cache = sys.planet_tiles.borrow_mut();
             if cache.len() != sys.planets.len() {
@@ -760,7 +788,15 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
                 // clock always advances — holding both alive costs the
                 // allocator its hot block and measured ~9% on `solar`'s bin.
                 drop(slot.tile.take());
-                slot.tile = Some(planet_core::render_tile(p.ptype, p.seed, spin_a, light, rad_render, sys.lod));
+                slot.tile = Some(planet_core::render_tile_features(
+                    p.ptype,
+                    p.seed,
+                    spin_a,
+                    light,
+                    rad_render,
+                    sys.lod,
+                    feat,
+                ));
                 slot.key = Some(key);
             }
             blit(out, w, h, slot.tile.as_ref().unwrap(), sx, sy, rad_px / rad_render);

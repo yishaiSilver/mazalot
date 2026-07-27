@@ -100,6 +100,7 @@ stretching, and a full 360° spin loops seamlessly.
 
 ### Animated weather (loop-safe)
 - **Clouds** — domain-warped wispy fronts that drift and billow; cast soft shadows.
+  (The web demos freeze the billowing by default — see *Frozen weather*.)
 - **Gas-giant bands** — counter-rotating zonal jets + domain warp (fluid, not a sine wobble).
 - **Great spot** — a drifting spiral cyclone with a calm eye.
 - **Lightning** — small, irregular, randomized-color flashes on storm worlds.
@@ -504,6 +505,64 @@ spot 16%, `lava` is specular 19% and nothing else, `barren` has no feature above
 For comparison the same panel reports what the optimizations are worth in this
 framing: cheap warp saves 19% on `terran`, 31% on `gas_giant`, 51% on
 `storm_shroud`; night-side thinning saves 4% on `terran`, 11% on `ocean`.
+
+### Frozen weather
+
+The cost table above says a cloudy world *is* its cloud deck. Per pixel the deck
+is 14 `value_noise` evaluations — a 4-octave domain warp for the tops (3 inner
+displacement fields + 1 outer) plus a plain 4-octave field for the self-shadow.
+All 14 collapse into two table reads the moment the deck stops **evolving**.
+
+The deck already turns at 2× the surface, which is the parallax that makes
+weather read as its own layer. What costs per-frame work is not the rotation but
+the billowing (a periodic morph) and the churning storm cells — both driven by
+`angle`. Freeze those and the density becomes a fixed function of a direction on
+the sphere, so it can be baked once into an equirectangular map in
+(longitude, y) and sampled for every frame after.
+
+`y` rather than latitude is deliberate: a sphere point is
+`(r·cos θ, y, r·sin θ)` with `r = √(1−y²)`, so a map row is exactly a circle of
+constant `y` and the vertical axis costs no transcendental at lookup time. It is
+also equal-area, so texels carry uniform detail instead of piling up at the
+poles. The map is `u8` — it feeds an 0.18-wide `smoothstep`, so one quantum
+moves the result by 2.2% of that ramp against a dither step of 0.045. Width is
+`4·rad` rounded up to a power of two and capped at 1024, which puts about one
+texel on one pixel and lets the adaptive detail cap nudge the radius without
+re-baking.
+
+Two kinds of planet get one, and the second is the bigger win:
+
+| | what is frozen | native | wasm |
+|---|---|---:|---:|
+| **deck** over a solid surface (`clouds > 0`) | the tops + the shadow field | 1.85–1.96× | 1.6–1.7× |
+| **shroud** that *is* the surface (`Base::Cloudy`) | the whole band/turbulence mix factor, so the lookup lands one `mix` from the pixel | 2.6× | 1.76–1.85× |
+
+The shrouded worlds do better because their entire surface algorithm collapses
+into the plane — the baked value is the finished mix factor, not an input to
+more math. wasm gains less than native across the board: its noise kernels are
+four-lane SIMD while the table read is scalar byte loads, so the thing being
+replaced was relatively cheaper there to begin with.
+
+In the scene, following a cloudy planet that fills a 1000×640 view:
+**59.3 → 29.9 ms, 17 → 33 fps (1.98×)**.
+
+The bake costs about five frames and then pays for the rest of the animation —
+that ratio holds at every size, because the map scales with the render. It is
+kept in a small per-thread LRU (8 slots / 12 MB); a scene draws every planet on
+the way to drawing one, so a one-deep cache would evict on every body and
+re-bake on the next, turning the optimization into a pessimization.
+
+What it costs to look at: on `terran`, 17.7% of pixels move by a mean of
+6.8/255. That number is not blur — the map is built at the same octave count the
+live path would have used, so the deck is exactly as detailed. It is a
+*different* sky: frozen at one phase, with storm cells wound to a fixed state
+(`STORM_STATIC`) rather than churning. Worlds with thinner decks move less
+(`tundra` 8.9%, `desert` 5.6%).
+
+Because it changes the picture rather than the pixel budget, `F_BAKED_CLOUDS` is
+**not** in `F_ALL`. The native generators keep the animated deck and `out/` is
+byte-identical; the three web demos turn it on at construction, behind a
+checkbox in each (`Frozen weather`, and `Frozen cloud deck` in the planet lab).
 
 ### Shader experiments
 

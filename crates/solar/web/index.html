@@ -161,6 +161,8 @@
     <div class="ctl"><label>Sun detail cap <b id="sdetV">110</b></label><input type="range" id="sdet" min="16" max="176" step="8" value="110" /></div>
     <div class="ctl"><label for="lod">Octave LOD on big tiles <b id="lodV">on</b></label>
       <input type="checkbox" id="lod" checked style="width:auto;accent-color:#f4b74a;cursor:pointer" /></div>
+    <div class="ctl"><label for="froz">Frozen weather <b id="frozV">on</b></label>
+      <input type="checkbox" id="froz" checked style="width:auto;accent-color:#f4b74a;cursor:pointer" /></div>
 
     <div class="grp">Background</div>
     <div class="ctl"><label>Star density <b id="sdenV">0.50×</b></label><input type="range" id="sden" min="0" max="2" step="0.05" value="0.5" /></div>
@@ -301,6 +303,7 @@ function buildSystem() {
   if (sys) wasm.system_set_orbit_width(sys, vOrbitW);
   if (sys) wasm.system_set_eccentricity(sys, vEcc);
   if (sys) wasm.system_set_lod(sys, $("lod").checked ? 1 : 0);
+  if (sys) wasm.system_set_frozen_clouds(sys, $("froz").checked ? 1 : 0);
   $("sysinfo").textContent = `${SUN_NAMES[sunKind] ?? "star"} · ${nPlanets} planets · seed ${seed}`;
 }
 
@@ -554,6 +557,16 @@ $("lod").addEventListener("change", () => {
   const on = $("lod").checked;
   $("lodV").textContent = on ? "on" : "off";
   if (sys) wasm.system_set_lod(sys, on ? 1 : 0);
+});
+
+// Frozen weather: bakes each planet's cloud deck once and reads it back per
+// pixel instead of evaluating ~14 noise octaves there every frame. ~2x on a
+// planet that fills the view. Off restores the billowing and the churning storm
+// cells — zoom into a cloudy world and toggle it to see both halves of the deal.
+$("froz").addEventListener("change", () => {
+  const on = $("froz").checked;
+  $("frozV").textContent = on ? "on" : "off";
+  if (sys) wasm.system_set_frozen_clouds(sys, on ? 1 : 0);
 });
 
 $("auto").addEventListener("change", () => {

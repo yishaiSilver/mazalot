@@ -161,6 +161,26 @@ Run wasm builds **from the repo root** so `.cargo/config.toml` applies. It adds
   index. A closure that accumulates across frames would silently produce garbage.
   The scene bins are the exception and stay serial: their `System`/`Belt`/`Scene`
   holds `RefCell` caches and is not `Sync` on purpose.
+- **`F_BAKED_CLOUDS` is deliberately outside `F_ALL`.** Every other `F_*` bit is
+  either a feature the ablation panel switches off or an optimization that is
+  invisible; this one changes the picture (frozen weather) to buy ~2x. Keeping it
+  out of `F_ALL` is what lets `out/` stay byte-identical while the web demos run
+  with it. `System::frozen_clouds` / `MoonSystem::frozen_clouds` default to
+  `false` for the same reason — the JS turns them on at construction.
+- **A render-mode flag has to be in the tile memo key.** `solar` caches a
+  planet's last tile against its geometry; a flag that changes how the tile is
+  rendered but not where it lands will otherwise keep serving the old tile until
+  the planet happens to move a pixel. That made the demo's checkboxes look dead
+  on a slow world, and made an A/B measure the cache. `lod` and `frozen_clouds`
+  are both folded in now.
+- **Timing a scene means putting the body on screen and keeping the memo
+  missing.** Three different ways to get this wrong, all of which produce a
+  confident number: a camera parked where a planet started drifts off it within a
+  few frames and then you are timing the backdrop (`solar`'s bench printed 0.28 ms
+  for a scenario whose real cost is 40 ms); a camera that jumps far each frame
+  re-bakes the backdrop and buries the body under it; and a time step too small to
+  move the tile past its memo key means the shader never runs at all. Use
+  `ms_follow` in `solar`'s bench as the template.
 - **Vector code is not automatically faster inlined.** `value_noise` runs ~28×
   per pixel and had to be `#[inline(never)]` *on the vector path only* to stop
   its `v128` temporaries spilling in the pixel loop — inlined it was slower than

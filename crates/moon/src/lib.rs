@@ -173,6 +173,13 @@ pub struct MoonSystem {
     pub parent_spin: f32,   // parent axial-spin turns per unit time
     pub moons: Vec<Moon>,
     pub orbit_width: f32,   // dashed orbit line thickness, px (1..=6)
+    // Freeze the parent's weather into a baked map rather than evaluating it per
+    // pixel per frame. The parent fills the view here, so it is the whole cost of
+    // the demo. See `planet_core::F_BAKED_CLOUDS`.
+    //
+    // OFF by default so `out/moon.gif` keeps the animated deck and stays
+    // byte-identical; the web demo turns it on at construction.
+    pub frozen_clouds: bool,
 }
 
 impl MoonSystem {
@@ -219,7 +226,7 @@ impl MoonSystem {
             orbit += radius + rng.range(24.0, 40.0) + i as f32 * 6.0;
         }
 
-        MoonSystem { seed, parent_kind, parent_type, parent_radius, parent_spin, moons, orbit_width: 1.0 }
+        MoonSystem { seed, parent_kind, parent_type, parent_radius, parent_spin, moons, orbit_width: 1.0, frozen_clouds: false }
     }
 
     /// Set the dashed orbit-line thickness in pixels, clamped to 1..=6 (1 =
@@ -283,7 +290,7 @@ impl MoonSystem {
                 // One angle turns the surface and advances the weather alike —
                 // that is the planet shader's contract.
                 let spin_a = self.parent_spin * t * TAU;
-                let tile = render_parent_tile(self.parent_type, self.seed, spin_a, rad_render);
+                let tile = render_parent_tile(self.parent_type, self.seed, spin_a, rad_render, self.frozen_clouds);
                 blit(out, w, h, &tile, pcx, pcy, rad_px / rad_render);
             } else {
                 let m = &self.moons[which as usize];
@@ -323,8 +330,9 @@ fn quant(o: Rgb, bx: f32) -> Rgb {
 /// wrapper over `planet_core::render_tile` — the same call `solar` makes for the
 /// worlds in its orbits, and the same shader the `planet` demo shows head-on;
 /// moon only pins the light to its fixed off-screen sun (`LIGHT_DIR`).
-fn render_parent_tile(type_idx: usize, seed: u32, spin_a: f32, rad_px: f32) -> Tile {
-    planet_core::render_tile(type_idx, seed, spin_a, LIGHT_DIR, rad_px, true)
+fn render_parent_tile(type_idx: usize, seed: u32, spin_a: f32, rad_px: f32, frozen: bool) -> Tile {
+    let feat = planet_core::F_ALL | if frozen { planet_core::F_BAKED_CLOUDS } else { 0 };
+    planet_core::render_tile_features(type_idx, seed, spin_a, LIGHT_DIR, rad_px, true, feat)
 }
 
 /// Moon surface albedo at a rotated surface point (no lighting yet): a grey/tinted

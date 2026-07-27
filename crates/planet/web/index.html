@@ -164,9 +164,10 @@ const PARAMS = [
 
 // Everything that can be switched off, and how. `pi` zeroes a shader parameter
 // (the type's own sliders already gate these on > 0); `bit` clears a flag the
-// wasm reads; `style` drives the existing look controls. `opt: true` marks the
-// two entries that are OPTIMIZATIONS rather than features — unticking those
-// makes the frame slower, and the table reports them as a saving.
+// wasm reads; `add` sets one the wasm does not have on by default; `style`
+// drives the existing look controls. `opt: true` marks the entries that are
+// OPTIMIZATIONS rather than features — unticking those makes the frame slower,
+// and the table reports them as a saving.
 const FEATURES = [
   { key: "clouds",   label: "Cloud layer",        pi: 4 },
   { key: "shadow",   label: "└ cloud shadow",     bit: 1 },
@@ -183,6 +184,7 @@ const FEATURES = [
   { key: "dither",   label: "Ordered dither",     style: "dither" },
   { key: "night",    label: "Night-side thinning", bit: 16, opt: true },
   { key: "warp",     label: "Cheap warp inner",    bit: 32, opt: true },
+  { key: "frozen",   label: "Frozen cloud deck",   add: 64, opt: true },
 ];
 const on = new Set(FEATURES.map(f => f.key));   // everything on to begin with
 let FEAT_ALL = 63;
@@ -250,7 +252,12 @@ function applyFeatures(set) {
   let moons = $("moons").checked ? 1 : 0;
   let dither = parseFloat($("dth").value);
   for (const f of FEATURES) {
-    if (set.has(f.key)) continue;
+    if (set.has(f.key)) {
+      // `add` is the mirror of `bit`: a switch the renderer does NOT have on by
+      // default, so ticking it ORs the bit in rather than unticking clearing it.
+      if (f.add !== undefined) feat |= f.add;
+      continue;
+    }
     if (f.pi !== undefined) pv[f.pi] = 0;
     if (f.bit !== undefined) feat &= ~f.bit;
     if (f.style === "moons") moons = 0;

@@ -74,3 +74,12 @@ pub extern "C" fn system_extent(sys: *const MoonSystem) -> f32 {
     let sys = unsafe { &*sys };
     sys.extent()
 }
+
+/// Freeze the parent planet's weather: 1 bakes the cloud deck once and reads it
+/// back per pixel (the default — the parent fills the view, so its shader is the
+/// frame), 0 evaluates it live, which billows and churns but costs ~2x.
+#[no_mangle]
+pub extern "C" fn moon_set_frozen_clouds(sys: *mut MoonSystem, on: u32) {
+    let sys = unsafe { &mut *sys };
+    sys.frozen_clouds = on != 0;
+}
