@@ -13,3 +13,6 @@ crates/*/out
 
 # Generated standalone artifacts (scripts/make-artifact.sh)
 /dist
+
+# Assembled static site (scripts/build-site.sh) — rebuilt from source, and by CI
+/site

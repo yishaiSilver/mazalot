@@ -128,6 +128,50 @@ silently, because the JS calls them by name.
 
 `cargo test --workspace` runs the handful of roster tests. It is fast; run it.
 
+## The website
+
+The demos ship as a static site, built from source and deployed to GitHub Pages
+by `.github/workflows/deploy.yml` on every push to `master` that touches
+something the site is made of.
+
+```bash
+scripts/build-wasm.sh [crate...]        # rebuild wasm, refresh crates/*/web/*.wasm
+scripts/build-site.sh [--serve 8000]    # rebuild + assemble site/ (gitignored)
+```
+
+Two layouts, deliberately:
+
+| | dev | deployed |
+|---|---|---|
+| root | the repo (`python3 -m http.server`) | `site/` |
+| a demo | `crates/<crate>/web/index.html` | `demos/<crate>/index.html` |
+| wasm URL | `?v=` + `Date.now()`, `cache: "no-store"` | `?v=<content hash>`, cacheable |
+
+Serving the repo root is fine for dev but is not a website — it would also serve
+`target/`, `out/` and `.git`. `build-site.sh` assembles only what a visitor
+needs, and rewrites the difference between the two columns.
+
+**The rewrites are string surgery, and they check themselves.** The build looks
+for exactly one `const DEMO_BASE` line and one `const WASM_V` line in the root
+`index.html`, and for each demo's dev-mode fetch line:
+
+```js
+const res = await fetch("./<crate>.wasm?v=" + Date.now(), { cache: "no-store" });
+```
+
+If a demo's loader stops matching, the build **fails** rather than shipping a
+page that fetches nothing. Change that line and you must change `build-site.sh`
+with it. Everything is referenced relatively so the site works both at a domain
+root and under a project subpath like `/mazalot/`.
+
+**No cross-origin isolation, on purpose.** GitHub Pages cannot set COOP/COEP
+headers, so `SharedArrayBuffer` is unavailable — which costs nothing, because
+nothing here needs shared memory. Every render job is a pure function of its
+seed with no shared mutable state, so if the site ever needs work off the main
+thread, the answer is plain Web Workers passing transferable `ArrayBuffer`s: no
+`SharedArrayBuffer`, no nightly, no `-Z build-std`, no header requirements. Do
+not reach for wasm threads here without re-reading this paragraph.
+
 ## Gotchas
 
 - **Float codegen is load-bearing.** Moving code between crates changes LTO and
@@ -142,8 +186,12 @@ silently, because the JS calls them by name.
   `planet` and `solar`. Pre-existing; ignore it.
 - `scripts/make-artifact.sh <crate>` bundles a demo into one self-contained HTML
   with the wasm inlined as base64. It rebuilds the wasm unless given `--no-build`.
-- The committed `crates/*/web/*.wasm` files go stale easily. If you change a
-  crate's render path, rebuild and copy the wasm over.
+- The committed `crates/*/web/*.wasm` files go stale easily, and the failure is
+  silent — a stale module still loads and still draws, just not what the Rust
+  says. If you change a render path, run `scripts/build-wasm.sh` (all crates) or
+  `scripts/build-wasm.sh <crate>...`; it reports which copies it updated. The
+  deployed site never trusts them (see below), but the dev server and
+  `make-artifact.sh --no-build` do.
 
 ## Adding things
 

@@ -50,7 +50,7 @@
 
   <div class="grid" id="grid"></div>
 
-  <div class="foot">seed-driven · rendered per-pixel in WebAssembly · run <code>python3 -m http.server</code> from the repo root</div>
+  <div class="foot">seed-driven · rendered per-pixel in WebAssembly · one Rust codebase, native and web</div>
 </div>
 
 <script>
@@ -103,15 +103,26 @@ const DEMOS = [
     } },
   { name: "Aliens", crate: "bird", sub: "hybrid avian creatures", wasm: "bird.wasm",
     render: (m, ex, ptr, size) => {
-      // render(ptr, size, seed, phase, energy)
-      ex.render(ptr, size, (Math.random()*1e9)|0, 0.0, 0.6);
+      // render(ptr, size, seed, phase, energy, detail) — `detail` is the
+      // supersample factor and was missing here, so it arrived as 0 and the
+      // creature rendered as a blank white square. Take the crate's own default.
+      ex.render(ptr, size, (Math.random()*1e9)|0, 0.0, 0.6, ex.default_detail());
     } },
 ];
+
+// Where each demo lives relative to this page, with `{crate}` substituted per
+// card. Serving the repo root finds them in the crates tree; the deployed site
+// is flatter, so scripts/build-site.sh rewrites these two lines — DEMO_BASE to
+// the flat layout, and WASM_V to a content stamp so thumbnails can be cached
+// instead of refetched on every load.
+const DEMO_BASE = "crates/{crate}/web";
+const WASM_V = "";
+const demoDir = c => DEMO_BASE.replace("{crate}", c);
 
 const grid = document.getElementById("grid");
 
 for (const d of DEMOS) {
-  const href = `crates/${d.crate}/web/index.html`;
+  const href = `${demoDir(d.crate)}/index.html`;
   const card = document.createElement("a");
   card.className = "card";
   card.href = href;
@@ -128,8 +139,10 @@ for (const d of DEMOS) {
 
 async function drawThumb(canvas, d) {
   const size = canvas.width; // square
-  const url = `crates/${d.crate}/web/${d.wasm}`;
-  const res = await fetch(url, { cache: "no-store" });
+  const url = `${demoDir(d.crate)}/${d.wasm}${WASM_V}`;
+  // Dev serves unstamped files that change underneath you, so bypass the cache;
+  // a stamped URL names its own content and is safe to cache normally.
+  const res = await fetch(url, WASM_V ? undefined : { cache: "no-store" });
   if (!res.ok) throw new Error(`no wasm at ${url}`);
   const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
   const ex = instance.exports;

@@ -282,6 +282,28 @@ scripts/make-artifact.sh solar    # -> dist/solar.html
 
 See [docs/artifacts.md](docs/artifacts.md) for options and details.
 
+**Building the whole site.** The demos also ship as one static site, built from
+source and deployed to GitHub Pages by `.github/workflows/deploy.yml` on every
+push to `master`:
+
+```bash
+scripts/build-wasm.sh                   # rebuild every wasm, refresh crates/*/web/
+scripts/build-site.sh --serve 8000      # assemble site/ and serve it
+```
+
+`build-wasm.sh` replaces the hand-rolled build-and-`cp` recipes above (and takes
+crate names to do just a few). It exists because those committed `.wasm` files
+go stale silently — a stale module still loads and still draws, just not what
+the Rust says.
+
+`build-site.sh` assembles a `site/` tree containing only what a visitor needs —
+serving the repo root is fine for dev, but it would also serve `target/`, `out/`
+and `.git`. It flattens the demos to `demos/<crate>/`, and swaps each page's
+dev-mode wasm URL (`?v=` + `Date.now()` with `cache: "no-store"`, which refetches
+the module on every load) for a content hash that browsers can actually cache.
+Everything stays relative, so the result works at a domain root or under a
+project subpath like `/mazalot/`.
+
 **Web — live creature (the bird half):**
 ```bash
 cargo build -p bird-web --target wasm32-unknown-unknown --release
