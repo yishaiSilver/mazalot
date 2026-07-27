@@ -466,6 +466,45 @@ the committed modules rather than a bonus — which is why it lives in
 `.cargo/config.toml` and not in a build script. Native is unaffected either way
 (it takes the array path, and measured within noise of before).
 
+### Feature cost lab
+
+The `planet` demo carries an ablation panel: a tick-box per shader feature, and a
+button that switches each one off in turn and times the difference. It measures
+on *your* machine, so the numbers below are a reference point rather than a
+claim about your hardware.
+
+Most features are reachable through the existing per-type sliders — `clouds`,
+`specular`, `spot`, `aurora`, `lightning`, `storm_cells` and `caps` are all gated
+on `> 0.0`, so zeroing one switches it off. The `F_*` mask in `planet-core`
+covers what a parameter cannot reach: part of a layer rather than a whole one
+(the cloud self-shadow), framing furniture (atmosphere rim, dark limb, starfield)
+and the two optimizations. `render_rgba_features(.., F_ALL, ..)` is byte-identical
+to `render_rgba_styled`, so nothing about the normal path changes.
+
+Measured here, `terran` at 64² (full frame 1.449 ms):
+
+| feature | cost | share |
+|---|---:|---:|
+| **cloud layer** (all of it) | 0.801 ms | **55%** |
+| ├ cloud colour (`fbm_warp`) | ~0.53 ms | 37% |
+| ├ **cloud self-shadow** | 0.176 ms | **12%** |
+| └ storm-cell swirl | 0.093 ms | 6% |
+| **aurora** | 0.172 ms | **12%** |
+| **specular + shimmer** | 0.133 ms | **9%** |
+| atmosphere rim · lightning · ice caps · great spot · moons | ≤0.03 ms each | ≤2% |
+| ordered dither · dark limb · starfield | ~0 | ~0% |
+
+The cloud deck is the whole game on a terrestrial world — everything else put
+together is about a quarter of the frame. Two things stand out as poor value:
+**aurora costs 12% for a thin polar band**, and **specular is 19% of a `lava`
+frame** for a glint whose intensity is 0.05. By archetype: `gas_giant` is great
+spot 16%, `lava` is specular 19% and nothing else, `barren` has no feature above
+5% because it is all Worley, which has no switch.
+
+For comparison the same panel reports what the optimizations are worth in this
+framing: cheap warp saves 19% on `terran`, 31% on `gas_giant`, 51% on
+`storm_shroud`; night-side thinning saves 4% on `terran`, 11% on `ocean`.
+
 ### Shader experiments
 
 Five ideas were built and measured against each other; three earned their place.

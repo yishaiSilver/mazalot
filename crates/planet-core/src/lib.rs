@@ -35,6 +35,31 @@ use noise_core::{
     clamp01, contrast, cycle3, fbm, fbm_warp_inner, hash3, lerp, mix, ramp, smoothstep, worley, Rgb,
 };
 
+// ---------------------------------------------------------------------------
+// Feature switches
+// ---------------------------------------------------------------------------
+//
+// The per-type sliders already reach most of the shader — `clouds`, `specular`,
+// `spot`, `aurora`, `lightning`, `storm_cells` and `caps` are all gated on
+// `> 0.0`, so zeroing one switches that feature off. These are the pieces a
+// parameter cannot reach: parts of a layer rather than a whole one, framing
+// furniture, and the two optimizations. A SET bit means the feature is ON.
+
+/// The cloud deck's self-shadow, independent of the cloud colour above it.
+pub const F_CLOUD_SHADOW: u32 = 1;
+/// The atmosphere rim glow at the limb.
+pub const F_ATMO: u32 = 2;
+/// The crisp 1px dark outline around the disc.
+pub const F_RIM: u32 = 4;
+/// The hashed starfield behind the planet (hero framing only).
+pub const F_STARFIELD: u32 = 8;
+/// OPTIMIZATION: skip the fine octaves and the cloud deck past the terminator.
+pub const F_NIGHT_LOD: u32 = 16;
+/// OPTIMIZATION: run a domain warp's displacement fields at 2 octaves.
+pub const F_CHEAP_WARP: u32 = 32;
+/// Everything on — what every caller but the demo's ablation panel wants.
+pub const F_ALL: u32 = 63;
+
 /// Octaves for a domain warp's three *displacement* fields.
 ///
 /// `fbm_warp` runs its inner fields at the same count as the outer one, but they
@@ -43,6 +68,12 @@ use noise_core::{
 /// kernel gets 36-44% cheaper and the field moves by a mean of 0.019, against a
 /// dither step of 0.045. Below 2 the marbling starts to straighten out.
 const WARP_INNER: u32 = 2;
+
+/// Inner-field octaves for a warp whose outer count is `outer`.
+#[inline(always)]
+fn warp_inner(feat: u32, outer: u32) -> u32 {
+    if feat & F_CHEAP_WARP != 0 { WARP_INNER } else { outer }
+}
 
 // ---------------------------------------------------------------------------
 // Planet type table
@@ -400,7 +431,7 @@ impl Lod {
     }
 }
 
-fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32, lod: Lod) -> (Rgb, f32) {
+fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32, lod: Lod, feat: u32) -> (Rgb, f32) {
     let (px, py, pz) = (sx + ofs[0], sy + ofs[1], sz + ofs[2]);
     let (mut col, mut emis) = match ct.base {
         Base::Terrestrial => {
@@ -431,7 +462,7 @@ fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32, lod
             let flow = angle * 0.16 * (sy * ct.bands * 0.5).sin();
             // Domain warp makes the band turbulence curl and marble like fluid.
             let o = lod.surf(5);
-            let warp = fbm_warp_inner((px + flow) * 1.3, py * 1.3, pz * 1.3, o, WARP_INNER, 0.8);
+            let warp = fbm_warp_inner((px + flow) * 1.3, py * 1.3, pz * 1.3, o, warp_inner(feat, o), 0.8);
             let lat = sy + (warp - 0.5) * ct.turb;
             let band = 0.5 + 0.5 * (lat * ct.bands).sin();
             let mut col = mix(ct.dark, ct.light, band);
@@ -458,7 +489,7 @@ fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32, lod
             // roiling, fluid-looking cloud cover.
             let flow = (0.5 + 0.3 * (sy * 3.0).cos()) * angle.sin();
             let o = lod.surf(5);
-            let t = fbm_warp_inner((px + flow) * 2.0, py * 2.0, pz * 2.0, o, WARP_INNER, 0.7);
+            let t = fbm_warp_inner((px + flow) * 2.0, py * 2.0, pz * 2.0, o, warp_inner(feat, o), 0.7);
             let band = 0.5 + 0.5 * (sy * ct.bands + (t - 0.5) * 6.0 * ct.turb).sin();
             (mix(ct.dark, ct.light, clamp01(band * 0.6 + t * 0.4)), 0.0)
         }
@@ -570,6 +601,26 @@ pub fn render_rgba_styled(
     moons: u32,
     out: &mut [u8],
 ) {
+    render_rgba_features(size, type_idx, seed, angle, p, palette, dither, moons, F_ALL, out)
+}
+
+/// [`render_rgba_styled`] with the feature switches exposed. `features` is a
+/// mask of the `F_*` bits; pass [`F_ALL`] for the normal picture. This is what
+/// the demo's ablation panel drives — switching one bit off and timing the
+/// difference is how the per-feature costs in the README were measured.
+#[allow(clippy::too_many_arguments)]
+pub fn render_rgba_features(
+    size: u32,
+    type_idx: usize,
+    seed: u32,
+    angle: f32,
+    p: &[f32],
+    palette: u32,
+    dither: f32,
+    moons: u32,
+    features: u32,
+    out: &mut [u8],
+) {
     let mut ct = TYPES[type_idx % TYPES.len()];
     if p.len() >= NUM_PARAMS {
         ct.contrast = p[0];
@@ -586,7 +637,7 @@ pub fn render_rgba_styled(
         ct.turb = p[11];
         ct.spec_albedo = p[12];
     }
-    let style = Style { palette, dither, moons: moons != 0 };
+    let style = Style { palette, dither, moons: moons != 0, feat: features };
     render_ct(size, &ct, seed, angle, &style, out);
 }
 
@@ -599,10 +650,11 @@ pub struct Style {
     pub palette: u32, // 0 natural, 1 game boy, 2 ice, 3 sunset
     pub dither: f32,  // 0..1 ordered-dither strength
     pub moons: bool,  // draw orbiting moons
+    pub feat: u32,    // feature switches (see `F_*`); `F_ALL` is the normal value
 }
 impl Style {
     pub fn natural() -> Style {
-        Style { palette: 0, dither: 0.7, moons: true }
+        Style { palette: 0, dither: 0.7, moons: true, feat: F_ALL }
     }
 }
 
@@ -675,7 +727,7 @@ fn render_ct(size: u32, ct: &PType, seed: u32, angle: f32, style: &Style, out: &
 /// no orbiting moons — a scene composites its own bodies, and moons would inflate
 /// every tile by a third to gain a one-pixel speck.
 fn tile_style() -> Style {
-    Style { palette: 0, dither: 0.7, moons: false }
+    Style { palette: 0, dither: 0.7, moons: false, feat: F_ALL }
 }
 
 /// Render one planet as a **sprite tile**: the same shader as [`render_rgba`],
@@ -720,7 +772,7 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
     // cloud deck when it does, so those types opt out wholesale. Aurora is
     // confined to a polar band, so it opts out by latitude instead — excluding
     // every type that merely *has* an aurora would rule out most of the table.
-    let night_ok = ct.lightning == 0.0 && ct.base != Base::Emissive;
+    let night_ok = style.feat & F_NIGHT_LOD != 0 && ct.lightning == 0.0 && ct.base != Base::Emissive;
     let (cx, cy) = (size as f32 / 2.0, size as f32 / 2.0);
     let ofs = seed_offsets(seed);
     let l = fr.light;
@@ -799,7 +851,7 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                 // layer cannot survive into the output. Drop them there.
                 let night = night_ok && diff <= 0.0 && (ct.aurora == 0.0 || sy.abs() < 0.52);
                 let (mut col, emis) =
-                    surface(ct, sx, sy, sz, ofs, angle, if night { LOD_NIGHT } else { lod });
+                    surface(ct, sx, sy, sz, ofs, angle, if night { LOD_NIGHT } else { lod }, style.feat);
                 if ct.clouds > 0.0 && !night {
                     // Clouds drift over the surface (2x = parallax, loops) and
                     // slowly billow — a periodic morph reveals new cloud structure
@@ -834,10 +886,12 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                     // ragged fronts instead of clumping into round blobs. Shadow
                     // uses the cheap plain density.
                     let co = lod.cld(4);
-                    let cloud = fbm_warp_inner(cx3 * 2.8, ny * 2.8 + ofs[1] + morph, cz3 * 2.8 + morph, co, WARP_INNER, 0.9);
+                    let cloud = fbm_warp_inner(cx3 * 2.8, ny * 2.8 + ofs[1] + morph, cz3 * 2.8 + morph, co, warp_inner(style.feat, co), 0.9);
 
-                    let shadow = smoothstep(0.55, 0.72, dens(l[0] * 0.45, l[2] * 0.45));
-                    let sh = 1.0 - 0.22 * shadow * ct.clouds;
+                    let sh = if style.feat & F_CLOUD_SHADOW == 0 { 1.0 } else {
+                        let shadow = smoothstep(0.55, 0.72, dens(l[0] * 0.45, l[2] * 0.45));
+                        1.0 - 0.22 * shadow * ct.clouds
+                    };
                     col = [col[0] * sh, col[1] * sh, col[2] * sh];
 
                     col = mix(col, [1.0, 1.0, 1.0], smoothstep(0.52, 0.70, cloud) * ct.clouds);
@@ -859,7 +913,7 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                     o[1] = clamp01(o[1] + sp);
                     o[2] = clamp01(o[2] + sp);
                 }
-                if has_atmo {
+                if has_atmo && style.feat & F_ATMO != 0 {
                     let rim = (1.0 - nz).powf(3.0) * 0.6;
                     o[0] = clamp01(o[0] + ct.atmo[0] * rim);
                     o[1] = clamp01(o[1] + ct.atmo[1] * rim);
@@ -870,7 +924,7 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                 o = [0.0, 0.0, 0.0];
                 a = 0.0;
             } else {
-                let s = star_bg(ix, iy, seed);
+                let s = if style.feat & F_STARFIELD != 0 { star_bg(ix, iy, seed) } else { [9, 8, 20, 255] };
                 o = [s[0] as f32 / 255.0, s[1] as f32 / 255.0, s[2] as f32 / 255.0];
             }
 
@@ -904,7 +958,7 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
             // Crisp dark rim on the planet disc. Applied BEFORE moons so a front
             // moon crossing the limb passes over the rim instead of being clipped
             // under it.
-            if d2 <= 1.0 {
+            if d2 <= 1.0 && style.feat & F_RIM != 0 {
                 let edge = 1.0 - 1.3 / rad;
                 if d2 > edge * edge {
                     o = [o[0] * 0.26, o[1] * 0.26, o[2] * 0.30];
