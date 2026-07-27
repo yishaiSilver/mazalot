@@ -6,6 +6,47 @@ const bytes = readFileSync(new URL("./planet.wasm", import.meta.url));
 const { instance } = await WebAssembly.instantiate(bytes, {});
 const { memory, alloc, render, type_count } = instance.exports;
 
+// --- WebGPU path: the demo's shader contract ------------------------------
+// index.html and planet.wgsl each declare the per-frame buffer layout, and the
+// buffer is untyped floats, so a drifted offset renders a *wrong* planet on the
+// GPU rather than failing — and only on machines that have WebGPU, which is
+// exactly where nobody notices. Check them against each other here; the shader
+// ships inside the wasm, so no browser and no GPU is needed to do it.
+{
+  const { wgsl_ptr, wgsl_len, gpu_table_len, gpu_table_stride } = instance.exports;
+  const wgsl = new TextDecoder().decode(new Uint8Array(memory.buffer, wgsl_ptr(), wgsl_len()));
+  const html = readFileSync(new URL("./index.html", import.meta.url), "utf8");
+
+  const fromWgsl = (name) => {
+    const m = wgsl.match(new RegExp(`const ${name}: u32 = (\\d+)u;`));
+    if (!m) throw new Error(`planet.wgsl is missing const ${name}`);
+    return Number(m[1]);
+  };
+  // index.html declares them all on one `const FR_… = 0, FR_… = 1, …` run.
+  const fromHtml = (name) => {
+    const m = html.match(new RegExp(`\\b${name}\\s*=\\s*(\\d+)`));
+    if (!m) throw new Error(`index.html is missing ${name}`);
+    return Number(m[1]);
+  };
+  const shared = ["FR_SIZE", "FR_ANGLE", "FR_SEED", "FR_TYPE", "FR_PALETTE",
+                  "FR_DITHER", "FR_MOONS", "FR_PARAMS", "FR_STRIDE"];
+  for (const name of shared) {
+    const a = fromWgsl(name), b = fromHtml(name);
+    if (a !== b) throw new Error(`${name}: planet.wgsl says ${a}, index.html says ${b}`);
+  }
+  // The 13 slider params have to fit between FR_PARAMS and the end of the row.
+  const need = fromWgsl("FR_PARAMS") + instance.exports.num_params();
+  if (need > fromWgsl("FR_STRIDE")) {
+    throw new Error(`frame buffer is ${fromWgsl("FR_STRIDE")} floats, layout needs ${need}`);
+  }
+  // The type table the shader indexes must be a whole number of rows.
+  if (gpu_table_len() !== type_count() * gpu_table_stride()) {
+    throw new Error("gpu table length is not type_count * stride");
+  }
+  console.log(`webgpu contract ok (frame ${fromWgsl("FR_STRIDE")} floats, ` +
+              `table ${type_count()}x${gpu_table_stride()})`);
+}
+
 const SIZE = 64;
 const nTypes = type_count();
 console.log(`type_count = ${nTypes}`);

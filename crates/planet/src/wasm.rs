@@ -91,3 +91,49 @@ pub extern "C" fn render_params(
 pub extern "C" fn type_count() -> u32 {
     crate::type_count() as u32
 }
+
+// ---------------------------------------------------------------------------
+// WebGPU path. The demo prefers the GPU shader and falls back to `render_styled`
+// above when WebGPU is missing, so both of these are optional to the caller.
+//
+// The shader source and the type table ride along inside the wasm rather than
+// sitting next to it as files: `scripts/make-artifact.sh` bundles the demo into
+// one self-contained HTML and rejects any surviving `fetch()`, so anything the
+// page needs at runtime has to be reachable through linear memory.
+// ---------------------------------------------------------------------------
+
+/// Pointer to the WGSL shader source in linear memory (UTF-8, not NUL-terminated
+/// — pair it with [`wgsl_len`]).
+#[no_mangle]
+pub extern "C" fn wgsl_ptr() -> *const u8 {
+    planet_core::gpu::WGSL.as_ptr()
+}
+
+/// Length of the WGSL source in bytes.
+#[no_mangle]
+pub extern "C" fn wgsl_len() -> u32 {
+    planet_core::gpu::WGSL.len() as u32
+}
+
+/// Number of `f32`s [`gpu_table_fill`] will write — allocate that many times 4
+/// bytes before calling it.
+#[no_mangle]
+pub extern "C" fn gpu_table_len() -> u32 {
+    planet_core::gpu::type_table_len() as u32
+}
+
+/// Write the flattened `TYPES` table for the shader's storage buffer into
+/// `ptr`, which must have room for [`gpu_table_len`] `f32`s.
+#[no_mangle]
+pub extern "C" fn gpu_table_fill(ptr: *mut f32) {
+    let table = planet_core::gpu::type_table();
+    let out = unsafe { slice::from_raw_parts_mut(ptr, table.len()) };
+    out.copy_from_slice(&table);
+}
+
+/// Floats per row in the table [`gpu_table_fill`] writes, so the shader and the
+/// JS agree on where row `i` starts without hard-coding the stride twice.
+#[no_mangle]
+pub extern "C" fn gpu_table_stride() -> u32 {
+    planet_core::gpu::GPU_STRIDE as u32
+}

@@ -23,6 +23,11 @@ use std::f32::consts::{PI, TAU};
 
 pub use scene_core::Tile;
 
+/// The WGSL mirror of the hero framing, for callers that can reach a GPU (the
+/// browser demo). The CPU path below stays the reference implementation and the
+/// only one the native bins and `solar`'s tiles use.
+pub mod gpu;
+
 // ---------------------------------------------------------------------------
 // Low-level primitives (noise, color/ramp helpers, ordered dither) now live in
 // the shared `noise-core` / `dither-core` rlibs — byte-for-byte identical to the

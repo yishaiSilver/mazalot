@@ -57,6 +57,26 @@ of it. If you find yourself writing a "simpler" planet shader for a new crate,
 add a framing to `planet-core` instead — that duplication has been removed once
 already.
 
+There is **one sanctioned exception**: `crates/planet-core/src/planet.wgsl`, a
+WGSL mirror of the hero framing that the `planet` web demo runs on the GPU (the
+demo falls back to the wasm CPU path when WebGPU is missing). It exists so the
+demo can render at 512² instead of 64². The rules that keep it from rotting:
+
+- The **algorithm** is duplicated; the **data** is not. The 26 rows travel to the
+  shader as a float buffer via `planet_core::gpu::type_table`, so adding a type
+  is still a one-row edit in `TYPES` with no shader change.
+- It implements the **hero framing only**. `render_tile` stays CPU-side.
+- It is **not** byte-identical to the CPU path and is not required to be (it is
+  very close — see `docs/webgpu.md`). Anything needing reproducible bytes — the
+  native bins, `solar`'s tiles — must keep using the CPU path.
+- The buffer layouts are untyped floats shared across three files, so drift
+  renders a *wrong* planet rather than failing. `cargo test -p planet-core` and
+  `node crates/planet/web/verify.mjs` pin them; keep both passing.
+
+Read `docs/webgpu.md` before editing the shader — it lists the WGSL builtins
+(`smoothstep`, `mix`, `round`) whose semantics differ from the Rust ones and
+silently shift pixels.
+
 **One backdrop, likewise.** Every scene paints through `background-core`:
 `paint_backdrop` (ground + optional nebula) then `paint_stars`. A new scene crate
 supplies a `Backdrop` and a `Starfield` const and a closure that mixes its seed

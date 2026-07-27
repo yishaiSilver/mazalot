@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Procedural Planet — Rust · WASM</title>
+<title>Procedural Planet — Rust · WebGPU</title>
 <style>
   :root { color-scheme: dark; }
   html, body {
@@ -23,6 +23,19 @@
     box-shadow: 0 10px 40px rgba(0,0,0,.6), inset 0 0 0 1px rgba(255,255,255,.05);
     display: block; image-rendering: pixelated;
   }
+  .stage.off { display: none; }
+  .badge {
+    position: absolute; top: 10px; left: 10px; z-index: 2;
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 9px; border-radius: 999px; font-size: 10px; font-weight: 700;
+    letter-spacing: .12em; text-transform: uppercase;
+    background: rgba(6,6,12,.72); border: 1px solid rgba(255,255,255,.12);
+    color: #7f86a3; backdrop-filter: blur(4px); pointer-events: none;
+  }
+  .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: #6b7290; }
+  .badge.gpu { color: #9fe6b4; border-color: rgba(120,230,160,.3); }
+  .badge.gpu .dot { background: #58e08a; box-shadow: 0 0 7px #58e08a; }
+  .badge .fps { color: #eef1f8; font-variant-numeric: tabular-nums; }
   .name { font-size: 20px; font-weight: 700; color: #eef1f8; text-transform: capitalize; margin-top: 16px; }
   .sub { font-size: 12px; color: #6b7290; letter-spacing: .04em; }
   .gen { margin-top: 14px; padding: 11px 22px; font: inherit; font-weight: 600;
@@ -64,11 +77,13 @@
   <div class="left">
     <h1>Procedural Planet</h1>
     <div class="stage-wrap">
+      <div class="badge" id="badge"><span class="dot"></span><span id="backend">…</span><span class="fps" id="fps"></span></div>
       <canvas class="stage" id="stage" width="360" height="360"></canvas>
+      <canvas class="stage off" id="gpustage" width="64" height="64"></canvas>
       <div class="crt" id="crtfx"></div>
     </div>
     <div class="name" id="name">loading…</div>
-    <div class="sub" id="sub">Rust → WebAssembly · live sphere shading</div>
+    <div class="sub" id="sub">Rust → WebGPU · live sphere shading</div>
     <button class="gen" id="gen">✦ Generate random</button>
   </div>
 
@@ -99,7 +114,7 @@
     <button class="mini reset" id="reset">↺ reset params to type defaults</button>
   </div>
 
-  <div class="foot">rendered live in <code>planet.wasm</code> — same code as the native generator</div>
+  <div class="foot" id="foot">rendered live in <code>planet.wasm</code> — same code as the native generator</div>
 </div>
 
 <script type="module">
@@ -134,10 +149,155 @@ const sctx = stage.getContext("2d");
 sctx.imageSmoothingEnabled = false;
 const off = document.createElement("canvas");
 const octx = off.getContext("2d");
+const gpustage = $("gpustage");
 
 let wasm, bufPtr, bufLen, imgData, paramsPtr, NUM;
 let NATIVE = 64, typeIdx = 0, seed = 1, angle = 0, spin = 0.012;
+let gpu = null; // the WebGPU backend, or null when we're on the wasm one
 const sliders = {}; // pi -> { input, val }
+
+// The same sphere shader runs two ways: as WGSL on the GPU (one invocation per
+// pixel) when WebGPU is available, and as the wasm CPU loop otherwise. The GPU
+// path is what makes the high end of the resolution slider usable — the CPU one
+// shades every pixel serially on the main thread.
+const RES_MAX_GPU = 512, RES_MAX_CPU = 240;
+
+// Per-frame buffer layout — MUST match the FR_* constants in planet.wgsl.
+const FR_SIZE = 0, FR_ANGLE = 1, FR_SEED = 2, FR_TYPE = 3,
+      FR_PALETTE = 4, FR_DITHER = 5, FR_MOONS = 6, FR_PARAMS = 7, FR_STRIDE = 20;
+
+/// Stand up the WebGPU pipeline, or return null if anything at all is missing —
+/// no WebGPU, no adapter, a shader that won't compile. Every failure here is a
+/// fallback to the wasm path, never a broken page.
+let gpuWhy = ""; // why we're not on the GPU, shown under the canvas
+
+async function initGPU() {
+  if (globalThis.isSecureContext === false) {
+    gpuWhy = "page is not a secure context (WebGPU needs https:// or file://)";
+    return null;
+  }
+  if (!navigator.gpu) {
+    // The usual causes, in rough order of likelihood for a visitor: an embedding
+    // that withholds WebGPU (a sandboxed iframe), a browser without it (Safari
+    // before 26, Firefox outside Windows), or one where it's behind a flag.
+    let framed = false;
+    try { framed = globalThis.self !== globalThis.top; } catch (e) { framed = true; }
+    gpuWhy = framed
+      ? "navigator.gpu missing — this page is embedded in an iframe that doesn't expose WebGPU; try opening it in its own tab"
+      : "navigator.gpu missing — this browser doesn't expose WebGPU";
+    return null;
+  }
+  let device, format;
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) { gpuWhy = "WebGPU present but no adapter (no compatible GPU driver)"; return null; }
+    device = await adapter.requestDevice();
+    format = navigator.gpu.getPreferredCanvasFormat();
+  } catch (e) { gpuWhy = "requesting a GPU device failed: " + e; return null; }
+
+  // The shader source and the planet table both ride inside the wasm, so the
+  // page still needs exactly one file at runtime and the artifact bundler can
+  // inline it. Copy both out of linear memory now: later allocations can grow
+  // the wasm heap, which detaches any view onto the old buffer.
+  const wgsl = new TextDecoder().decode(
+    new Uint8Array(wasm.memory.buffer.slice(wasm.wgsl_ptr(), wasm.wgsl_ptr() + wasm.wgsl_len())));
+
+  const nFloats = wasm.gpu_table_len();
+  const tPtr = wasm.alloc(nFloats * 4);
+  wasm.gpu_table_fill(tPtr);
+  const table = new Float32Array(wasm.memory.buffer.slice(tPtr, tPtr + nFloats * 4));
+  wasm.dealloc(tPtr, nFloats * 4);
+
+  const module = device.createShaderModule({ code: wgsl });
+  if (module.getCompilationInfo) {
+    const info = await module.getCompilationInfo();
+    const bad = info.messages.filter(m => m.type === "error");
+    if (bad.length) {
+      for (const m of bad) console.error(`planet.wgsl:${m.lineNum}: ${m.message}`);
+      gpuWhy = `planet.wgsl failed to compile (line ${bad[0].lineNum}: ${bad[0].message})`;
+      return null;
+    }
+  }
+
+  const typesBuf = device.createBuffer({ size: table.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(typesBuf, 0, table);
+  const frBuf = device.createBuffer({ size: FR_STRIDE * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+
+  const layout = device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+    { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },
+  ]});
+  let pipeline;
+  try {
+    pipeline = device.createRenderPipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }),
+      vertex: { module, entryPoint: "vs_main" },
+      fragment: { module, entryPoint: "fs_main", targets: [{ format }] },
+      primitive: { topology: "triangle-list" },
+    });
+  } catch (e) { console.error(e); gpuWhy = "render pipeline was rejected: " + e; return null; }
+
+  const bind = device.createBindGroup({ layout, entries: [
+    { binding: 0, resource: { buffer: typesBuf } },
+    { binding: 1, resource: { buffer: frBuf } },
+  ]});
+
+  const ctx = gpustage.getContext("webgpu");
+  if (!ctx) { gpuWhy = "canvas has no webgpu context"; return null; }
+  ctx.configure({ device, format, alphaMode: "opaque" });
+
+  const fr = new Float32Array(FR_STRIDE);
+  const fru = new Uint32Array(fr.buffer); // the seed travels as raw bits
+
+  // A lost device (driver reset, tab backgrounded on some machines) must not
+  // freeze the planet — drop back to the CPU path and carry on.
+  device.lost?.then(() => { if (gpu) { gpu = null; useBackend(); } });
+
+  return {
+    resize(n) { gpustage.width = gpustage.height = n; ctx.configure({ device, format, alphaMode: "opaque" }); },
+    draw(state) {
+      fr[FR_SIZE] = state.size;
+      fr[FR_ANGLE] = state.angle;
+      fru[FR_SEED] = state.seed >>> 0;
+      fr[FR_TYPE] = state.type;
+      fr[FR_PALETTE] = state.palette;
+      fr[FR_DITHER] = state.dither;
+      fr[FR_MOONS] = state.moons;
+      fr.set(state.params, FR_PARAMS);
+      device.queue.writeBuffer(frBuf, 0, fr);
+
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginRenderPass({ colorAttachments: [{
+        view: ctx.getCurrentTexture().createView(),
+        loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      }]});
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bind);
+      pass.draw(3); // fullscreen triangle; the shader needs no vertex data
+      pass.end();
+      device.queue.submit([enc.finish()]);
+    },
+  };
+}
+
+/// Point the page at whichever backend is live: swap the visible canvas, relabel
+/// the badge, and re-cap the resolution slider to what that backend can carry.
+function useBackend() {
+  const on = !!gpu;
+  gpustage.classList.toggle("off", !on);
+  stage.classList.toggle("off", on);
+  $("badge").classList.toggle("gpu", on);
+  $("backend").textContent = on ? "GPU · WebGPU" : "CPU · WebAssembly";
+  const res = $("res");
+  res.max = on ? RES_MAX_GPU : RES_MAX_CPU;
+  if (parseInt(res.value) > res.max) res.value = res.max;
+  $("foot").textContent = on
+    ? "planet.wgsl on the GPU — one invocation per pixel, same table as the native generator"
+    : "rendered live in planet.wasm — same code as the native generator"
+      + (gpuWhy ? ` · no GPU: ${gpuWhy}` : "");
+  $("badge").title = on ? "rendering with WebGPU" : `WebGPU unavailable — ${gpuWhy || "unknown"}`;
+  setResolution(parseInt(res.value));
+}
 
 function buildSliders() {
   const host = $("sliders");
@@ -156,9 +316,11 @@ function buildSliders() {
 }
 
 function setResolution(n) {
-  NATIVE = n; off.width = off.height = n; imgData = octx.createImageData(n, n);
+  NATIVE = n; $("resV").textContent = n;
+  if (gpu) { gpu.resize(n); return; }
+  off.width = off.height = n; imgData = octx.createImageData(n, n);
   if (bufPtr) wasm.dealloc(bufPtr, bufLen);
-  bufLen = n * n * 4; bufPtr = wasm.alloc(bufLen); $("resV").textContent = n;
+  bufLen = n * n * 4; bufPtr = wasm.alloc(bufLen);
 }
 
 function loadTypeDefaults(t) {
@@ -181,19 +343,39 @@ function randomize() {
   setType(Math.floor(Math.random() * NAMES.length));
 }
 
-function frame() {
+let fpsLast = 0, fpsAvg = 0;
+function tickFps(now) {
+  if (fpsLast) {
+    const inst = 1000 / Math.max(now - fpsLast, 0.001);
+    fpsAvg = fpsAvg ? fpsAvg * 0.9 + inst * 0.1 : inst;
+    $("fps").textContent = `${Math.round(fpsAvg)} fps`;
+  }
+  fpsLast = now;
+}
+
+function frame(now) {
   angle += spin;
-  const pv = new Float32Array(wasm.memory.buffer, paramsPtr, NUM);
-  for (const p of PARAMS) pv[p.pi] = parseFloat(sliders[p.pi].input.value);
   const palette = parseInt($("palette").value);
   const dither = parseFloat($("dth").value);
   const moons = $("moons").checked ? 1 : 0;
-  wasm.render_styled(bufPtr, NATIVE, typeIdx, seed, angle, paramsPtr, palette, dither, moons);
-  const view = new Uint8Array(wasm.memory.buffer, bufPtr, bufLen);
-  imgData.data.set(view);
-  octx.putImageData(imgData, 0, 0);
-  sctx.clearRect(0, 0, stage.width, stage.height);
-  sctx.drawImage(off, 0, 0, stage.width, stage.height);
+
+  if (gpu) {
+    // The GPU path keeps its parameters in a plain JS array — nothing crosses
+    // into wasm memory, so there is no per-frame copy through linear memory.
+    const params = new Float32Array(NUM);
+    for (const p of PARAMS) params[p.pi] = parseFloat(sliders[p.pi].input.value);
+    gpu.draw({ size: NATIVE, angle, seed, type: typeIdx, palette, dither, moons, params });
+  } else {
+    const pv = new Float32Array(wasm.memory.buffer, paramsPtr, NUM);
+    for (const p of PARAMS) pv[p.pi] = parseFloat(sliders[p.pi].input.value);
+    wasm.render_styled(bufPtr, NATIVE, typeIdx, seed, angle, paramsPtr, palette, dither, moons);
+    const view = new Uint8Array(wasm.memory.buffer, bufPtr, bufLen);
+    imgData.data.set(view);
+    octx.putImageData(imgData, 0, 0);
+    sctx.clearRect(0, 0, stage.width, stage.height);
+    sctx.drawImage(off, 0, 0, stage.width, stage.height);
+  }
+  tickFps(now ?? performance.now());
   requestAnimationFrame(frame);
 }
 
@@ -210,7 +392,8 @@ async function main() {
   buildSliders();
 
   paramsPtr = wasm.alloc(NUM * 4); // stable buffer, allocated before pixel buffer
-  setResolution(64);
+  gpu = await initGPU();           // null => stay on the wasm path
+  useBackend();                    // sizes the canvas for whichever won
   randomize();
 
   $("type").addEventListener("change", () => setType(parseInt($("type").value)));
