@@ -1119,6 +1119,54 @@ pub fn render_rgba_styled(
     render_rgba_features(size, type_idx, seed, angle, p, palette, dither, moons, F_ALL, out)
 }
 
+/// A type row with the caller's parameter overrides applied. One copy, so the
+/// whole-frame and banded entry points cannot disagree about what they render.
+fn ct_with_params(type_idx: usize, p: &[f32]) -> PType {
+    let mut ct = TYPES[type_idx % TYPES.len()];
+    if p.len() >= NUM_PARAMS {
+        ct.contrast = p[0];
+        ct.freq = p[1];
+        ct.specular = p[2];
+        ct.shininess = p[3];
+        ct.clouds = p[4];
+        ct.caps = p[5];
+        ct.spot = p[6];
+        ct.lightning = p[7];
+        ct.aurora = p[8];
+        ct.storm_cells = p[9];
+        ct.bands = p[10];
+        ct.turb = p[11];
+        ct.spec_albedo = p[12];
+    }
+    ct
+}
+
+/// [`render_rgba_features`] restricted to rows `y0..y1` of the frame.
+///
+/// The band is written into `out` at its real offset — `out` is a whole frame's
+/// worth of pixels, and the rows outside the band are not touched. Splitting a
+/// frame into N bands across N wasm instances and concatenating the results
+/// reproduces the whole frame exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn render_rgba_band(
+    size: u32,
+    type_idx: usize,
+    seed: u32,
+    angle: f32,
+    p: &[f32],
+    palette: u32,
+    dither: f32,
+    moons: u32,
+    features: u32,
+    y0: u32,
+    y1: u32,
+    out: &mut [u8],
+) {
+    let ct = ct_with_params(type_idx, p);
+    let style = Style { palette, dither, moons: moons != 0, feat: features };
+    render_ct_band(size, &ct, seed, angle, &style, y0, y1, out);
+}
+
 /// [`render_rgba_styled`] with the feature switches exposed. `features` is a
 /// mask of the `F_*` bits; pass [`F_ALL`] for the normal picture. This is what
 /// the demo's ablation panel drives — switching one bit off and timing the
@@ -1136,22 +1184,7 @@ pub fn render_rgba_features(
     features: u32,
     out: &mut [u8],
 ) {
-    let mut ct = TYPES[type_idx % TYPES.len()];
-    if p.len() >= NUM_PARAMS {
-        ct.contrast = p[0];
-        ct.freq = p[1];
-        ct.specular = p[2];
-        ct.shininess = p[3];
-        ct.clouds = p[4];
-        ct.caps = p[5];
-        ct.spot = p[6];
-        ct.lightning = p[7];
-        ct.aurora = p[8];
-        ct.storm_cells = p[9];
-        ct.bands = p[10];
-        ct.turb = p[11];
-        ct.spec_albedo = p[12];
-    }
+    let ct = ct_with_params(type_idx, p);
     let style = Style { palette, dither, moons: moons != 0, feat: features };
     render_ct(size, &ct, seed, angle, &style, out);
 }
@@ -1233,9 +1266,21 @@ fn key_light() -> [f32; 3] {
 
 /// The hero framing: the planet fills a `size`×`size` starfield frame.
 fn render_ct(size: u32, ct: &PType, seed: u32, angle: f32, style: &Style, out: &mut [u8]) {
+    render_ct_band(size, ct, seed, angle, style, 0, size, out)
+}
+
+/// [`render_ct`] restricted to rows `y0..y1`, which is how one frame is split
+/// across several wasm instances.
+///
+/// **Rows outside the band are left untouched**, so a caller hands each worker
+/// its own buffer and stitches the bands back together. Every band is shaded
+/// from the same pure function of pixel position, so the result is bit-identical
+/// to rendering the frame whole — `render_band_matches_whole` pins that.
+fn render_ct_band(size: u32, ct: &PType, seed: u32, angle: f32, style: &Style, y0: u32, y1: u32, out: &mut [u8]) {
     // 0.375 (was 0.42) leaves orbital margin for moons and rings.
     let rad = (size as f32 * 24.0 / 64.0) * ct.radius_scale;
-    let frame = Frame { size, rad, light: key_light(), sprite: false, clip: [0, 0, size, size] };
+    let clip = [0, y0.min(size), size, y1.min(size)];
+    let frame = Frame { size, rad, light: key_light(), sprite: false, clip };
     render_frame(&frame, ct, seed, angle, style, out);
 }
 
@@ -1609,6 +1654,112 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
             out[idx + 1] = (clamp01(px[1]) * 255.0) as u8;
             out[idx + 2] = (clamp01(px[2]) * 255.0) as u8;
             out[idx + 3] = if fr.sprite { (clamp01(a) * 255.0) as u8 } else { 255 };
+        }
+    }
+}
+
+#[cfg(test)]
+mod cloud_tests {
+    use super::*;
+
+    /// The fast longitude has to be good to well under a texel of the widest
+    /// map (1024), or the frozen deck would shear along the seam where the
+    /// approximation's fold sits.
+    #[test]
+    fn atan2_turns_tracks_libm() {
+        let mut worst: f32 = 0.0;
+        for i in 0..2000 {
+            let a = (i as f32 / 2000.0) * TAU - PI;
+            // Sweep radii too: the polynomial is fed a ratio, so a near-axis
+            // point is a different case from a diagonal one.
+            for &r in &[1.0f32, 0.05, 8.0] {
+                let (x, z) = (r * a.cos(), r * a.sin());
+                let want = z.atan2(x) * (1.0 / TAU);
+                let got = atan2_turns(z, x);
+                // Both wrap at ±0.5; compare the shorter way round.
+                let d = (got - want).abs();
+                worst = worst.max(d.min(1.0 - d));
+            }
+        }
+        // 1024 texels to the turn, so a texel is 9.8e-4 of a turn. The cubic
+        // lands at 3.3e-5 (2.0e-4 rad); the bound is where it stops being
+        // negligible against the bilinear filter, not where it sits today.
+        assert!(worst < 1.0e-4, "worst {worst} turns");
+    }
+
+    #[test]
+    fn atan2_turns_handles_axes_and_origin() {
+        for (z, x, want) in [(0.0, 1.0, 0.0), (1.0, 0.0, 0.25), (0.0, -1.0, 0.5), (-1.0, 0.0, -0.25)] {
+            let got: f32 = atan2_turns(z, x);
+            assert!((got - want).abs() < 1e-5, "atan2_turns({z}, {x}) = {got}, want {want}");
+        }
+        assert!(atan2_turns(0.0, 0.0).is_finite());
+    }
+
+    /// A bilinear fetch dead on a texel centre must return that texel, and the
+    /// longitude axis must wrap rather than clamp — a clamped seam would show
+    /// as a stationary band down the middle of every planet.
+    #[test]
+    fn cloud_map_sampling_is_exact_and_wraps() {
+        let m = CloudMap { w: 4, h: 2, warp: vec![0, 64, 128, 255, 10, 20, 30, 40], dens: vec![], phases: 1, base_a: vec![], base_b: vec![], surf: vec![] };
+        for i in 0..4 {
+            let u = (i as f32 + 0.5) / 4.0;
+            let got = m.sample(&m.warp, u, 0.25);
+            assert!((got - m.warp[i] as f32 / 255.0).abs() < 1e-6, "texel {i}: {got}");
+        }
+        // Half a texel before column 0 blends columns 3 and 0, not 0 and 0.
+        let seam = m.sample(&m.warp, 0.0, 0.25);
+        let want = (255.0 + 0.0) / 2.0 / 255.0;
+        assert!((seam - want).abs() < 1e-6, "seam {seam}, want {want}");
+        // And a whole turn later is the same place.
+        assert_eq!(m.sample(&m.warp, 0.0, 0.25), m.sample(&m.warp, 1.0, 0.25));
+        assert_eq!(m.sample(&m.warp, 0.3, 0.25), m.sample(&m.warp, -0.7, 0.25));
+    }
+
+    /// The map is the whole sphere, so one bake serves every angle — and the
+    /// cache must not rebuild for a change that cannot move it.
+    #[test]
+    fn cloud_map_cache_keys_on_what_it_depends_on() {
+        let w = cloud_map_w(128.0);
+        assert_eq!(w, cloud_map_w(200.0), "same octave of radius must reuse the bake");
+        assert!(cloud_map_w(4096.0) <= 1024, "capped");
+        assert!(cloud_map_w(1.0) >= 128, "floored");
+    }
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::*;
+
+    /// Splitting a frame across workers is only sound if a band is bit-identical
+    /// to the same rows of the whole frame — every worker shades from the same
+    /// pure function of pixel position, and nothing accumulates across rows.
+    #[test]
+    fn render_band_matches_whole() {
+        const SIZE: u32 = 96;
+        let n = (SIZE * SIZE * 4) as usize;
+        for &t in &[0usize, 7, 8, 10, 20, 24] {
+            let p: Vec<f32> = (0..NUM_PARAMS).map(|i| param(t, i as u32)).collect();
+            let feat = F_ALL | F_BAKED_CLOUDS | F_BAKED_SURFACE | F_BAKED_BANDS | F_MORPH_LUT;
+            let mut whole = vec![0u8; n];
+            render_rgba_features(SIZE, t, 1, 0.7, &p, 0, 0.7, 1, feat, &mut whole);
+
+            // Uneven bands on purpose: a real pool hands out a remainder.
+            for bands in [2u32, 3, 5, 7] {
+                let mut out = vec![0u8; n];
+                let step = SIZE.div_ceil(bands);
+                for b in 0..bands {
+                    let (y0, y1) = (b * step, ((b + 1) * step).min(SIZE));
+                    if y0 >= y1 {
+                        continue;
+                    }
+                    let mut band = vec![0u8; n];
+                    render_rgba_band(SIZE, t, 1, 0.7, &p, 0, 0.7, 1, feat, y0, y1, &mut band);
+                    let r = (y0 * SIZE * 4) as usize..(y1 * SIZE * 4) as usize;
+                    out[r.clone()].copy_from_slice(&band[r]);
+                }
+                assert_eq!(out, whole, "type {t}, {bands} bands");
+            }
         }
     }
 }

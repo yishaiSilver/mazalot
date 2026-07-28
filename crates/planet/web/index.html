@@ -102,6 +102,7 @@
       <div class="rowflex"><input type="number" id="seed" min="0" value="1" /><button class="mini" id="rndseed" title="random seed">🎲</button></div>
     </div>
     <div class="ctl"><label>Resolution <b id="resV">64</b></label><input type="range" id="res" min="40" max="240" step="8" value="64" /></div>
+    <div class="ctl"><label>Render workers <b id="poolV">—</b></label><input type="range" id="pool" min="0" max="16" step="1" value="8" /></div>
     <div class="ctl"><label>Spin speed <b id="spnV">0.012</b></label><input type="range" id="spn" min="0" max="0.05" step="0.002" value="0.012" /></div>
 
     <div class="grp">Look</div>
@@ -200,6 +201,99 @@ const off = document.createElement("canvas");
 const octx = off.getContext("2d");
 
 let wasm, bufPtr, bufLen, imgData, paramsPtr, NUM;
+
+// --- worker pool ------------------------------------------------------------
+// A wasm INSTANCE is single-threaded, but nothing says one instance. Each worker
+// holds its own instance and shades a horizontal band of the same frame; bands
+// are bit-identical to the same rows of a whole frame (`render_band_matches_whole`
+// pins that in Rust), so stitching them is exact rather than approximate.
+//
+// Transferable ArrayBuffers, NOT SharedArrayBuffer — shared memory needs COOP/COEP
+// headers, which a static host like GitHub Pages cannot set. This needs neither.
+const POOL_SRC = `
+let w = null, buf = 0, pp = 0, NUM = 0, SZ = 0;
+onmessage = async (e) => {
+  const m = e.data;
+  if (m.cmd === "init") {
+    w = (await WebAssembly.instantiate(m.bytes, {})).instance.exports;
+    NUM = w.num_params();
+    pp = w.alloc(NUM * 4);
+    postMessage({ ready: 1 });
+  } else if (m.cmd === "size") {
+    if (buf) w.dealloc(buf, SZ * SZ * 4);
+    SZ = m.size; buf = w.alloc(SZ * SZ * 4);
+    postMessage({ ready: 1 });
+  } else if (m.cmd === "band") {
+    new Float32Array(w.memory.buffer, pp, NUM).set(m.params);
+    w.render_band(buf, SZ, m.type, m.seed, m.angle, pp, m.palette, m.dither, m.moons, m.feat, m.y0, m.y1);
+    // Only the band travels back, and it moves rather than copies.
+    const bytes = new Uint8Array(w.memory.buffer, buf + m.y0 * SZ * 4, (m.y1 - m.y0) * SZ * 4).slice();
+    postMessage({ y0: m.y0, bytes }, [bytes.buffer]);
+  }
+};`;
+
+const pool = { workers: [], size: 0, native: 0, busy: false };
+// Leave the main thread and the browser's own threads room: on a 4-core box a
+// pool of 4 measured WORSE than 2 (4.57 ms main-thread, 1.70 at 2, 2.21 at 4),
+// while a 16-thread laptop's sweep put the knee at 8. `cores - 2` fits both.
+let poolWant = Math.max(1, Math.min(8, (navigator.hardwareConcurrency || 4) - 2));
+let wasmBytes = null;
+
+async function poolResize(n) {
+  n = Math.max(0, Math.min(32, n | 0));
+  for (const w of pool.workers) w.terminate();
+  pool.workers = [];
+  pool.native = 0;
+  if (n === 0 || !wasmBytes) { pool.size = 0; return; }
+  const url = URL.createObjectURL(new Blob([POOL_SRC], { type: "text/javascript" }));
+  const ws = Array.from({ length: n }, () => new Worker(url));
+  URL.revokeObjectURL(url);
+  await Promise.all(ws.map(w => new Promise((res, rej) => {
+    w.onerror = () => rej(new Error("worker failed — a CSP may forbid blob: workers"));
+    w.onmessage = () => res();
+    w.postMessage({ cmd: "init", bytes: wasmBytes });
+  })));
+  pool.workers = ws;
+  pool.size = n;
+}
+
+const askWorker = (w, msg, xfer) => new Promise(res => {
+  w.onmessage = e => res(e.data);
+  w.postMessage(msg, xfer || []);
+});
+
+/// Split `NATIVE` rows across the pool and stitch the bands into `imgData`.
+/// Bands are sized by area, not by row count: the disc is widest in the middle,
+/// so equal row counts would leave the edge workers idle. Weighting by the
+/// chord's length evens the shading out.
+async function renderPooled(a) {
+  if (pool.native !== NATIVE) {
+    await Promise.all(pool.workers.map(w => askWorker(w, { cmd: "size", size: NATIVE })));
+    pool.native = NATIVE;
+  }
+  const n = pool.workers.length;
+  const cuts = [0];
+  // Cumulative half-chord area, inverted to place n equal-work cuts.
+  const area = y => { const t = 2 * y / NATIVE - 1; return Math.asin(Math.max(-1, Math.min(1, t))) + t * Math.sqrt(Math.max(0, 1 - t * t)); };
+  const total = area(NATIVE) - area(0);
+  for (let k = 1; k < n; k++) {
+    const want = area(0) + total * k / n;
+    let lo = cuts[k - 1], hi = NATIVE;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (area(mid) < want) lo = mid + 1; else hi = mid; }
+    cuts.push(Math.max(cuts[k - 1], lo));
+  }
+  cuts.push(NATIVE);
+  const jobs = [];
+  for (let k = 0; k < n; k++) {
+    const [y0, y1] = [cuts[k], cuts[k + 1]];
+    if (y0 >= y1) continue;
+    jobs.push(askWorker(pool.workers[k], {
+      cmd: "band", type: typeIdx, seed, angle, params: a.params,
+      palette: a.palette, dither: a.dither, moons: a.moons, feat: a.feat, y0, y1,
+    }));
+  }
+  for (const r of await Promise.all(jobs)) imgData.data.set(r.bytes, r.y0 * NATIVE * 4);
+}
 let NATIVE = 64, typeIdx = 0, seed = 1, angle = 0, spin = 0.012;
 const sliders = {}; // pi -> { input, val }
 
@@ -266,25 +360,43 @@ function applyFeatures(set) {
     if (f.style === "moons") moons = 0;
     if (f.style === "dither") dither = 0;
   }
-  return { feat, moons, dither, palette: parseInt($("palette").value) };
+  return { feat, moons, dither, palette: parseInt($("palette").value), params: pv.slice() };
 }
 
 let emaMs = 0;
-function frame() {
+let inFlight = false;
+async function frame() {
+  // The pool is async, so a slow frame must not queue another behind it.
+  if (inFlight) return;
+  inFlight = true;
   angle += spin;
   const a = applyFeatures(on);
   const t0 = performance.now();
-  wasm.render_features(bufPtr, NATIVE, typeIdx, seed, angle, paramsPtr, a.palette, a.dither, a.moons, a.feat);
+  if (pool.size > 0) {
+    try {
+      await renderPooled(a);
+    } catch (e) {
+      // A pool that dies mid-flight falls back rather than freezing the demo.
+      $("poolV").textContent = "unavailable";
+      await poolResize(0);
+      poolWant = 0;
+    }
+  }
+  if (pool.size === 0) {
+    wasm.render_features(bufPtr, NATIVE, typeIdx, seed, angle, paramsPtr, a.palette, a.dither, a.moons, a.feat);
+    imgData.data.set(new Uint8Array(wasm.memory.buffer, bufPtr, bufLen));
+  }
   emaMs += (performance.now() - t0 - emaMs) * 0.08;
-  const view = new Uint8Array(wasm.memory.buffer, bufPtr, bufLen);
-  imgData.data.set(view);
+  inFlight = false;
   octx.putImageData(imgData, 0, 0);
   sctx.clearRect(0, 0, stage.width, stage.height);
   sctx.drawImage(off, 0, 0, stage.width, stage.height);
   $("labMs").textContent = emaMs.toFixed(3);
   $("labFps").textContent = emaMs > 0 ? (1000 / emaMs).toFixed(0) : "–";
-  requestAnimationFrame(frame);
 }
+// `frame` is async, so it cannot re-arm itself from inside without the rAF
+// clock and the render getting out of step. Drive it from a plain loop instead.
+function tick() { frame(); requestAnimationFrame(tick); }
 
 // Build the tick-boxes.
 function buildFeats() {
@@ -358,7 +470,8 @@ async function measure() {
 
 async function main() {
   const res = await fetch("./planet.wasm?v=" + Date.now(), { cache: "no-store" });
-  const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
+  wasmBytes = await res.arrayBuffer();
+  const { instance } = await WebAssembly.instantiate(wasmBytes, {});
   wasm = instance.exports;
 
   FEAT_ALL = wasm.feat_all();
@@ -385,7 +498,21 @@ async function main() {
   $("dth").addEventListener("input", () => $("dthV").textContent = parseFloat($("dth").value).toFixed(2));
   $("crt").addEventListener("change", () => $("crtfx").classList.toggle("on", $("crt").checked));
 
-  requestAnimationFrame(frame);
+  // The pool is worth what the machine's cores are worth; 8 is the knee on a
+  // 16-thread laptop (past it, each worker's slice shrinks faster than the
+  // dispatch grows). 0 renders on the main thread, which is the A/B.
+  $("pool").value = String(poolWant);
+  $("pool").addEventListener("input", async () => {
+    const n = parseInt($("pool").value);
+    $("poolV").textContent = "…";
+    await poolResize(n);
+    poolWant = pool.size;
+    $("poolV").textContent = pool.size === 0 ? "off (main thread)" : `${pool.size}`;
+  });
+  await poolResize(poolWant);
+  $("poolV").textContent = pool.size === 0 ? "off (main thread)" : `${pool.size}`;
+
+  requestAnimationFrame(tick);
 }
 main().catch(e => { $("name").textContent = "failed to load wasm"; $("sub").textContent = String(e); });
 </script>
