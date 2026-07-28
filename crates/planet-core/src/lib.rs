@@ -36,6 +36,45 @@ use noise_core::{
 };
 
 // ---------------------------------------------------------------------------
+// Level of detail
+// ---------------------------------------------------------------------------
+
+/// Octave counts for the shader's fBm fields, derived from the disc's pixel
+/// radius.
+///
+/// A tile puts one sphere radius across `rad` px, so a field sampled at
+/// `p · freq` has its `k`-th octave's lattice cell land at
+/// `rad / (freq · 2^(k-1))` px. Under two pixels that octave is past Nyquist:
+/// unresolvable, and on a turning planet it reads as crawling speckle. Dropping
+/// it is cheaper *and* steadier — a mip level, not a quality knob.
+#[derive(Clone, Copy)]
+struct Lod {
+    /// Disc radius in px — how finely this tile can resolve anything.
+    rad: f32,
+}
+
+impl Lod {
+    fn for_disc(rad_px: f32) -> Lod {
+        Lod { rad: rad_px.max(1.0) }
+    }
+
+    /// Octaves for a domain warp's three displacement components.
+    const WARP: u32 = 2;
+
+    /// Solves `rad / (freq · 2^(k-1)) >= 2` for the largest whole `k`, clamped
+    /// to `1..=full`.
+    #[inline]
+    fn oct(&self, freq: f32, full: u32) -> u32 {
+        let cells = self.rad / (2.0 * freq.max(0.01)); // = 2^(k-1) at the limit
+        if cells <= 1.0 {
+            return 1;
+        }
+        let k = 1 + cells.log2() as u32;
+        k.clamp(1, full)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Planet type table
 // ---------------------------------------------------------------------------
 
@@ -247,7 +286,7 @@ fn seed_offsets(seed: u32) -> [f32; 3] {
 }
 
 /// A drifting spiral cyclone (great-spot) tint on a banded world, with a calm eye.
-fn great_spot(col: Rgb, sx: f32, sy: f32, sz: f32, angle: f32, intensity: f32) -> Rgb {
+fn great_spot(col: Rgb, sx: f32, sy: f32, sz: f32, angle: f32, intensity: f32, lod: Lod) -> Rgb {
     let spot_lat = 0.28;
     let spot_lon = 0.6 + angle.sin() * 0.18; // gently oscillates (loop-safe)
     let lon = sz.atan2(sx);
@@ -259,9 +298,16 @@ fn great_spot(col: Rgb, sx: f32, sy: f32, sz: f32, angle: f32, intensity: f32) -
         dlon += TAU;
     }
     let dlat = sy - spot_lat;
+    let base = ((dlon * 1.05).powi(2) + (dlat * 2.2).powi(2)).sqrt();
+    // The boundary below scales `base` by `0.82 + 0.4·edge`, `edge` in [0, 1],
+    // so 0.82·base is the smallest it can be: past that the pixel is outside
+    // whatever the noise says. Most of a banded disc is. Exact rejection.
+    if base * 0.82 >= 1.0 {
+        return col;
+    }
     // Turbulent, irregular boundary — not a clean geometric oval.
-    let edge = fbm(dlon * 3.0 + sy * 4.0, dlat * 3.0, sz * 2.0, 2);
-    let d = ((dlon * 1.05).powi(2) + (dlat * 2.2).powi(2)).sqrt() * (0.82 + 0.4 * edge);
+    let edge = fbm(dlon * 3.0 + sy * 4.0, dlat * 3.0, sz * 2.0, lod.oct(4.0, 2));
+    let d = base * (0.82 + 0.4 * edge);
     if d >= 1.0 {
         return col;
     }
@@ -270,7 +316,7 @@ fn great_spot(col: Rgb, sx: f32, sy: f32, sz: f32, angle: f32, intensity: f32) -
     let (s, c) = swirl.sin_cos();
     let lx = dlon * c - dlat * s;
     let ly = dlon * s + dlat * c;
-    let streak = fbm(lx * 8.0, ly * 8.0, sy * 2.0, 4);
+    let streak = fbm(lx * 8.0, ly * 8.0, sy * 2.0, lod.oct(8.0, 4));
     let core = smoothstep(1.0, 0.15, d) * intensity;
     let spot_col = mix([0.80, 0.36, 0.26], [0.93, 0.66, 0.46], smoothstep(0.40, 0.82, streak));
     let mut out = mix(col, spot_col, core * 0.78);
@@ -281,7 +327,7 @@ fn great_spot(col: Rgb, sx: f32, sy: f32, sz: f32, angle: f32, intensity: f32) -
 }
 
 /// Shimmering polar aurora intensity (0..1) at this surface point.
-fn aurora_glow(sx: f32, sy: f32, sz: f32, angle: f32) -> f32 {
+fn aurora_glow(sx: f32, sy: f32, sz: f32, angle: f32, lod: Lod) -> f32 {
     let lat = sy.abs();
     let band = smoothstep(0.55, 0.70, lat) * (1.0 - smoothstep(0.82, 0.96, lat));
     if band <= 0.0 {
@@ -289,7 +335,7 @@ fn aurora_glow(sx: f32, sy: f32, sz: f32, angle: f32) -> f32 {
     }
     let lon = sz.atan2(sx);
     // curtains: drift in longitude + shimmer over time
-    let curtain = fbm(lon * 2.5 + angle * 1.5, lat * 9.0, sy * 3.0 + angle, 3);
+    let curtain = fbm(lon * 2.5 + angle * 1.5, lat * 9.0, sy * 3.0 + angle, lod.oct(9.0, 3));
     band * smoothstep(0.48, 0.78, curtain)
 }
 
@@ -330,11 +376,11 @@ fn lightning_flash(sx: f32, sy: f32, angle: f32) -> (f32, Rgb) {
     (mag, col)
 }
 
-fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32) -> (Rgb, f32) {
+fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32, lod: Lod) -> (Rgb, f32) {
     let (px, py, pz) = (sx + ofs[0], sy + ofs[1], sz + ofs[2]);
     let (mut col, mut emis) = match ct.base {
         Base::Terrestrial => {
-            let raw = fbm(px * ct.freq, py * ct.freq, pz * ct.freq, if ct.ridged { 5 } else { 6 });
+            let raw = fbm(px * ct.freq, py * ct.freq, pz * ct.freq, lod.oct(ct.freq, if ct.ridged { 5 } else { 6 }));
             let n = if ct.ridged { 1.0 - (2.0 * raw - 1.0).abs() } else { raw };
             let h = contrast(n, ct.contrast);
             let mut col = ramp(ct.stops, h);
@@ -343,7 +389,7 @@ fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32) -> 
             (col, 0.0)
         }
         Base::Cratered => {
-            let m = smoothstep(0.4, 0.6, fbm(px * 1.2, py * 1.2, pz * 1.2, 5));
+            let m = smoothstep(0.4, 0.6, fbm(px * 1.2, py * 1.2, pz * 1.2, lod.oct(1.2, 5)));
             let base_col = mix(ct.dark, ct.light, m);
             let w = worley(px * ct.freq, py * ct.freq, pz * ct.freq);
             let bowl = smoothstep(0.0, 0.35, w);
@@ -360,22 +406,22 @@ fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32) -> 
             // continuously — the real gas-giant look, not a uniform wobble.
             let flow = angle * 0.16 * (sy * ct.bands * 0.5).sin();
             // Domain warp makes the band turbulence curl and marble like fluid.
-            let warp = fbm_warp((px + flow) * 1.3, py * 1.3, pz * 1.3, 5, 0.8);
+            let warp = fbm_warp((px + flow) * 1.3, py * 1.3, pz * 1.3, Lod::WARP, lod.oct(1.3, 5), 0.8);
             let lat = sy + (warp - 0.5) * ct.turb;
             let band = 0.5 + 0.5 * (lat * ct.bands).sin();
             let mut col = mix(ct.dark, ct.light, band);
-            let fine = fbm((px + flow * 1.4) * 4.0, py * 4.0, pz * 4.0, 4);
+            let fine = fbm((px + flow * 1.4) * 4.0, py * 4.0, pz * 4.0, lod.oct(4.0, 4));
             col = mix(col, ct.light, smoothstep(0.55, 0.8, fine) * 0.35);
             if ct.spot > 0.0 {
-                col = great_spot(col, sx, sy, sz, angle, ct.spot);
+                col = great_spot(col, sx, sy, sz, angle, ct.spot, lod);
             }
             (col, 0.0)
         }
         Base::Emissive => {
-            let n = contrast(fbm(px * ct.freq, py * ct.freq, pz * ct.freq, 6), 1.7);
+            let n = contrast(fbm(px * ct.freq, py * ct.freq, pz * ct.freq, lod.oct(ct.freq, 6)), 1.7);
             // Molten flow: a slow noise field advects across the surface, so the
             // glow brightens and dims in drifting patches instead of pulsing.
-            let flow = fbm(px * 2.2 + angle * 0.7, py * 2.2, pz * 2.2 - angle * 0.5, 3);
+            let flow = fbm(px * 2.2 + angle * 0.7, py * 2.2, pz * 2.2 - angle * 0.5, lod.oct(2.2, 3));
             let glow = clamp01(smoothstep(ct.glow_e0, ct.glow_e1, n) * (0.55 + 0.9 * flow));
             // Palette cycling: warm colors flow along the glow over time.
             let mid = mix(ct.glow_lo, ct.glow_hi, 0.5);
@@ -386,7 +432,7 @@ fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32) -> 
             // Storm bands churn: latitude-dependent shear + domain warp for
             // roiling, fluid-looking cloud cover.
             let flow = (0.5 + 0.3 * (sy * 3.0).cos()) * angle.sin();
-            let t = fbm_warp((px + flow) * 2.0, py * 2.0, pz * 2.0, 5, 0.7);
+            let t = fbm_warp((px + flow) * 2.0, py * 2.0, pz * 2.0, Lod::WARP, lod.oct(2.0, 5), 0.7);
             let band = 0.5 + 0.5 * (sy * ct.bands + (t - 0.5) * 6.0 * ct.turb).sin();
             (mix(ct.dark, ct.light, clamp01(band * 0.6 + t * 0.4)), 0.0)
         }
@@ -395,7 +441,7 @@ fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32) -> 
     // Aurora — shimmering polar curtains, hue palette-cycled over time/latitude
     // (green → cyan → violet). Glows on the night side via emis.
     if ct.aurora > 0.0 {
-        let a = aurora_glow(sx, sy, sz, angle) * ct.aurora;
+        let a = aurora_glow(sx, sy, sz, angle, lod) * ct.aurora;
         let ac = cycle3([0.25, 0.95, 0.45], [0.35, 0.85, 0.95], [0.65, 0.40, 1.0], sy * 1.4 + angle * 0.1);
         col[0] = clamp01(col[0] + ac[0] * a);
         col[1] = clamp01(col[1] + ac[1] * a);
@@ -580,6 +626,9 @@ struct Frame {
     /// Cut the planet out on transparent pixels — a tile a scene compositor can
     /// blit — instead of filling the frame with a starfield.
     sprite: bool,
+    /// The sub-rect to write, `[x0, y0, x1, y1)`; outside it is left alone. The
+    /// hero framing passes the whole frame.
+    clip: [u32; 4],
 }
 
 /// The hero framing's fixed key light, over the viewer's left shoulder.
@@ -593,7 +642,7 @@ fn key_light() -> [f32; 3] {
 fn render_ct(size: u32, ct: &PType, seed: u32, angle: f32, style: &Style, out: &mut [u8]) {
     // 0.375 (was 0.42) leaves orbital margin for moons and rings.
     let rad = (size as f32 * 24.0 / 64.0) * ct.radius_scale;
-    let frame = Frame { size, rad, light: key_light(), sprite: false };
+    let frame = Frame { size, rad, light: key_light(), sprite: false, clip: [0, 0, size, size] };
     render_frame(&frame, ct, seed, angle, style, out);
 }
 
@@ -614,18 +663,55 @@ fn tile_style() -> Style {
 /// +z toward the viewer). `angle` turns the surface and advances the weather,
 /// exactly as in the hero framing.
 pub fn render_tile(type_idx: usize, seed: u32, angle: f32, light: [f32; 3], rad_px: f32) -> Tile {
-    let ct = &TYPES[type_idx % TYPES.len()];
+    let size = tile_size(type_idx, rad_px);
+    let mut tile = Tile::default();
+    render_tile_into(&mut tile, type_idx, seed, angle, light, rad_px, [0, 0, size, size]);
+    tile
+}
+
+/// The edge length [`render_tile`] produces for this type at this radius —
+/// needed *before* rendering, to ask `scene_core::visible_tile_rect` which part
+/// of the tile will be seen.
+pub fn tile_size(type_idx: usize, rad_px: f32) -> u32 {
     // Rings reach `ring_outer` disc radii sideways; a plain world needs only a
     // pixel of slack for its dark limb. `radius_scale` — which shrinks a ringed
     // world so its rings fit the hero's fixed square — is deliberately ignored
     // here: the tile is grown instead of the planet shrunk.
+    let ct = &TYPES[type_idx % TYPES.len()];
     let margin = if ct.rings { rad_px * (ct.ring_outer - 1.0) + 1.5 } else { 1.5 };
-    let size = (((rad_px + margin) * 2.0).ceil() as u32).max(6);
-    let mut px = vec![0u8; (size * size * 4) as usize];
-    let frame = Frame { size, rad: rad_px, light, sprite: true };
-    render_frame(&frame, ct, seed, angle, &tile_style(), &mut px);
-    Tile { px, size }
+    (((rad_px + margin) * 2.0).ceil() as u32).max(6)
 }
+
+/// [`render_tile`] into a tile you already own, shading only the tile pixels in
+/// `clip` (`[x0, y0, x1, y1)`, tile px).
+///
+/// Pass `scene_core::visible_tile_rect` as the clip and the off-screen part of a
+/// zoomed-in body's tile is never shaded.
+///
+/// **Pixels outside `clip` are left as they were**, not cleared: the tile is only
+/// valid for the placement its clip came from. That is exactly what `blit` reads
+/// back, so a reused buffer cannot leak a previous body into the scene — but do
+/// not hand the tile to anything that reads wider.
+pub fn render_tile_into(
+    tile: &mut Tile,
+    type_idx: usize,
+    seed: u32,
+    angle: f32,
+    light: [f32; 3],
+    rad_px: f32,
+    clip: [u32; 4],
+) {
+    let ct = &TYPES[type_idx % TYPES.len()];
+    let size = tile_size(type_idx, rad_px);
+    tile.ensure(size);
+    let clip = [clip[0].min(size), clip[1].min(size), clip[2].min(size), clip[3].min(size)];
+    let frame = Frame { size, rad: rad_px, light, sprite: true, clip };
+    render_frame(&frame, ct, seed, angle, &tile_style(), &mut tile.px);
+}
+
+/// A glint below this cannot survive the 22-level quantization (one level is
+/// 1/22 ≈ 0.045), so the shimmer noise modulating it is not worth evaluating.
+const SPEC_FLOOR: f32 = 1.0 / 1024.0;
 
 fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, out: &mut [u8]) {
     let size = fr.size;
@@ -657,10 +743,54 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
         }
     }
 
-    for iy in 0..size {
-        for ix in 0..size {
+    let lod = Lod::for_disc(rad);
+    // Functions of `angle` and `seed` alone — hoisted out of the pixel loop.
+    let (cs, cc) = (angle * 2.0).sin_cos();
+    let morph = angle.sin() * 0.6;
+    let swirl_phase = (angle * 0.6).sin() * 1.6 * ct.storm_cells;
+    let vortex: [(f32, f32); 2] = [0, 1].map(|k: i32| {
+        (
+            (hash3(seed as i32, k * 7 + 1, 3) * 2.0 - 1.0) * 1.6 + ofs[0],
+            (hash3(seed as i32, k * 7 + 2, 3) * 2.0 - 1.0) * 1.6 + ofs[2],
+        )
+    });
+
+    // A sprite is empty off the disc and off a ringed world's ring ellipse, so a
+    // row need only be walked across those. Moons orbit out in the margin, so a
+    // frame that draws them opts out.
+    let narrow = fr.sprite && nmoon == 0;
+    // Half-width of the covered band at row offset `ny`, in disc radii.
+    let cover = |ny: f32| {
+        let disc = (1.0 - ny * ny).max(0.0).sqrt();
+        if ct.rings {
+            let rr = (ct.ring_outer * ct.ring_outer - (ny / RING_SQUASH).powi(2)).max(0.0).sqrt();
+            disc.max(rr)
+        } else {
+            disc
+        }
+    };
+
+    let [clip_x0, clip_y0, clip_x1, clip_y1] = fr.clip;
+    for iy in clip_y0..clip_y1 {
+        let ny = (cy - (iy as f32 + 0.5)) / rad;
+        // Clear whatever of the clip the narrowing leaves uncovered — a reused
+        // buffer must not show the previous body there.
+        let (mut x0, mut x1) = (clip_x0, clip_x1);
+        if narrow {
+            let half = cover(ny) * rad + 1.0; // +1 px of slack for the rounding
+            x0 = clip_x0.max((cx - half).floor().max(0.0) as u32);
+            x1 = clip_x1.min((cx + half).ceil().clamp(0.0, size as f32) as u32);
+            let row = (iy * size * 4) as usize;
+            let span = |a: u32, b: u32| row + (a * 4) as usize..row + (b * 4) as usize;
+            if x1 <= x0 {
+                out[span(clip_x0, clip_x1)].fill(0);
+                continue;
+            }
+            out[span(clip_x0, x0)].fill(0);
+            out[span(x1, clip_x1)].fill(0);
+        }
+        for ix in x0..x1 {
             let nx = (ix as f32 + 0.5 - cx) / rad;
-            let ny = (cy - (iy as f32 + 0.5)) / rad;
             let d2 = nx * nx + ny * ny;
 
             let mut o;
@@ -673,41 +803,51 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                 let sy = ny;
                 let sz = -nx * sina + nz * cosa;
 
-                let (mut col, emis) = surface(ct, sx, sy, sz, ofs, angle);
+                let (mut col, emis) = surface(ct, sx, sy, sz, ofs, angle, lod);
                 if ct.clouds > 0.0 {
                     // Clouds drift over the surface (2x = parallax, loops) and
                     // slowly billow — a periodic morph reveals new cloud structure
                     // so weather forms and dissipates rather than sliding rigidly.
-                    let (cs, cc) = (angle * 2.0).sin_cos();
                     let mut cx3 = nx * cc + nz * cs + ofs[0];
                     let mut cz3 = -nx * cs + nz * cc + ofs[2];
-                    let morph = angle.sin() * 0.6;
 
                     // Rotating storm cells: swirl the cloud field around a couple
                     // of seeded vortex centers, spinning with the animation.
                     if ct.storm_cells > 0.0 {
-                        for k in 0..2 {
-                            let vx = (hash3(seed as i32, k * 7 + 1, 3) * 2.0 - 1.0) * 1.6 + ofs[0];
-                            let vz = (hash3(seed as i32, k * 7 + 2, 3) * 2.0 - 1.0) * 1.6 + ofs[2];
+                        for (vx, vz) in vortex {
                             let (dx, dz) = (cx3 - vx, cz3 - vz);
-                            let fall = (-(dx * dx + dz * dz) * 2.2).exp();
+                            let d2v = dx * dx + dz * dz;
+                            // exp(-2.2·d²) is under 1e-4 past here and only
+                            // scales a rotation angle, so the eddy does nothing.
+                            // Most of a disc is this far out.
+                            if d2v > 4.2 {
+                                continue;
+                            }
+                            let fall = (-d2v * 2.2).exp();
                             // Bounded (periodic) swirl: the eddy churns back and forth
                             // rather than winding into ever-tighter rings as `angle`
                             // grows unbounded on the continuously-running web.
-                            let sw = fall * (angle * 0.6).sin() * 1.6 * ct.storm_cells;
-                            let (ss, sc) = sw.sin_cos();
+                            let (ss, sc) = (fall * swirl_phase).sin_cos();
                             cx3 = vx + dx * sc - dz * ss;
                             cz3 = vz + dx * ss + dz * sc;
                         }
                     }
 
                     let dens = |ox: f32, oz: f32| {
-                        fbm((cx3 + ox) * 2.8, ny * 2.8 + ofs[1] + morph, (cz3 + oz) * 2.8 + morph, 4)
+                        let n = lod.oct(2.8, 4);
+                        fbm((cx3 + ox) * 2.8, ny * 2.8 + ofs[1] + morph, (cz3 + oz) * 2.8 + morph, n)
                     };
                     // Wispy, fractal cloud tops (domain-warped) so they break into
                     // ragged fronts instead of clumping into round blobs. Shadow
                     // uses the cheap plain density.
-                    let cloud = fbm_warp(cx3 * 2.8, ny * 2.8 + ofs[1] + morph, cz3 * 2.8 + morph, 4, 0.9);
+                    let cloud = fbm_warp(
+                        cx3 * 2.8,
+                        ny * 2.8 + ofs[1] + morph,
+                        cz3 * 2.8 + morph,
+                        Lod::WARP,
+                        lod.oct(2.8, 4),
+                        0.9,
+                    );
 
                     let shadow = smoothstep(0.55, 0.72, dens(l[0] * 0.45, l[2] * 0.45));
                     let sh = 1.0 - 0.22 * shadow * ct.clouds;
@@ -726,15 +866,23 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                     // moon's dark maria glare far less than its bright highlands.
                     let alb = col[0] * 0.3 + col[1] * 0.59 + col[2] * 0.11;
                     let mat = 1.0 - ct.spec_albedo * (1.0 - alb);
-                    // Cycling shimmer so water/ice glints twinkle over time.
-                    let shimmer = 0.82 + 0.18 * fbm(sx * 5.0 + angle * 2.5, sy * 5.0, sz * 5.0, 2);
-                    let sp = ndh.powf(ct.shininess) * ct.specular * mat * shimmer;
-                    o[0] = clamp01(o[0] + sp);
-                    o[1] = clamp01(o[1] + sp);
-                    o[2] = clamp01(o[2] + sp);
+                    // `ndh^shininess` collapses fast, so over most of the disc
+                    // the glint cannot show at all. `shimmer <= 1`, so bound the
+                    // whole term first and skip its fBm where it can't.
+                    let peak = ndh.powf(ct.shininess) * ct.specular * mat;
+                    if peak > SPEC_FLOOR {
+                        // Cycling shimmer so water/ice glints twinkle over time.
+                        let shimmer =
+                            0.82 + 0.18 * fbm(sx * 5.0 + angle * 2.5, sy * 5.0, sz * 5.0, lod.oct(5.0, 2));
+                        let sp = peak * shimmer;
+                        o[0] = clamp01(o[0] + sp);
+                        o[1] = clamp01(o[1] + sp);
+                        o[2] = clamp01(o[2] + sp);
+                    }
                 }
                 if has_atmo {
-                    let rim = (1.0 - nz).powf(3.0) * 0.6;
+                    // `powf(3.0)` is a full exp/log even for a literal exponent.
+                    let rim = (1.0 - nz).powi(3) * 0.6;
                     o[0] = clamp01(o[0] + ct.atmo[0] * rim);
                     o[1] = clamp01(o[1] + ct.atmo[1] * rim);
                     o[2] = clamp01(o[2] + ct.atmo[2] * rim);

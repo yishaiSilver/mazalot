@@ -9,7 +9,7 @@
 //!   • zooming onto the sun vs a planet compares the two body shaders.
 //! Native only (uses `std::time::Instant`); run: `cargo run --release --bin bench`.
 
-use solar::{render_system, render_system_cached, Camera, System};
+use solar::{planet_world_pos, render_system, render_system_cached, Camera, System};
 use std::time::Instant;
 
 const W: u32 = 1000;
@@ -29,6 +29,22 @@ fn ms(sys: &System, cam: &Camera, buf: &mut [u8]) -> f64 {
         let ta = i as f32 * 0.013; // advance clocks so nothing is cached away
         let bg = 12.0 + i as f32 * 3.0; // pan -> full-frame cache miss every frame
         render_system(sys, W, H, cam, bg, 0.0, ta, ta * 1.3, ta * 0.7, buf);
+    }
+    t.elapsed().as_secs_f64() * 1000.0 / FRAMES as f64
+}
+
+/// Mean ms/frame with the ORBIT clock frozen, so a camera aimed at a body stays
+/// aimed at it; the spin/boil clocks still advance, so nothing is cached away.
+/// Without this a body scenario sweeps its planet out of frame within a few
+/// frames and quietly measures an empty sky.
+fn ms_still(sys: &System, cam: &Camera, buf: &mut [u8]) -> f64 {
+    for i in 0..4 {
+        render_system(sys, W, H, cam, 0.0, 0.0, 0.0, i as f32 * 0.1, i as f32 * 0.1, buf);
+    }
+    let t = Instant::now();
+    for i in 0..FRAMES {
+        let ta = i as f32 * 0.013;
+        render_system(sys, W, H, cam, 0.0, 0.0, 0.0, ta * 1.3, ta * 0.7, buf);
     }
     t.elapsed().as_secs_f64() * 1000.0 / FRAMES as f64
 }
@@ -55,7 +71,9 @@ fn main() {
     let far = Camera { x: 1.0e7, y: 1.0e7, zoom: fz }; // all bodies off-screen -> background only
     let far_zoomed = Camera { x: 1.0e7, y: 1.0e7, zoom: fz * 12.0 }; // + nebula & far-layer faded
     let sun = Camera { x: 0.0, y: 0.0, zoom: fz * 22.0 }; // fill screen with the sun
-    let planet = &sys.planets.iter().find(|p| p.orbit > 0.0).cloned();
+    // A mid-system world, framed where it actually IS at t = 0 (see `ms_still`).
+    let probe = sys.planets.len() / 2;
+    let (bx, by) = planet_world_pos(&sys, probe, 0.0);
 
     set_density(&mut sys, 0.5); // default
     let t_full = ms(&sys, &fit, &mut buf);
@@ -64,29 +82,17 @@ fn main() {
     let t_bg_nostars = ms(&sys, &far, &mut buf); // base + nebula + orbits
     let t_base = ms(&sys, &far_zoomed, &mut buf); // base fill + orbits (nebula faded)
     set_density(&mut sys, 0.5);
-    let t_sun = ms(&sys, &sun, &mut buf); // sun tile dominates
+    let t_sun = ms_still(&sys, &sun, &mut buf); // sun tile dominates
 
-    // A planet filling the view: follow it to centre, zoom in.
-    let t_planet = if let Some(p) = planet {
-        // place it at the top of its orbit (front) by choosing t so sin≈1
-        let cam = Camera { x: p.orbit, y: 0.0, zoom: fz * 22.0 };
-        ms(&sys, &cam, &mut buf)
-    } else {
-        0.0
-    };
+    // A planet filling the view, at the shipped detail cap.
+    let pcam = Camera { x: bx, y: by, zoom: fz * 22.0 };
+    let t_planet = ms_still(&sys, &pcam, &mut buf);
 
-    // The same full-screen planet with the detail cap pinned LOW (56): the tile
-    // stays small, so the per-pixel surface shader is cheap — the recommended way
-    // to keep a fills-the-screen planet fast (vs the ~34 ms at the 160 cap).
-    let t_planet_lowcap = if let Some(p) = planet {
-        sys.set_view(1.0, 1.0, 1.0, 1.0, 1.0, 56.0, 110.0, 0.5, 1.0); // planet_detail = 56
-        let cam = Camera { x: p.orbit, y: 0.0, zoom: fz * 22.0 };
-        let m = ms(&sys, &cam, &mut buf);
-        sys.set_view(1.0, 1.0, 1.0, 1.0, 1.0, 160.0, 110.0, 0.5, 1.0); // restore default
-        m
-    } else {
-        0.0
-    };
+    // The cap bounds the tile RADIUS, so cost falls with its square — still the
+    // biggest single lever on a zoomed-in scene.
+    sys.set_view(1.0, 1.0, 1.0, 1.0, 1.0, 56.0, 110.0, 0.5, 1.0); // planet_detail = 56
+    let t_planet_lowcap = ms_still(&sys, &pcam, &mut buf);
+    sys.set_view(1.0, 1.0, 1.0, 1.0, 1.0, 160.0, 110.0, 0.5, 1.0); // restore default
 
     let bodies = (t_full - t_bg).max(0.0);
     let stars = (t_bg - t_bg_nostars).max(0.0);

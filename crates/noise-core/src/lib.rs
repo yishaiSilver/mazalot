@@ -9,17 +9,32 @@
 // Noise: 3D value-noise fBm + 3D Worley (cellular) for craters.
 // ---------------------------------------------------------------------------
 
-pub fn hash3(x: i32, y: i32, z: i32) -> f32 {
-    // Murmur3-style bit mixer -> well-distributed, mean ~0.5.
-    let mut h = (x as u32).wrapping_mul(0x8da6_b343)
-        ^ (y as u32).wrapping_mul(0xd816_3841)
-        ^ (z as u32).wrapping_mul(0xcb1a_b31f);
+// Split out so `value_noise` can weight each axis once — see there.
+const HX: u32 = 0x8da6_b343;
+const HY: u32 = 0xd816_3841;
+const HZ: u32 = 0xcb1a_b31f;
+
+/// `1 / (u32::MAX as f32)`. Exact, and so bit-for-bit substitutable for the
+/// divide it replaced: `u32::MAX as f32` rounds to 2^32, whose reciprocal is a
+/// power of two. A compiler cannot make that substitution without fast-math.
+const INV_U32: f32 = 1.0 / 4_294_967_296.0;
+
+/// Finish a weighted-and-xored lattice key into `[0, 1)`.
+#[inline(always)]
+fn avalanche(mut h: u32) -> f32 {
     h ^= h >> 16;
     h = h.wrapping_mul(0x7feb_352d);
     h ^= h >> 15;
     h = h.wrapping_mul(0x846c_a68b);
     h ^= h >> 16;
-    (h as f32) / (u32::MAX as f32)
+    (h as f32) * INV_U32
+}
+
+pub fn hash3(x: i32, y: i32, z: i32) -> f32 {
+    // Murmur3-style bit mixer -> well-distributed, mean ~0.5.
+    avalanche(
+        (x as u32).wrapping_mul(HX) ^ (y as u32).wrapping_mul(HY) ^ (z as u32).wrapping_mul(HZ),
+    )
 }
 
 pub fn smoother(t: f32) -> f32 {
@@ -34,11 +49,15 @@ pub fn value_noise(x: f32, y: f32, z: f32) -> f32 {
     let (xf, yf, zf) = (x - xi, y - yi, z - zi);
     let (xi, yi, zi) = (xi as i32, yi as i32, zi as i32);
     let (u, v, w) = (smoother(xf), smoother(yf), smoother(zf));
-    let c = |dx: i32, dy: i32, dz: i32| hash3(xi + dx, yi + dy, zi + dz);
-    let x00 = lerp(c(0, 0, 0), c(1, 0, 0), u);
-    let x10 = lerp(c(0, 1, 0), c(1, 1, 0), u);
-    let x01 = lerp(c(0, 0, 1), c(1, 0, 1), u);
-    let x11 = lerp(c(0, 1, 1), c(1, 1, 1), u);
+    // The eight corners are the XOR combinations of two weighted values per
+    // axis, so weight each axis once rather than inside eight `hash3` calls.
+    let (x0, x1) = ((xi as u32).wrapping_mul(HX), (xi as u32).wrapping_add(1).wrapping_mul(HX));
+    let (y0, y1) = ((yi as u32).wrapping_mul(HY), (yi as u32).wrapping_add(1).wrapping_mul(HY));
+    let (z0, z1) = ((zi as u32).wrapping_mul(HZ), (zi as u32).wrapping_add(1).wrapping_mul(HZ));
+    let x00 = lerp(avalanche(x0 ^ y0 ^ z0), avalanche(x1 ^ y0 ^ z0), u);
+    let x10 = lerp(avalanche(x0 ^ y1 ^ z0), avalanche(x1 ^ y1 ^ z0), u);
+    let x01 = lerp(avalanche(x0 ^ y0 ^ z1), avalanche(x1 ^ y0 ^ z1), u);
+    let x11 = lerp(avalanche(x0 ^ y1 ^ z1), avalanche(x1 ^ y1 ^ z1), u);
     lerp(lerp(x00, x10, v), lerp(x01, x11, v), w)
 }
 
@@ -58,27 +77,53 @@ pub fn fbm(mut x: f32, mut y: f32, mut z: f32, octaves: u32) -> f32 {
 /// Domain-warped fBm (Inigo Quilez): `fbm(p + w·fbm(p'))`. The inner noise
 /// distorts the domain of the outer, turning plain bands/clouds into curling,
 /// marbled, fluid-looking structure. One warp level = 4 fbm calls.
-pub fn fbm_warp(x: f32, y: f32, z: f32, octaves: u32, w: f32) -> f32 {
-    let qx = fbm(x, y, z, octaves);
-    let qy = fbm(x + 3.1, y + 1.7, z + 5.2, octaves);
-    let qz = fbm(x + 8.3, y + 2.8, z + 1.1, octaves);
-    fbm(x + w * qx, y + w * qy, z + w * qz, octaves)
+///
+/// The warp field takes its own octave count because it only *displaces* the
+/// sample point: its `k`-th octave moves it `w · 0.5^k`, under 2% of a lattice
+/// cell by the fourth — nothing the warped field can resolve. Two warp octaves
+/// against four main costs 10 octave evaluations where a uniform four costs 16.
+pub fn fbm_warp(x: f32, y: f32, z: f32, warp_oct: u32, main_oct: u32, w: f32) -> f32 {
+    let qx = fbm(x, y, z, warp_oct);
+    let qy = fbm(x + 3.1, y + 1.7, z + 5.2, warp_oct);
+    let qz = fbm(x + 8.3, y + 2.8, z + 1.1, warp_oct);
+    fbm(x + w * qx, y + w * qy, z + w * qz, main_oct)
 }
 
 /// 3D Worley F1: distance to nearest hashed feature point. ~[0, 1.0].
+///
+/// Prices each of the 27 cells before hashing it: a feature point lies inside
+/// its own cell, so the distance to that cell's box lower-bounds the distance to
+/// its point, and a cell already further than the best so far cannot win. The
+/// centre cell goes first to give the bound something tight to test against.
+/// Exact — every cell skipped is one whose `min` was provably a no-op.
 pub fn worley(x: f32, y: f32, z: f32) -> f32 {
     let (fx, fy, fz) = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
-    let mut f1 = 9.0f32;
+    let dist = |cx: i32, cy: i32, cz: i32| {
+        let ox = hash3(cx, cy, cz);
+        let oy = hash3(cx + 911, cy + 733, cz + 512);
+        let oz = hash3(cx + 271, cy + 619, cz + 188);
+        let (px, py, pz) = (cx as f32 + ox, cy as f32 + oy, cz as f32 + oz);
+        ((px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2)).sqrt()
+    };
+    // Distance from a coordinate to the cell's unit interval.
+    let gap = |c: i32, v: f32| {
+        let lo = c as f32;
+        (lo - v).max(v - (lo + 1.0)).max(0.0)
+    };
+
+    let mut f1 = dist(fx, fy, fz).min(9.0);
     for dz in -1..=1 {
         for dy in -1..=1 {
             for dx in -1..=1 {
+                if dx == 0 && dy == 0 && dz == 0 {
+                    continue; // already done, and it seeded the bound
+                }
                 let (cx, cy, cz) = (fx + dx, fy + dy, fz + dz);
-                let ox = hash3(cx, cy, cz);
-                let oy = hash3(cx + 911, cy + 733, cz + 512);
-                let oz = hash3(cx + 271, cy + 619, cz + 188);
-                let (px, py, pz) = (cx as f32 + ox, cy as f32 + oy, cz as f32 + oz);
-                let d = ((px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2)).sqrt();
-                f1 = f1.min(d);
+                let (bx, by, bz) = (gap(cx, x), gap(cy, y), gap(cz, z));
+                if bx * bx + by * by + bz * bz >= f1 * f1 {
+                    continue; // the whole cell is further than the best so far
+                }
+                f1 = f1.min(dist(cx, cy, cz));
             }
         }
     }
@@ -143,4 +188,100 @@ pub fn cycle3(lo: Rgb, mid: Rgb, hi: Rgb, phase: f32) -> Rgb {
     } else {
         mix(hi, lo, p - 2.0)
     }
+}
+
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The eight-corner rewrite is valid only because the axis weights are
+    /// XORed *before* the avalanche. Every planet in the workspace hangs off
+    /// this function, so pin it.
+    fn reference(x: f32, y: f32, z: f32) -> f32 {
+        let (xi, yi, zi) = (x.floor(), y.floor(), z.floor());
+        let (xf, yf, zf) = (x - xi, y - yi, z - zi);
+        let (xi, yi, zi) = (xi as i32, yi as i32, zi as i32);
+        let (u, v, w) = (smoother(xf), smoother(yf), smoother(zf));
+        let c = |dx: i32, dy: i32, dz: i32| hash3(xi + dx, yi + dy, zi + dz);
+        let x00 = lerp(c(0, 0, 0), c(1, 0, 0), u);
+        let x10 = lerp(c(0, 1, 0), c(1, 1, 0), u);
+        let x01 = lerp(c(0, 0, 1), c(1, 0, 1), u);
+        let x11 = lerp(c(0, 1, 1), c(1, 1, 1), u);
+        lerp(lerp(x00, x10, v), lerp(x01, x11, v), w)
+    }
+
+    #[test]
+    fn value_noise_is_bit_identical_to_the_eight_hash_form() {
+        // Negative coordinates included: the axis weights go through `as u32`
+        // on a negative `i32`, where such a rewrite would most likely diverge.
+        let mut n = 0;
+        for i in -40..40i32 {
+            for j in -7..7i32 {
+                let (x, y, z) = (i as f32 * 0.37, j as f32 * 1.9 - 3.3, i as f32 * -0.11 + 12.5);
+                assert_eq!(
+                    value_noise(x, y, z).to_bits(),
+                    reference(x, y, z).to_bits(),
+                    "value_noise diverged at ({x}, {y}, {z})"
+                );
+                n += 1;
+            }
+        }
+        assert!(n > 500);
+    }
+
+    /// Pruning is sound only if the box distance is a true lower bound; an
+    /// off-by-one there would notch every crater rim in the workspace.
+    #[test]
+    fn pruned_worley_matches_the_exhaustive_scan() {
+        fn reference(x: f32, y: f32, z: f32) -> f32 {
+            let (fx, fy, fz) = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
+            let mut f1 = 9.0f32;
+            for dz in -1..=1 {
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let (cx, cy, cz) = (fx + dx, fy + dy, fz + dz);
+                        let ox = hash3(cx, cy, cz);
+                        let oy = hash3(cx + 911, cy + 733, cz + 512);
+                        let oz = hash3(cx + 271, cy + 619, cz + 188);
+                        let (px, py, pz) = (cx as f32 + ox, cy as f32 + oy, cz as f32 + oz);
+                        f1 = f1.min(((px - x).powi(2) + (py - y).powi(2) + (pz - z).powi(2)).sqrt());
+                    }
+                }
+            }
+            f1
+        }
+        // Includes negatives and points sitting on a lattice boundary.
+        let mut n = 0;
+        for i in -60..60i32 {
+            for j in -13..13i32 {
+                let (x, y, z) = (i as f32 * 0.25, j as f32 * 0.5, i as f32 * 0.125 - 2.0);
+                assert_eq!(
+                    worley(x, y, z).to_bits(),
+                    reference(x, y, z).to_bits(),
+                    "worley diverged at ({x}, {y}, {z})"
+                );
+                n += 1;
+            }
+        }
+        assert!(n > 2000);
+    }
+
+    /// `fbm_warp` is now a thin call into `fbm_warp_oct`; equal octave counts
+    /// must still be the exact old four-call form.
+    /// Bit-identical only because `u32::MAX as f32` rounds to exactly 2^32 —
+    /// assert that rather than trusting the comment on `INV_U32`.
+    #[test]
+    fn reciprocal_multiply_matches_the_divide() {
+        assert_eq!((u32::MAX as f32).to_bits(), 4_294_967_296.0f32.to_bits());
+        for h in [0u32, 1, 2, 255, 65535, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff] {
+            assert_eq!(((h as f32) * INV_U32).to_bits(), ((h as f32) / (u32::MAX as f32)).to_bits());
+        }
+        for k in 0..5000u32 {
+            let h = k.wrapping_mul(0x9e37_79b9);
+            assert_eq!(((h as f32) * INV_U32).to_bits(), ((h as f32) / (u32::MAX as f32)).to_bits());
+        }
+    }
+
 }
