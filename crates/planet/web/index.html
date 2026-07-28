@@ -232,18 +232,32 @@ onmessage = async (e) => {
   }
 };`;
 
-const pool = { workers: [], size: 0, native: 0, busy: false };
+const pool = { workers: [], size: 0 };
 // Leave the main thread and the browser's own threads room: on a 4-core box a
 // pool of 4 measured WORSE than 2 (4.57 ms main-thread, 1.70 at 2, 2.21 at 4),
 // while a 16-thread laptop's sweep put the knee at 8. `cores - 2` fits both.
 let poolWant = Math.max(1, Math.min(8, (navigator.hardwareConcurrency || 4) - 2));
 let wasmBytes = null;
 
+// Resizes are SERIALIZED and they settle whatever is in flight. A terminated
+// worker never fires `onmessage`, so a frame awaiting one would hang forever
+// and — because `inFlight` gates re-entry — every later frame would return
+// early. That is a freeze, and dragging the slider used to cause it.
+let resizeChain = Promise.resolve();
+function queueResize(n) {
+  resizeChain = resizeChain.then(() => poolResize(n), () => poolResize(n));
+  return resizeChain;
+}
+
 async function poolResize(n) {
   n = Math.max(0, Math.min(32, n | 0));
-  for (const w of pool.workers) w.terminate();
+  for (const w of pool.workers) {
+    // Reject before terminating, so anything awaiting this worker unwinds.
+    for (const e of w.__pending || []) e.rej(new Error("pool resized"));
+    w.__pending = [];
+    w.terminate();
+  }
   pool.workers = [];
-  pool.native = 0;
   if (n === 0 || !wasmBytes) { pool.size = 0; return; }
   const url = URL.createObjectURL(new Blob([POOL_SRC], { type: "text/javascript" }));
   const ws = Array.from({ length: n }, () => new Worker(url));
@@ -257,8 +271,13 @@ async function poolResize(n) {
   pool.size = n;
 }
 
-const askWorker = (w, msg, xfer) => new Promise(res => {
-  w.onmessage = e => res(e.data);
+const askWorker = (w, msg, xfer) => new Promise((res, rej) => {
+  const entry = { res, rej };
+  (w.__pending ||= []).push(entry);
+  w.onmessage = e => {
+    w.__pending = (w.__pending || []).filter(x => x !== entry);
+    res(e.data);
+  };
   w.postMessage(msg, xfer || []);
 });
 
@@ -267,9 +286,15 @@ const askWorker = (w, msg, xfer) => new Promise(res => {
 /// so equal row counts would leave the edge workers idle. Weighting by the
 /// chord's length evens the shading out.
 async function renderPooled(a) {
-  if (pool.native !== NATIVE) {
-    await Promise.all(pool.workers.map(w => askWorker(w, { cmd: "size", size: NATIVE })));
-    pool.native = NATIVE;
+  // Sized PER WORKER, not pool-wide. A pool-wide flag races a resize: the
+  // frame in flight sets it after `poolResize` cleared it, and the workers
+  // that replaced the old ones are then never told the size — they allocate
+  // nothing, return empty bands, and the picture stops updating while the
+  // frame timer keeps reporting. That is what the freeze actually was.
+  const stale = pool.workers.filter(w => w.__native !== NATIVE);
+  if (stale.length) {
+    await Promise.all(stale.map(w =>
+      askWorker(w, { cmd: "size", size: NATIVE }).then(() => { w.__native = NATIVE; })));
   }
   const n = pool.workers.length;
   const cuts = [0];
@@ -372,22 +397,28 @@ async function frame() {
   angle += spin;
   const a = applyFeatures(on);
   const t0 = performance.now();
-  if (pool.size > 0) {
-    try {
+  let painted = true;
+  try {
+    if (pool.size > 0) {
       await renderPooled(a);
-    } catch (e) {
-      // A pool that dies mid-flight falls back rather than freezing the demo.
+    } else {
+      wasm.render_features(bufPtr, NATIVE, typeIdx, seed, angle, paramsPtr, a.palette, a.dither, a.moons, a.feat);
+      imgData.data.set(new Uint8Array(wasm.memory.buffer, bufPtr, bufLen));
+    }
+  } catch (e) {
+    // Resized mid-frame (benign — the next frame uses the new pool), or a
+    // worker died. Either way this frame has no pixels: keep the last one.
+    painted = false;
+    if (!/resized/.test(String(e && e.message))) {
       $("poolV").textContent = "unavailable";
-      await poolResize(0);
+      queueResize(0);
       poolWant = 0;
     }
+  } finally {
+    inFlight = false;
   }
-  if (pool.size === 0) {
-    wasm.render_features(bufPtr, NATIVE, typeIdx, seed, angle, paramsPtr, a.palette, a.dither, a.moons, a.feat);
-    imgData.data.set(new Uint8Array(wasm.memory.buffer, bufPtr, bufLen));
-  }
+  if (!painted) return;
   emaMs += (performance.now() - t0 - emaMs) * 0.08;
-  inFlight = false;
   octx.putImageData(imgData, 0, 0);
   sctx.clearRect(0, 0, stage.width, stage.height);
   sctx.drawImage(off, 0, 0, stage.width, stage.height);
@@ -502,15 +533,18 @@ async function main() {
   // 16-thread laptop (past it, each worker's slice shrinks faster than the
   // dispatch grows). 0 renders on the main thread, which is the A/B.
   $("pool").value = String(poolWant);
-  $("pool").addEventListener("input", async () => {
+  const poolLabel = () => (pool.size === 0 ? "off (main thread)" : String(pool.size));
+  $("pool").addEventListener("input", () => {
     const n = parseInt($("pool").value);
-    $("poolV").textContent = "…";
-    await poolResize(n);
-    poolWant = pool.size;
-    $("poolV").textContent = pool.size === 0 ? "off (main thread)" : `${pool.size}`;
+    $("poolV").textContent = n === 0 ? "off (main thread)" : `${n}…`;
   });
-  await poolResize(poolWant);
-  $("poolV").textContent = pool.size === 0 ? "off (main thread)" : `${pool.size}`;
+  $("pool").addEventListener("change", async () => {
+    await queueResize(parseInt($("pool").value));
+    poolWant = pool.size;
+    $("poolV").textContent = poolLabel();
+  });
+  await queueResize(poolWant);
+  $("poolV").textContent = poolLabel();
 
   requestAnimationFrame(tick);
 }
