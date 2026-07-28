@@ -32,7 +32,7 @@ pub use scene_core::Tile;
 
 use dither_core::{bayer, quant};
 use noise_core::{
-    clamp01, contrast, cycle3, fbm, fbm_warp_oct, hash3, lerp, mix, ramp, smoothstep, worley, Rgb,
+    clamp01, contrast, cycle3, fbm, fbm_warp, hash3, lerp, mix, ramp, smoothstep, worley, Rgb,
 };
 
 // ---------------------------------------------------------------------------
@@ -425,7 +425,7 @@ fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32, lod
             // continuously — the real gas-giant look, not a uniform wobble.
             let flow = angle * 0.16 * (sy * ct.bands * 0.5).sin();
             // Domain warp makes the band turbulence curl and marble like fluid.
-            let warp = fbm_warp_oct((px + flow) * 1.3, py * 1.3, pz * 1.3, Lod::WARP, lod.oct(1.3, 5), 0.8);
+            let warp = fbm_warp((px + flow) * 1.3, py * 1.3, pz * 1.3, Lod::WARP, lod.oct(1.3, 5), 0.8);
             let lat = sy + (warp - 0.5) * ct.turb;
             let band = 0.5 + 0.5 * (lat * ct.bands).sin();
             let mut col = mix(ct.dark, ct.light, band);
@@ -451,7 +451,7 @@ fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32, lod
             // Storm bands churn: latitude-dependent shear + domain warp for
             // roiling, fluid-looking cloud cover.
             let flow = (0.5 + 0.3 * (sy * 3.0).cos()) * angle.sin();
-            let t = fbm_warp_oct((px + flow) * 2.0, py * 2.0, pz * 2.0, Lod::WARP, lod.oct(2.0, 5), 0.7);
+            let t = fbm_warp((px + flow) * 2.0, py * 2.0, pz * 2.0, Lod::WARP, lod.oct(2.0, 5), 0.7);
             let band = 0.5 + 0.5 * (sy * ct.bands + (t - 0.5) * 6.0 * ct.turb).sin();
             (mix(ct.dark, ct.light, clamp01(band * 0.6 + t * 0.4)), 0.0)
         }
@@ -684,7 +684,9 @@ fn tile_style() -> Style {
 /// exactly as in the hero framing.
 pub fn render_tile(type_idx: usize, seed: u32, angle: f32, light: [f32; 3], rad_px: f32) -> Tile {
     let size = tile_size(type_idx, rad_px);
-    render_tile_clipped(type_idx, seed, angle, light, rad_px, [0, 0, size, size])
+    let mut tile = Tile::default();
+    render_tile_into(&mut tile, type_idx, seed, angle, light, rad_px, [0, 0, size, size]);
+    tile
 }
 
 /// The edge length [`render_tile`] will produce for this type at this radius.
@@ -702,37 +704,20 @@ pub fn tile_size(type_idx: usize, rad_px: f32) -> u32 {
     (((rad_px + margin) * 2.0).ceil() as u32).max(6)
 }
 
-/// [`render_tile`], but shading only the tile pixels in `clip`
-/// (`[x0, y0, x1, y1)`, tile px).
+/// [`render_tile`] into a tile you already own, shading only the tile pixels in
+/// `clip` (`[x0, y0, x1, y1)`, tile px).
 ///
 /// Zoomed in far enough that a body overflows the viewport, most of its tile has
 /// nowhere on screen to land — at a disc twice the viewport height, around 70%
 /// of it — and the compositor never reads those pixels. Pass
-/// `scene_core::visible_tile_rect` here and that work simply does not happen.
+/// `scene_core::visible_tile_rect` here and that work does not happen. Reusing
+/// the buffer also drops a heap allocation (and its zero-fill) per body per
+/// frame — 68 KB a time at detail cap 64.
 ///
-/// Pixels **outside `clip` are left transparent**, not shaded: the tile is only
-/// valid for the placement the clip was computed from.
-pub fn render_tile_clipped(
-    type_idx: usize,
-    seed: u32,
-    angle: f32,
-    light: [f32; 3],
-    rad_px: f32,
-    clip: [u32; 4],
-) -> Tile {
-    let size = tile_size(type_idx, rad_px);
-    let mut tile = Tile { px: vec![0u8; (size * size * 4) as usize], size };
-    render_tile_into(&mut tile, type_idx, seed, angle, light, rad_px, clip);
-    tile
-}
-
-/// [`render_tile_clipped`] into a tile you already own, resizing its buffer only
-/// when the radius changes.
-///
-/// A scene re-renders every body every frame, so the alternative is a fresh
-/// heap allocation (and its zero-fill) per body per frame — 68 KB a time for a
-/// tile at detail cap 64. Everything outside `clip` is zeroed, so a reused
-/// buffer can never leak the previous frame's pixels into the compositor.
+/// **Pixels outside `clip` are left as they were**, not cleared: the tile is
+/// only valid for the placement its clip came from. That is exactly the range
+/// `blit` reads back, so a reused buffer cannot leak a previous body's pixels
+/// into the scene — but do not hand the tile to anything that reads wider.
 pub fn render_tile_into(
     tile: &mut Tile,
     type_idx: usize,
@@ -744,12 +729,7 @@ pub fn render_tile_into(
 ) {
     let ct = &TYPES[type_idx % TYPES.len()];
     let size = tile_size(type_idx, rad_px);
-    let len = (size * size * 4) as usize;
-    if tile.size != size || tile.px.len() != len {
-        tile.px.clear();
-        tile.px.resize(len, 0);
-        tile.size = size;
-    }
+    tile.ensure(size);
     let clip = [clip[0].min(size), clip[1].min(size), clip[2].min(size), clip[3].min(size)];
     let frame = Frame { size, rad: rad_px, light, sprite: true, clip };
     render_frame(&frame, ct, seed, angle, &tile_style(), &mut tile.px);
@@ -891,7 +871,7 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                     // Wispy, fractal cloud tops (domain-warped) so they break into
                     // ragged fronts instead of clumping into round blobs. Shadow
                     // uses the cheap plain density.
-                    let cloud = fbm_warp_oct(
+                    let cloud = fbm_warp(
                         cx3 * 2.8,
                         ny * 2.8 + ofs[1] + morph,
                         cz3 * 2.8 + morph,

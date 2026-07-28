@@ -59,8 +59,8 @@ already.
 
 **Bodies go through the compositor's clip, not a hand-rolled cull.** A scene
 draws a body by asking `scene_core::visible_tile_rect` where its tile lands, and
-passing that rect back into `render_tile_clipped` / `render_tile_into` /
-`render_star_tile_into`. Two things follow, and both matter:
+passing that rect back into `render_tile_into` / `render_star_tile_into`. Two
+things follow, and both matter:
 
 - An **empty rect is the visibility test** — exact, and free. Do not add a
   "body radius × some margin" off-screen check next to it. There was one; it had
@@ -72,9 +72,12 @@ passing that rect back into `render_tile_clipped` / `render_tile_into` /
   (`snap_out`), or a camera drifting a pixel a frame invalidates the cache every
   frame and the caching buys nothing.
 
-`scene-core`'s tests pin the rect as a superset of what `blit` reads; a rect
-that under-reports by a pixel leaves an unshaded seam only visible at the zoom
-levels nobody screenshots.
+The rect is **exact**, not padded — `blit` reads tile pixel `map(dd)` for each
+destination offset it visits and `map` is monotone, so the two endpoints bound
+the set. Both functions share that expression for exactly that reason. Keep them
+in step: a rect that under-reports by a pixel leaves an unshaded seam only
+visible at the zoom levels nobody screenshots, which is what `scene-core`'s
+million-read sweep is there to catch.
 
 **One backdrop, likewise.** Every scene paints through `background-core`:
 `paint_backdrop` (ground + optional nebula) then `paint_stars`. A new scene crate

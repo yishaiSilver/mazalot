@@ -333,7 +333,7 @@ fn quant(o: Rgb, bx: f32) -> Rgb {
 }
 
 /// Render the parent planet to a lit RGBA tile of diameter ~`2*rad_px`. A thin
-/// wrapper over `planet_core::render_tile` — the same call `solar` makes for the
+/// wrapper over `planet_core::render_tile_into` — the same call `solar` makes for the
 /// worlds in its orbits, and the same shader the `planet` demo shows head-on;
 /// moon only pins the light to its fixed off-screen sun (`LIGHT_DIR`).
 fn render_parent_tile(
@@ -381,12 +381,7 @@ fn render_moon_tile(
     clip: [u32; 4],
 ) {
     let size = moon_tile_size(rad_px);
-    let len = (size * size * 4) as usize;
-    if tile.size != size || tile.px.len() != len {
-        tile.px.clear();
-        tile.px.resize(len, 0);
-        tile.size = size;
-    }
+    tile.ensure(size);
     let c = size as f32 / 2.0;
     let ofs = seed_offsets(seed);
     let (sina, cosa) = spin_a.sin_cos();

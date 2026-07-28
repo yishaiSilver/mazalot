@@ -420,7 +420,7 @@ per frame rather than by reusing frames, in three independent ways:
 
 - **Shade only what the compositor will read.** `scene_core::visible_tile_rect`
   asks where a tile actually lands on screen and returns the sub-rect `blit` will
-  sample; `planet_core::render_tile_clipped` shades that and nothing else. A disc
+  sample; `planet_core::render_tile_into` shades that and nothing else. A disc
   twice the viewport height has ~70% of its tile hanging off the edge, and that
   work simply stops happening. An empty rect is also the exact visibility test,
   which replaced a blanket "2.2 body radii" cull margin that had to over-estimate

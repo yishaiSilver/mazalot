@@ -82,6 +82,22 @@ pub struct Tile {
     pub size: u32,
 }
 
+impl Tile {
+    /// Resize to `size`×`size`, reusing the allocation when it already is.
+    ///
+    /// Every body renderer that writes into a caller-owned tile starts here, so
+    /// that "does this buffer already fit?" is decided in one place rather than
+    /// once per renderer.
+    pub fn ensure(&mut self, size: u32) {
+        let len = (size * size * 4) as usize;
+        if self.size != size || self.px.len() != len {
+            self.px.clear();
+            self.px.resize(len, 0);
+            self.size = size;
+        }
+    }
+}
+
 /// Where a tile lands on screen: the destination rect `blit` would fill, as
 /// `(x0, y0, edge)` in px. `edge` is the scaled tile's edge length; the rect is
 /// square because tiles are.
@@ -111,8 +127,11 @@ fn dest_rect(tile_size: u32, sx: f32, sy: f32, scale: f32) -> (i32, i32, i32) {
 /// the compositor where the tile really lands instead of guessing how far a
 /// body's rings or corona reach.
 ///
-/// Deliberately errs one tile px wide on each side, so rounding can only ever
-/// shade a hair more than `blit` reads, never less.
+/// Exact, not padded: `blit` reads tile pixel `map(dd)` for each destination
+/// offset `dd` it visits, and `map` is non-decreasing in `dd`, so the tile
+/// pixels it touches are exactly those between the two endpoints' images. The
+/// two functions share the `map` expression below for that reason — keep them
+/// in step, and keep `visible_rect_covers_every_tile_pixel_blit_reads` passing.
 pub fn visible_tile_rect(tile_size: u32, w: u32, h: u32, sx: f32, sy: f32, scale: f32) -> [u32; 4] {
     let (x0, y0, edge) = dest_rect(tile_size, sx, sy, scale);
     // The on-screen slice of the destination rect, in destination-local px.
@@ -122,14 +141,15 @@ pub fn visible_tile_rect(tile_size: u32, w: u32, h: u32, sx: f32, sy: f32, scale
         return [0, 0, 0, 0];
     }
     let inv = 1.0 / scale;
-    // Map the visible destination span back to tile px, then pad by one.
-    let map = |dd: i32| ((dd as f32 + 0.5) * inv) as i32;
-    let lo = |dd: i32| map(dd).max(0) as u32;
-    let hi = |dd: i32| (map(dd) + 2).clamp(0, tile_size as i32) as u32;
-    let (tx0, tx1) = (lo(ddx0).saturating_sub(1), hi(ddx1 - 1));
-    let (ty0, ty1) = (lo(ddy0).saturating_sub(1), hi(ddy1 - 1));
+    // The half-open tile span the destination range [lo, hi) maps onto.
+    let span = |lo: i32, hi: i32| {
+        let map = |dd: i32| ((dd as f32 + 0.5) * inv) as u32;
+        (map(lo), (map(hi - 1) + 1).min(tile_size))
+    };
+    let (tx0, tx1) = span(ddx0, ddx1);
+    let (ty0, ty1) = span(ddy0, ddy1);
     if tx1 <= tx0 || ty1 <= ty0 {
-        return [0, 0, 0, 0];
+        return [0, 0, 0, 0]; // the whole visible span is past the tile's edge
     }
     [tx0, ty0, tx1, ty1]
 }
@@ -313,6 +333,49 @@ mod tests {
     /// what `blit` reads. Under-reporting by one px would leave an unshaded
     /// seam along the edge of a zoomed-in planet, which is exactly the kind of
     /// bug that only shows up at the zoom levels nobody screenshots.
+    /// The rect is exact rather than padded, so this is the only thing standing
+    /// between a rounding change in either function and an unshaded seam down
+    /// the edge of a zoomed-in body. Sweep far wider than `PLACEMENTS`: every
+    /// scale from a heavy downscale to a 50x blow-up, at sub-pixel centres, on
+    /// and off every edge.
+    #[test]
+    fn visible_rect_is_exact_across_a_wide_sweep() {
+        let (w, h) = (121u32, 83u32);
+        let mut checked = 0usize;
+        for size in [6u32, 17, 64, 131] {
+            for si in 0..80 {
+                let scale = 0.05 + si as f32 * 0.65;
+                for ci in 0..24 {
+                    let (sx, sy) = (-40.0 + ci as f32 * 7.3, -30.0 + ci as f32 * 5.7);
+                    let [tx0, ty0, tx1, ty1] = visible_tile_rect(size, w, h, sx, sy, scale);
+                    let dsize = (size as f32 * scale).round().max(1.0) as i32;
+                    let x0 = (sx - dsize as f32 * 0.5).floor() as i32;
+                    let y0 = (sy - dsize as f32 * 0.5).floor() as i32;
+                    let inv = 1.0 / scale;
+                    for ddy in (-y0).max(0)..(h as i32 - y0).min(dsize) {
+                        let ty = ((ddy as f32 + 0.5) * inv) as u32;
+                        if ty >= size {
+                            continue;
+                        }
+                        for ddx in (-x0).max(0)..(w as i32 - x0).min(dsize) {
+                            let tx = ((ddx as f32 + 0.5) * inv) as u32;
+                            if tx >= size {
+                                continue;
+                            }
+                            assert!(
+                                tx >= tx0 && tx < tx1 && ty >= ty0 && ty < ty1,
+                                "size {size} at ({sx}, {sy}, x{scale}): blit reads tile \
+                                 ({tx}, {ty}) outside [{tx0}, {ty0}, {tx1}, {ty1})"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 1_000_000, "only {checked} reads exercised");
+    }
+
     #[test]
     fn visible_rect_covers_every_tile_pixel_blit_reads() {
         let (w, h) = (121u32, 83u32);

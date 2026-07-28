@@ -184,7 +184,7 @@ pub fn render_star_tile(
     lod_enabled: bool,
 ) -> Tile {
     let size = star_tile_size(rad_px, corona_reach);
-    let mut tile = Tile { px: vec![0u8; (size * size * 4) as usize], size };
+    let mut tile = Tile::default();
     render_star_tile_into(&mut tile, sk, seed, t, rad_px, corona_reach, lod_enabled, [0, 0, size, size]);
     tile
 }
@@ -216,12 +216,7 @@ pub fn render_star_tile_into(
     clip: [u32; 4],
 ) {
     let size = star_tile_size(rad_px, corona_reach);
-    let len = (size * size * 4) as usize;
-    if tile.size != size || tile.px.len() != len {
-        tile.px.clear();
-        tile.px.resize(len, 0);
-        tile.size = size;
-    }
+    tile.ensure(size);
     let c = size as f32 / 2.0;
     let ofs = seed_offsets(seed, 220.0);
     // LOD: on a large (zoomed-in) tile, thin the secondary-fBm octaves.
@@ -380,6 +375,17 @@ mod tests {
                     }
                 }
                 assert!(n > 20, "rad {rad}: only {n} halo px sampled");
+
+                // The disc's limb darkening is tabulated too, and it is the
+                // least forgiving of the three: `mu^0.45` has infinite slope at
+                // `mu = 0`, so the very limb is where interpolation is worst.
+                let mut lw = 0i32;
+                for i in 0..=2048 {
+                    let mu = i as f32 / 2048.0;
+                    let want = 0.66 + 0.34 * mu.powf(0.45);
+                    lw = lw.max(((want - sample(&sh.limb, mu)) * 255.0).abs() as i32);
+                }
+                assert!(lw <= 2, "limb darkening table is off by {lw}/255");
                 // Sized as above, the tables are exact to the byte from rad 24
                 // up (where the halo is more than a dozen px wide). Only a tiny
                 // star, whose table hits the 64-entry floor and whose halo is a

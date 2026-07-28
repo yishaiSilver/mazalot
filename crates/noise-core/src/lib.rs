@@ -86,23 +86,15 @@ pub fn fbm(mut x: f32, mut y: f32, mut z: f32, octaves: u32) -> f32 {
 /// Domain-warped fBm (Inigo Quilez): `fbm(p + w·fbm(p'))`. The inner noise
 /// distorts the domain of the outer, turning plain bands/clouds into curling,
 /// marbled, fluid-looking structure. One warp level = 4 fbm calls.
-pub fn fbm_warp(x: f32, y: f32, z: f32, octaves: u32, w: f32) -> f32 {
-    fbm_warp_oct(x, y, z, octaves, octaves, w)
-}
-
-/// [`fbm_warp`] with the warp field's octave count set separately from the
-/// final field's.
 ///
-/// The three warp components only *displace* the sample point, by at most `w`
-/// domain units total — so an octave of the warp field moves the sample by
-/// `w · 0.5^k`, which at the fourth octave is under 2% of a lattice cell. That
-/// is far below anything the final field can resolve, let alone anything that
-/// survives the ordered dither, so the warp is the cheap half to shorten:
-/// `warp_oct = 2, main_oct = 4` costs 10 octave evaluations where a flat
-/// `fbm_warp(.., 4, ..)` costs 16, for a visually identical field.
-///
-/// `warp_oct == main_oct` reproduces [`fbm_warp`] exactly.
-pub fn fbm_warp_oct(x: f32, y: f32, z: f32, warp_oct: u32, main_oct: u32, w: f32) -> f32 {
+/// The warp field gets its own octave count, because it is not the field it
+/// warps: its three components only *displace* the sample point, by at most `w`
+/// domain units. An octave of warp moves the sample by `w · 0.5^k`, which by the
+/// fourth octave is under 2% of a lattice cell — far below anything the warped
+/// field can resolve, let alone anything that survives the ordered dither. So
+/// `warp_oct = 2, main_oct = 4` costs 10 octave evaluations where a uniform 4
+/// would cost 16, for a visually identical field.
+pub fn fbm_warp(x: f32, y: f32, z: f32, warp_oct: u32, main_oct: u32, w: f32) -> f32 {
     let qx = fbm(x, y, z, warp_oct);
     let qy = fbm(x + 3.1, y + 1.7, z + 5.2, warp_oct);
     let qz = fbm(x + 8.3, y + 2.8, z + 1.1, warp_oct);
@@ -316,16 +308,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn equal_octave_warp_matches_the_flat_form() {
-        for k in 1..6u32 {
-            for i in 0..17i32 {
-                let (x, y, z) = (i as f32 * 0.61, 4.0 - i as f32 * 0.13, i as f32 * 0.29);
-                assert_eq!(
-                    fbm_warp(x, y, z, k, 0.8).to_bits(),
-                    fbm_warp_oct(x, y, z, k, k, 0.8).to_bits()
-                );
-            }
-        }
-    }
 }
