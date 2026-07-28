@@ -109,15 +109,6 @@ pub extern "C" fn render_t(
     crate::render_system_cached(sys, w, h, &cam, bgx, bgy, t_orbit, t_spin, t_sun, out);
 }
 
-/// Planet-tile level of detail: 1 thins fBm octaves on tiles past 200px (the
-/// default), 0 renders every octave at every zoom. Toggling it is the A/B for
-/// what the thinning actually costs on screen.
-#[no_mangle]
-pub extern "C" fn system_set_lod(sys: *mut System, on: u32) {
-    let sys = unsafe { &mut *sys };
-    sys.set_lod(on != 0);
-}
-
 /// Number of planets in the system.
 #[no_mangle]
 pub extern "C" fn planet_count(sys: *const System) -> u32 {

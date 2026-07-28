@@ -51,7 +51,8 @@ use background_core::{paint_backdrop, paint_stars, Backdrop, StarLayer, StarTint
 
 // Shared scene-compositor primitives (were previously copy-pasted here
 // byte-for-byte). Camera is part of this crate's public API, so re-export it.
-use scene_core::{blit, to_screen, Rng, Tile, ORBIT_FLATTEN};
+use scene_core::{blit, to_screen, visible_tile_rect, Rng, Tile, ORBIT_FLATTEN};
+use std::cell::RefCell;
 pub use scene_core::Camera;
 
 // The compact star renderer is shared with `solar` via `sun-core`; comet keeps
@@ -91,10 +92,10 @@ const CORONA_REACH: f32 = 0.85;
 
 /// Render the star to a tile of diameter ~`2*rad_px` (+corona margin).
 ///
-/// Thin wrapper over the shared `sun_core::render_star_tile`: comet always
+/// Thin wrapper over the shared `sun_core::render_star_tile_into`: comet always
 /// renders full detail (no LOD) and uses its own `CORONA_REACH`.
-fn render_star_tile(sk: &StarKind, seed: u32, t: f32, rad_px: f32) -> Tile {
-    sun_core::render_star_tile(sk, seed, t, rad_px, CORONA_REACH, false)
+fn render_star_tile(tile: &mut Tile, sk: &StarKind, seed: u32, t: f32, rad_px: f32, clip: [u32; 4]) {
+    sun_core::render_star_tile_into(tile, sk, seed, t, rad_px, CORONA_REACH, false, clip);
 }
 
 // ===========================================================================
@@ -198,6 +199,10 @@ impl Comet {
 /// eccentric orbits around it. Deterministic in `seed`.
 pub struct CometScene {
     pub seed: u32,
+    /// Reused star-tile buffer — the star is baked fresh every frame, and at
+    /// the 120 px cap that is a ~800 KB allocation each time. Interior-mutable
+    /// because `render` takes `&self`.
+    star_tile: RefCell<Tile>,
     pub star_kind: usize,
     pub star_radius: f32, // world units
     pub comets: Vec<Comet>,
@@ -249,7 +254,7 @@ impl CometScene {
             comets.push(Comet { a, e, arg, period, phase, tilt, nucleus, tint, seed: cseed });
         }
 
-        CometScene { seed, star_kind, star_radius, comets, orbit_width: 1.0 }
+        CometScene { seed, star_kind, star_radius, comets, orbit_width: 1.0, star_tile: RefCell::default() }
     }
 
     /// Set the orbit-ellipse stroke width in pixels, clamped to 1..=6.
@@ -284,8 +289,15 @@ impl CometScene {
         let rad_px = self.star_radius * cam.zoom;
         if rad_px >= 0.5 {
             let rad_render = rad_px.clamp(2.0, 120.0);
-            let tile = render_star_tile(sk, self.seed, t, rad_render);
-            blit(out, w, h, &tile, starx, stary, rad_px / rad_render);
+            let scale = rad_px / rad_render;
+            // Shade only what the compositor reads back.
+            let tsize = sun_core::star_tile_size(rad_render, CORONA_REACH);
+            let clip = visible_tile_rect(tsize, w, h, starx, stary, scale);
+            if clip[2] != clip[0] {
+                let mut tile = self.star_tile.borrow_mut();
+                render_star_tile(&mut tile, sk, self.seed, t, rad_render, clip);
+                blit(out, w, h, &tile, starx, stary, scale);
+            }
         }
 
         for c in &self.comets {

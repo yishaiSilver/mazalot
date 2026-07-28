@@ -148,20 +148,17 @@ pub fn fbm(mut x: f32, mut y: f32, mut z: f32, octaves: u32) -> f32 {
 /// Domain-warped fBm (Inigo Quilez): `fbm(p + w·fbm(p'))`. The inner noise
 /// distorts the domain of the outer, turning plain bands/clouds into curling,
 /// marbled, fluid-looking structure. One warp level = 4 fbm calls.
-pub fn fbm_warp(x: f32, y: f32, z: f32, octaves: u32, w: f32) -> f32 {
-    fbm_warp_inner(x, y, z, octaves, octaves, w)
-}
-
-/// [`fbm_warp`] with the three *displacement* fields run at their own octave
-/// count. They only bend the domain of the outer field, so their fine octaves
-/// are largely invisible in the result while costing full price — `inner` well
-/// below `octaves` buys most of the warp's speed back. `inner == octaves`
-/// reproduces [`fbm_warp`] exactly.
-pub fn fbm_warp_inner(x: f32, y: f32, z: f32, octaves: u32, inner: u32, w: f32) -> f32 {
-    let qx = fbm(x, y, z, inner);
-    let qy = fbm(x + 3.1, y + 1.7, z + 5.2, inner);
-    let qz = fbm(x + 8.3, y + 2.8, z + 1.1, inner);
-    fbm(x + w * qx, y + w * qy, z + w * qz, octaves)
+///
+/// The warp field takes its own octave count because it only *displaces* the
+/// sample point: its `k`-th octave moves it `w · 0.5^k`, under 2% of a lattice
+/// cell by the fourth — nothing the warped field can resolve. Two warp octaves
+/// against four main costs 10 octave evaluations where a uniform four costs 16.
+/// `warp_oct == main_oct` is the undifferentiated original.
+pub fn fbm_warp(x: f32, y: f32, z: f32, warp_oct: u32, main_oct: u32, w: f32) -> f32 {
+    let qx = fbm(x, y, z, warp_oct);
+    let qy = fbm(x + 3.1, y + 1.7, z + 5.2, warp_oct);
+    let qz = fbm(x + 8.3, y + 2.8, z + 1.1, warp_oct);
+    fbm(x + w * qx, y + w * qy, z + w * qz, main_oct)
 }
 
 /// The 3×3×3 neighbourhood [`worley`] searches, padded from 27 to 28 entries so

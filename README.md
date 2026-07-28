@@ -307,18 +307,23 @@ Measured natively (WASM in-browser runs ~2–3× slower):
 
 | @ 64px | per frame | vs a sprite |
 |---|---|---|
-| sprite blit (`memcpy`) | ~0.0003 ms | 1× |
-| planet, no weather (iron) | 0.67 ms | ~3,200× |
-| planet, full weather (terran) | 1.98 ms | ~9,400× |
-| lava (emissive) | 0.79 ms | ~3,800× |
+| sprite blit (`memcpy`) | ~0.0002 ms | 1× |
+| planet, no weather (iron) | 0.45 ms | ~2,500× |
+| planet, full weather (terran) | 1.49 ms | ~8,400× |
+| lava (emissive) | 0.64 ms | ~3,600× |
 
 **The weather is the cost** — domain warp on clouds/bands roughly triples the
 base planet. **The pixel-art pipeline is nearly free:** dithering, moons, and
 palette swaps together add **< 0.05 ms** (a few percent).
 
+Cost is **quadratic in the rendered size**, but not quite: the octave count is
+tied to what the pixel grid can resolve (see `planet_core::Lod`), so a small
+planet drops the octaves it could never have shown. A 64 px terran runs 3
+octaves of surface noise where a 256 px one runs 6.
+
 Implications:
-- **One planet live** (the web demo): comfortable — ~2 ms native, ~5–7 ms in WASM at 64 px, well under a 60 fps budget. Tightens above ~200 px.
-- **Many planets / a galaxy map**: don't render live. **Bake the ~30 spin frames once, then blit** (that ~0.0003 ms) — procedural variety at sprite-cheap playback.
+- **One planet live** (the web demo): comfortable — ~1.5 ms native, ~4–5 ms in WASM at 64 px, well under a 60 fps budget. Tightens above ~200 px.
+- **Many planets / a galaxy map**: don't render live. **Bake the ~30 spin frames once, then blit** (that ~0.0002 ms) — procedural variety at sprite-cheap playback.
 - **Cheaper weather:** dropping domain warp (back to plain fBm) roughly halves the weather cost.
 
 ### Profiling the solar system
@@ -384,88 +389,77 @@ extreme zoom the tile also drops its secondary-fBm octaves (below the dither
 floor at that size) for a cheaper re-bake. The per-frame draw-order `Vec` and the
 star tile's 577 KB alloc are both gone (reused/cached).
 
-Everything invalidates automatically the moment its key changes. **Remaining
-frontier:** a *planet* zoomed to fill the screen (~34 ms at a high detail cap).
-Planets aren't tile-cached because their axial rotation is the visible motion, so
-quantizing it (the sun trick) would read as choppy.
+Caching does mean the cost arrives as a **spike**: most frames are a blit and one
+in ~5 pays the whole re-bake, so what matters for the star is the size of that
+one frame, not the average. Two things shrank it, and neither is the planets' fix
+— the star's fBm fields are so low-frequency that their octave counts are
+*already* under Nyquist at any scene radius:
 
-The cost scales with the **detail cap** — it bounds the tile resolution, and the
-per-pixel shader runs once per tile pixel. Two ways to keep it cheap:
+- **Its corona is the majority of the tile.** The halo annulus out to
+  `1 + corona_reach` radii is ~1.9× the disc's area, so ~65% of the shaded pixels
+  are corona (71.9k vs 38.0k at a 110 px radius) — and every one of them was
+  running a two-octave fBM and a `powf` to evaluate something that varies along
+  *one* axis. The streamers depend only on the angle around the limb, the falloff
+  only on the distance past it, and the disc's limb darkening only on `mu`, so
+  `sun_core::Shade` samples each along its own axis once per bake and interpolates.
+  Indexing the angular one needs a monotone angle, which `diamond_angle` gives for
+  a divide and a compare instead of an `atan2`.
+- **The old code recovered an angle with `atan2` only to feed it straight back
+  through `cos`/`sin`.** Out past the limb the unit direction is just `(nx, ny)/r`
+  — same field, three transcendentals cheaper, on those same 65% of pixels.
 
-- **Let it pin itself.** The demo holds a render budget by walking the planet
-  detail cap down when a frame runs long and back up when it doesn't (*Hold 60
-  fps automatically*, on by default; the slider becomes the ceiling and the HUD
-  shows the effective value). Body tile resolution is by far the steepest knob
-  in the scene — following a planet at 20× zoom costs **53 ms at cap 160 and
-  10 ms at cap 64** — and it degrades the way pixel art wants to, by getting
-  chunkier rather than blurrier. A tile costs ~r², so the controller jumps
-  straight to `cap · sqrt(budget / measured)` instead of walking: it converges
-  in two ticks (~0.4 s) and settles just under budget.
+Sun alone, in the browser at 1680×944, cap 110: **22.7 → 15.8 ms** per frame at a
+screen-filling zoom, **20.7 → 7.6 ms** when it overflows the viewport, with the
+re-bake spike roughly 59 → 38 ms. `sun-core`'s tests pin the tabulated fields
+against direct evaluation — exact to the byte from a 24 px radius up.
 
-  Worth knowing what it is *not*: at that zoom the backdrop cache is worth only
-  ~0.5 ms whether it hits or misses, turning the starfield and nebula off
-  entirely changes nothing, and the sun's cap is irrelevant because the star is
-  culled once you are on a planet. It is the planet tile, all of it.
+Everything invalidates automatically the moment its key changes.
 
-- **Pin the detail cap low** (~56) — the tile stays small, so the fills-screen
-  case never gets expensive in the first place. This is the intended default and
-  needs no code: the cap is already a live slider (`planet_detail`). At ~56 a
-  full-screen planet is **~6 ms (170 fps)** instead of ~34 ms — the `bench` bin
-  measures both.
-- **Octave LOD** — implemented, at `sun-core`'s threshold (`size > 200`) and
-  behind a toggle in the demo. Worth **9–19%** on a zoomed-in planet for a mean
-  change of 0.8–4.5/255 across the disc; one 1px step of spin already moves ~40%
-  of it with a mean near 10, so the LOD sits well inside the frame-to-frame noise
-  the eye accepts. Below 200px it is bit-identical, so `out/` never sees it —
-  solar's biggest native planet tile is r≈12, moon's r≈85.
+**Zoomed-in planets.** Planets can't be tile-cached the way the star is — their
+axial rotation *is* the visible motion, and at any usable quantum the tile
+changes every frame anyway. So the zoomed-in case is attacked by doing less work
+per frame rather than by reusing frames, in three independent ways:
 
-  The tuning is the opposite of what it looks like. Clouds are 61% of a `terran`
-  frame, so cutting them is where the speed is — but one dropped *cloud* octave
-  moves 22% of the disc (mean 3.3) against 3% (mean 1.3) for one dropped
-  *surface* octave. The broad low-contrast layer is what the eye reads as
-  silhouette, so the surface octave goes first and clouds only follow past 400px.
+- **Shade only what the compositor will read.** `scene_core::visible_tile_rect`
+  asks where a tile actually lands on screen and returns the sub-rect `blit` will
+  sample; `planet_core::render_tile_into` shades that and nothing else. A disc
+  twice the viewport height has ~70% of its tile hanging off the edge, and that
+  work simply stops happening. An empty rect is also the exact visibility test,
+  which replaced a blanket "2.2 body radii" cull margin that had to over-estimate
+  for ringed giants — and so kept rendering full-size tiles for plain worlds that
+  were already off-screen. Rows are further narrowed to the span the disc (and a
+  ringed world's ring ellipse) actually covers.
+- **Octaves finer than the pixel grid are dropped** (`planet_core::Lod`). A tile
+  puts one sphere radius across `rad` px, so a field sampled at `p · freq` has
+  its `k`-th octave land at `rad / (freq · 2^(k-1))` px. Under two pixels it is
+  past Nyquist — it cannot be resolved, and since the planet turns, what it
+  contributes is crawling speckle. This is a mip level, not a quality knob: a
+  planet 20 px across pays for three octaves, the same planet filling the screen
+  pays for six, and coastlines come out *steadier* than before. Separately, a
+  domain warp's displacement field only needs two octaves whatever the size
+  (`noise_core::fbm_warp_oct`), which alone turns a 4-octave `fbm_warp`'s 16
+  octave evaluations into 10.
+- **The compositor walks runs, not pixels.** At the upscales a zoomed-in scene
+  reaches, tens of consecutive destination px share one tile px, so `blit` fetches
+  the source, tests alpha and computes the blend factors once per run — and skips
+  a transparent run without touching the destination.
 
-  Keep it in proportion: 9–19% is barely above this machine's timing noise, and
-  pinning `planet_detail` low is still the 5–6× lever.
-
-### SIMD noise
-
-Everything above is about doing the shader *less often*. This is about making it
-cheaper: `value_noise` and `worley` hash their lattice corners four at a time
-through a small four-lane shim (`crates/noise-core/src/lanes.rs`), which lowers
-to wasm `simd128` in the browser and to plain `[_; 4]` arrays everywhere else.
-Measured in V8 (64²/128² frames, ms):
+Measured in the browser (V8, a 1680×944 render buffer — what the demo picks for a
+2560×1440 viewport — seed 7, detail cap 64):
 
 | | before | after |
 |---|---|---|
-| `terran` (clouds + aurora + storm) | 3.46 / 13.32 | **3.10 / 12.17** |
-| `gas_giant` (warped bands + spot)  | 3.13 / 12.32 | **2.71 / 11.00** |
-| `barren` (worley craters)          | 1.40 / 5.65  | **1.11 / 4.56** |
-| `sun-core` tile, r = 24 / 60 / 140 px | 2.88 / 15.6 / 85.5 | **2.40 / 13.1 / 71.0** |
-| `solar` scene frame @ 960×540      | 7.4          | **6.4** |
+| planet filling the viewport | 28.2 ms (35 fps) | **17.3 ms (58 fps)** |
+| planet at 2× the viewport | 31.6 ms (32 fps) | **9.4 ms (106 fps)** |
+| mid-zoom, several worlds past the cap | 39.2 ms (25 fps) | **17.1 ms (58 fps)** |
+| compositing one full-screen body | 10.6 ms | **2.2 ms** |
+| surface shader, median archetype | 633 ns/px | **361 ns/px** |
 
-Every rendered byte is unchanged — native `out/` hashes and the wasm pixel
-checksums both match the scalar code exactly, which is the point: the shim is
-written so the two backends cannot diverge (no FMA, no reassociation), and
-`cargo test -p noise-core` pins both kernels to the scalar definitions they
-replaced, bit-for-bit.
-
-Two results worth keeping, because both are counter-intuitive:
-
-- **`-C target-feature=+simd128` on its own does nothing.** LLVM will not
-  auto-vectorize these kernels; the flag alone produced byte-identical output at
-  identical speed. The lanes have to be written by hand.
-- **The four-lane `value_noise` is only a win when it is *not* inlined.** A pixel
-  evaluates it ~28 times, and inlined into the pixel loop its `v128` temporaries
-  spill badly enough to end up *slower* than scalar (4.12 ms vs 3.46). Out of
-  line it wins (3.10). `worley` is called once per pixel and wants ordinary
-  inlining. Hence the `cfg_attr` on `value_noise`.
-
-Without `simd128` the shim's portable path is slower **in wasm** than the scalar
-code it replaced (`barren` 1.63 vs 1.40 ms), so the feature is a requirement of
-the committed modules rather than a bonus — which is why it lives in
-`.cargo/config.toml` and not in a build script. Native is unaffected either way
-(it takes the array path, and measured within noise of before).
+**The detail cap is still the biggest single lever**, and it is worth knowing that
+it sets a *radius*: cost goes as its square, so halving the slider quarters the
+shader work. At the same zoom, cap 32 is 5.8 ms, cap 64 is 17.8 ms and cap 160 is
+95 ms. The shipped default of 160 buys full six-octave detail on a screen-filling
+world and costs accordingly; drop it if you want the frame back.
 
 ### Feature cost lab
 
@@ -670,88 +664,27 @@ morph, so restoring it too would need the product of the two axes rather than
 the sum — 36 planes, not 12.
 
 Because they change the picture rather than the pixel budget, none of these
-switches is in `F_ALL`. The native generators keep the live shader and `out/` is byte-identical; the
-three web demos turn all three on at construction, behind one `Frozen weather`
-checkbox each. The planet lab exposes them separately (`Frozen cloud deck`,
-`Baked surface`, `Baked bands`, `billow (morph LUT)`) so each can be A/B'd on
-its own — the last is nested under the deck, which it needs.
+switches is in `F_ALL` — which is `F_CLOUD_SHADOW | F_ATMO | F_RIM |
+F_STARFIELD | F_CHEAP_WARP` and nothing else. That is what keeps `out/`
+byte-identical while the web demos run with the lot.
 
-### Shader experiments
+Measured against the shipped renderer (which already sizes octaves to the pixel
+grid and clips tiles to the viewport), a 160px tile in wasm:
 
-Five ideas were built and measured against each other; three earned their place.
-Unlike everything above, these **change pixels** — the cost is stated for each.
-
-| experiment | best case | visual cost | kept |
-|---|---|---|:--:|
-| **Cheap warp inner field** — `fbm_warp`'s three displacement fields only bend the outer field's domain, so they run at 2 octaves instead of matching it | 16–38% on cloudy/banded worlds | 12–30% of the disc moves, mean 1.4–4.2/255 | ✅ |
-| **Night-side thinning** — past the terminator `shade` bottoms out at the 0.10 ambient floor, leaving ~3 of 22 levels, so the fine octaves and the whole cloud deck are skipped there | 8–35% | 3–7% of the disc, mean 0.03–0.9 | ✅ |
-| **Tile bbox** — a ringed giant's tile is 4.4r across for a 2r disc; bound each row to its content | 9–14% on ringed worlds | none — bit-exact | ✅ |
-| **Planet tile memo** — reuse a body's last tile while nothing it depends on has moved a whole pixel (the sun has done this for ages) | 16–35% at fit view, **65% paused when zoomed** | motion quantizes to ≤1px | ✅ |
-| **Cubic interpolant** — replace the quintic `smoother` | 0% — the hash dominates and the lerps are already vectorized | — | ❌ |
-| **Worley early-out** — skip cells whose bounding box is farther than the best hit so far | **3× slower**, despite skipping 19.4 of 27 cells exactly | none | ❌ |
-
-That last one is the useful negative: branchless four-lane SIMD beats a smarter
-scalar loop, and the per-call bookkeeping to decide what to skip costs more than
-the work it saves. Don't add branches to reclaim work from a vectorized kernel.
-
-For scale on the visual cost: one 1px step of axial spin already changes ~40% of
-a disc with a mean delta near 10. Across the whole shipped `planets_table.png`,
-all of this together moves **4.6% of pixels by a mean of 0.63/255**; the sun
-table is untouched (the `star` crate doesn't share this shader).
-
-Net: **13–20% off a wasm planet frame**, ~8% off a solar scene frame, and up to
-65% when the scene is parked. The native generators barely move (~1%), which is
-the encoder-bound result above showing up exactly where it should.
-
-### Parallel generation
-
-The browser work above does not help the native generators, because they were
-never shader-bound. Profiling the whole pipeline found the shading to be **~9%**
-of it; the other ~85% was **GIF encoding** — NeuQuant palette quantization at
-`image`'s default `speed = 1`. A single file, planet's all-types grid GIF, was
-19s of a 30s run by itself.
-
-So `render-io` drives the `gif` crate directly instead of `image`'s `GifEncoder`.
-The encoder is one stateful writer, but the quantization of each frame is a pure
-function of that frame — so quantization fans out across cores with `rayon` and
-only the writes stay ordered and serial. Frame *production* is parallel too for
-the spinning-body family. On 4 cores:
-
-| generator | before | after | |
+| type | shipped | + every switch | |
 |---|---:|---:|---:|
-| `comet`    | 19.6s | **5.3s** | 3.68× |
-| `planet`   | 31.2s | **8.7s** | 3.60× |
-| `sun`      | 13.1s | **3.7s** | 3.54× |
-| `solar`    | 17.6s | **5.1s** | 3.47× |
-| `asteroid` | 15.3s | **4.5s** | 3.40× |
-| `moon`     |  8.2s | **2.5s** | 3.32× |
-| **all six** | **105s** | **30s** | **3.52×** |
+| `barren` | 200 fps | **459 fps** | 2.30× |
+| `ocean` | 103 fps | **231 fps** | 2.26× |
+| `gas_giant` | 112 fps | **220 fps** | 1.97× |
+| `terran` | 101 fps | **210 fps** | 2.08× |
+| `toxic` | 154 fps | **310 fps** | 2.01× |
+| `lava` | 214 fps | **282 fps** | 1.32× | The native generators keep the live shader and `out/` is byte-identical; the
+three web demos turn all three on at construction, behind one `Frozen weather`
+checkbox each, alongside night-side thinning. The planet lab exposes them
+separately (`Night-side thinning`, `Frozen cloud deck`, `Baked surface`,
+`Baked bands`, `billow (morph LUT)`) so each can be A/B'd on its own — the last
+is nested under the deck, which it needs.
 
-Counting `bird` and `character`, which are untouched, the whole `out/` build goes
-110.5s → 35.1s (3.15×).
-
-Every byte is unchanged, which is the whole constraint: `encode_gif` mirrors
-`GifEncoder::convert_frame`/`encode_gif` step for step — same speed, same
-`delay / 10` truncation, same `Background` disposal, same empty global palette
-sized from the first frame, `set_repeat` before any frame. It is the one place
-in the workspace that has to stay byte-compatible with someone else's encoder,
-so changes there get checked against the `out/` hashes, not by eye.
-
-The scene generators (`solar`, `moon`, `comet`, `asteroid`) parallelize only
-their encoding: their frame closures borrow a `System`/`Belt`/`Scene` whose
-`RefCell` caches — draw order, the baked sun tile, the nebula — make it
-deliberately non-`Sync`. Rendering frames in parallel would mean one system per
-thread, which throws away exactly the caches that make a scene frame cheap. They
-still land near 3.5× because encoding was the bulk of it.
-
-`bird` is deliberately untouched. It renders creatures, not planets; it keeps its
-own inline GIF encoder and its independence from `render-io`, and it stays on the
-serial path. That is why the whole-pipeline figure lands below the per-generator
-one — `alien` is ~5s of it.
-
-Nothing here reaches the wasm builds: `render-io` sits behind the `native`
-feature, so a `--no-default-features` module still has **zero** third-party
-dependencies.
 
 ## Adding a planet type
 

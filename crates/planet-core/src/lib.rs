@@ -34,8 +34,56 @@ pub use scene_core::Tile;
 
 use dither_core::{bayer, quant};
 use noise_core::{
-    clamp01, contrast, cycle3, fbm, fbm_warp_inner, hash3, lerp, mix, ramp, smoothstep, worley, Rgb,
+    clamp01, contrast, cycle3, fbm, fbm_warp, hash3, lerp, mix, ramp, smoothstep, worley, Rgb,
 };
+
+// ---------------------------------------------------------------------------
+// Level of detail
+// ---------------------------------------------------------------------------
+
+/// Octave counts for the shader's fBm fields, derived from the disc's pixel
+/// radius.
+///
+/// A tile puts one sphere radius across `rad` px, so a field sampled at
+/// `p · freq` has its `k`-th octave's lattice cell land at
+/// `rad / (freq · 2^(k-1))` px. Under two pixels that octave is past Nyquist:
+/// unresolvable, and on a turning planet it reads as crawling speckle. Dropping
+/// it is cheaper *and* steadier — a mip level, not a quality knob.
+#[derive(Clone, Copy)]
+struct Lod {
+    /// Disc radius in px — how finely this tile can resolve anything.
+    rad: f32,
+    /// Hard ceiling on top of what the radius allows. `F_NIGHT_LOD` sets it
+    /// past the terminator, where `shade` bottoms out at the 0.10 ambient floor
+    /// and the 22-level output has ~3 levels left to say anything with.
+    cap: u32,
+}
+
+impl Lod {
+    fn for_disc(rad_px: f32) -> Lod {
+        Lod { rad: rad_px.max(1.0), cap: u32::MAX }
+    }
+
+    /// The same disc with the octave count capped — see [`Lod::cap`].
+    fn capped(self, cap: u32) -> Lod {
+        Lod { cap, ..self }
+    }
+
+    /// Octaves for a domain warp's three displacement components.
+    const WARP: u32 = 2;
+
+    /// Solves `rad / (freq · 2^(k-1)) >= 2` for the largest whole `k`, clamped
+    /// to `1..=full`.
+    #[inline]
+    fn oct(&self, freq: f32, full: u32) -> u32 {
+        let cells = self.rad / (2.0 * freq.max(0.01)); // = 2^(k-1) at the limit
+        if cells <= 1.0 {
+            return 1;
+        }
+        let k = 1 + cells.log2() as u32;
+        k.clamp(1, full.min(self.cap))
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Feature switches
@@ -45,7 +93,7 @@ use noise_core::{
 // `spot`, `aurora`, `lightning`, `storm_cells` and `caps` are all gated on
 // `> 0.0`, so zeroing one switches that feature off. These are the pieces a
 // parameter cannot reach: parts of a layer rather than a whole one, framing
-// furniture, and the two optimizations. A SET bit means the feature is ON.
+// furniture, and the optimizations. A SET bit means the feature is ON.
 
 /// The cloud deck's self-shadow, independent of the cloud colour above it.
 pub const F_CLOUD_SHADOW: u32 = 1;
@@ -55,30 +103,50 @@ pub const F_ATMO: u32 = 2;
 pub const F_RIM: u32 = 4;
 /// The hashed starfield behind the planet (hero framing only).
 pub const F_STARFIELD: u32 = 8;
-/// OPTIMIZATION: skip the fine octaves and the cloud deck past the terminator.
+/// OPTIMIZATION: cap the octaves and skip the cloud deck past the terminator,
+/// where `shade` bottoms out at the 0.10 ambient floor and the 22-level output
+/// has about three levels left to say anything with.
+///
+/// NOT in [`F_ALL`]. It used to be, back when the octave budget only reached the
+/// base field — the night side quantized to the same levels either way. Now that
+/// `Lod` also feeds the aurora and the great spot, capping it there moves
+/// pixels, so it sits with the other switches that change the picture.
 pub const F_NIGHT_LOD: u32 = 16;
-/// OPTIMIZATION: run a domain warp's displacement fields at 2 octaves.
+/// OPTIMIZATION: run a domain warp's displacement fields at [`Lod::WARP`]
+/// octaves instead of matching the field they bend.
 pub const F_CHEAP_WARP: u32 = 32;
-/// OPTIMIZATION: freeze the cloud deck and read it from a baked map (see
-/// [`CloudMap`]). Costs the billowing and the churning storm cells; the deck
-/// still rotates over the surface at its own rate.
+/// Everything on — what every caller but the demo's ablation panel wants. The
+/// switches that change the picture rather than the pixel budget are outside it,
+/// so `out/` stays byte-identical while the web demos opt in.
+pub const F_ALL: u32 = F_CLOUD_SHADOW | F_ATMO | F_RIM | F_STARFIELD | F_CHEAP_WARP;
+
+/// OPTIMIZATION: freeze the cloud deck and read it from a baked sphere map.
+/// Costs the billowing and the churning storm cells; the deck still rotates
+/// over the surface at its own rate.
 ///
-/// Deliberately NOT in [`F_ALL`]: it is the one switch here that changes the
-/// picture rather than the pixel budget, so the native generators keep the
-/// animated deck and `out/` stays byte-identical. The web demos opt in.
+/// Deliberately NOT in [`F_ALL`]: this and the three below change the picture
+/// rather than the pixel budget, so the native generators keep the live shader
+/// and `out/` stays byte-identical. The web demos opt in.
 pub const F_BAKED_CLOUDS: u32 = 64;
-/// OPTIMIZATION: bake the base surface albedo into the sphere map as well.
+/// OPTIMIZATION: bake the base surface albedo into the sphere map.
 ///
-/// Only the two families that are pure functions of a direction on the sphere —
-/// `Terrestrial` and `Cratered`, 15 of the 26 types. A gas giant's zonal jets
-/// and a lava world's molten flow advect with `angle` and stay live.
-///
-/// Also covers `Emissive`, whose 6-octave rock field is static — only the
-/// 3-octave flow that lights it advects, and that stays live, so a lava world
-/// keeps flowing at full speed.
-///
-/// Like [`F_BAKED_CLOUDS`], deliberately outside [`F_ALL`].
+/// Covers the families that are pure functions of a direction on the sphere:
+/// `Terrestrial` and `Cratered`, plus `Emissive`, whose 6-octave rock field is
+/// static — only the 3-octave flow that lights it advects, and that stays live,
+/// so a lava world keeps flowing.
 pub const F_BAKED_SURFACE: u32 = 128;
+/// OPTIMIZATION: bake `Base::Banded`, re-expressing its zonal drift as a
+/// rotation in longitude instead of a shear of the noise domain.
+///
+/// The drift is added to the sample's *x* today, which slides the field through
+/// the sphere and so cannot be a lookup offset. As a longitude rate it stays on
+/// the sphere, and animating the bands costs one subtraction from the texture
+/// coordinate. The bake is exact under that model: `band` is a function of the
+/// warp and of `y`, and a shift in longitude leaves `y` alone.
+///
+/// Its own bit because unlike the others it changes what the motion *is* — the
+/// bands counter-rotate rather than shearing past each other.
+pub const F_BAKED_BANDS: u32 = 256;
 /// Restore the cloud deck's billowing on top of [`F_BAKED_CLOUDS`], by baking
 /// the deck at several points along its morph cycle and interpolating.
 ///
@@ -87,53 +155,29 @@ pub const F_BAKED_SURFACE: u32 = 128;
 /// Discretizing that axis does: `MORPH_PHASES` maps across the cycle, indexed by
 /// the morph *value* rather than by time, since it oscillates rather than
 /// advancing. Costs one extra tap per plane and `MORPH_PHASES`x the memory and
-/// bake, and buys back the half of the deck's life that freezing took.
-///
-/// The storm swirl stays frozen: it runs on its own cycle, so restoring it too
-/// would need the product of the two axes rather than the sum.
+/// bake, and buys back most of the life freezing took.
 pub const F_MORPH_LUT: u32 = 512;
-/// How many points along the morph cycle [`F_MORPH_LUT`] bakes.
-///
-/// The morph spans ±0.6 of a lattice cell at the base octave, which is ±4.8 at
-/// the fourth — so adjacent phases are well correlated coarsely and independent
-/// finely, and the interpolation between them reads as cloud forming and
-/// dissipating rather than sliding. Six is where that still looks continuous;
-/// fewer and the dissolve steps.
+
+/// Octave ceiling past the terminator. Four keeps a terrestrial world's
+/// coastlines; below that the night side loses shape, not just grain.
+const NIGHT_OCT: u32 = 4;
+
+/// How many points along the morph cycle [`F_MORPH_LUT`] bakes. Six is where
+/// the dissolve between adjacent phases still looks continuous.
 const MORPH_PHASES: u8 = 6;
 /// Half-width of the morph cycle: `angle.sin() * MORPH_SPAN`.
 const MORPH_SPAN: f32 = 0.6;
 
-/// OPTIMIZATION: bake `Base::Banded`, re-expressing its zonal drift as a
-/// rotation in longitude instead of a shear of the noise domain.
-///
-/// The drift `angle · 0.16 · sin(lat · bands / 2)` is added to the sample's *x*
-/// today, which slides the field through the sphere and so cannot be a lookup
-/// offset. As a longitude rate it stays on the sphere, and animating the bands
-/// costs one subtraction from the texture coordinate. The bake is exact under
-/// that model: `band` is a function of the warp and of `y`, and a shift in
-/// longitude leaves `y` alone.
-///
-/// Its own bit, and outside [`F_ALL`], because unlike the others it changes what
-/// the motion *is* — the bands counter-rotate rather than shearing past each
-/// other. That is arguably what the code always meant to do, but it does not
-/// look the same.
-pub const F_BAKED_BANDS: u32 = 256;
-/// Everything on — what every caller but the demo's ablation panel wants.
-pub const F_ALL: u32 = 63;
-
-/// Octaves for a domain warp's three *displacement* fields.
-///
-/// `fbm_warp` runs its inner fields at the same count as the outer one, but they
-/// only bend the outer field's domain — their fine octaves are nearly invisible
-/// in the result and cost full price. Two octaves is the measured knee: the warp
-/// kernel gets 36-44% cheaper and the field moves by a mean of 0.019, against a
-/// dither step of 0.045. Below 2 the marbling starts to straighten out.
-const WARP_INNER: u32 = 2;
-
-/// Inner-field octaves for a warp whose outer count is `outer`.
+/// Octaves for a domain warp's three displacement fields, given the count the
+/// field they bend is running at. [`F_CHEAP_WARP`] is what the ablation panel
+/// switches off to price the difference.
 #[inline(always)]
-fn warp_inner(feat: u32, outer: u32) -> u32 {
-    if feat & F_CHEAP_WARP != 0 { WARP_INNER } else { outer }
+fn warp_oct(feat: u32, main: u32) -> u32 {
+    if feat & F_CHEAP_WARP != 0 {
+        Lod::WARP
+    } else {
+        main
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -348,7 +392,7 @@ fn seed_offsets(seed: u32) -> [f32; 3] {
 }
 
 /// A drifting spiral cyclone (great-spot) tint on a banded world, with a calm eye.
-fn great_spot(col: Rgb, sx: f32, sy: f32, sz: f32, angle: f32, intensity: f32) -> Rgb {
+fn great_spot(col: Rgb, sx: f32, sy: f32, sz: f32, angle: f32, intensity: f32, lod: Lod) -> Rgb {
     let spot_lat = 0.28;
     let spot_lon = 0.6 + angle.sin() * 0.18; // gently oscillates (loop-safe)
     let lon = sz.atan2(sx);
@@ -360,9 +404,16 @@ fn great_spot(col: Rgb, sx: f32, sy: f32, sz: f32, angle: f32, intensity: f32) -
         dlon += TAU;
     }
     let dlat = sy - spot_lat;
+    let base = ((dlon * 1.05).powi(2) + (dlat * 2.2).powi(2)).sqrt();
+    // The boundary below scales `base` by `0.82 + 0.4·edge`, `edge` in [0, 1],
+    // so 0.82·base is the smallest it can be: past that the pixel is outside
+    // whatever the noise says. Most of a banded disc is. Exact rejection.
+    if base * 0.82 >= 1.0 {
+        return col;
+    }
     // Turbulent, irregular boundary — not a clean geometric oval.
-    let edge = fbm(dlon * 3.0 + sy * 4.0, dlat * 3.0, sz * 2.0, 2);
-    let d = ((dlon * 1.05).powi(2) + (dlat * 2.2).powi(2)).sqrt() * (0.82 + 0.4 * edge);
+    let edge = fbm(dlon * 3.0 + sy * 4.0, dlat * 3.0, sz * 2.0, lod.oct(4.0, 2));
+    let d = base * (0.82 + 0.4 * edge);
     if d >= 1.0 {
         return col;
     }
@@ -371,7 +422,7 @@ fn great_spot(col: Rgb, sx: f32, sy: f32, sz: f32, angle: f32, intensity: f32) -
     let (s, c) = swirl.sin_cos();
     let lx = dlon * c - dlat * s;
     let ly = dlon * s + dlat * c;
-    let streak = fbm(lx * 8.0, ly * 8.0, sy * 2.0, 4);
+    let streak = fbm(lx * 8.0, ly * 8.0, sy * 2.0, lod.oct(8.0, 4));
     let core = smoothstep(1.0, 0.15, d) * intensity;
     let spot_col = mix([0.80, 0.36, 0.26], [0.93, 0.66, 0.46], smoothstep(0.40, 0.82, streak));
     let mut out = mix(col, spot_col, core * 0.78);
@@ -382,7 +433,7 @@ fn great_spot(col: Rgb, sx: f32, sy: f32, sz: f32, angle: f32, intensity: f32) -
 }
 
 /// Shimmering polar aurora intensity (0..1) at this surface point.
-fn aurora_glow(sx: f32, sy: f32, sz: f32, angle: f32) -> f32 {
+fn aurora_glow(sx: f32, sy: f32, sz: f32, angle: f32, lod: Lod) -> f32 {
     let lat = sy.abs();
     let band = smoothstep(0.55, 0.70, lat) * (1.0 - smoothstep(0.82, 0.96, lat));
     if band <= 0.0 {
@@ -390,7 +441,7 @@ fn aurora_glow(sx: f32, sy: f32, sz: f32, angle: f32) -> f32 {
     }
     let lon = sz.atan2(sx);
     // curtains: drift in longitude + shimmer over time
-    let curtain = fbm(lon * 2.5 + angle * 1.5, lat * 9.0, sy * 3.0 + angle, 3);
+    let curtain = fbm(lon * 2.5 + angle * 1.5, lat * 9.0, sy * 3.0 + angle, lod.oct(9.0, 3));
     band * smoothstep(0.48, 0.78, curtain)
 }
 
@@ -431,123 +482,37 @@ fn lightning_flash(sx: f32, sy: f32, angle: f32) -> (f32, Rgb) {
     (mag, col)
 }
 
-// ---------------------------------------------------------------------------
-// Level of detail
-// ---------------------------------------------------------------------------
-
-/// How much fBm detail a tile keeps.
-///
-/// A scene tile's noise is sampled in *disc-normalised* coordinates, so a bigger
-/// tile spreads the same field over more pixels: the finest octaves shrink to
-/// sub-pixel wobble and then disappear into the ordered dither. Past a point
-/// they cost their full price and change nothing you can see, which is what this
-/// drops. `sun-core` has done the same for the star since it was split out; the
-/// thresholds here are its (`size > 200`), and the native generators never reach
-/// them — solar's biggest planet tile is r≈12, moon's r≈85 — so `out/` is
-/// untouched by construction.
-///
-/// The two fields are tuned apart, and the split is the opposite of what it
-/// looks like it should be. Clouds are 61% of a `terran` frame, so cutting them
-/// is where the speed is — but measured against full detail, one dropped cloud
-/// octave moves 22% of the disc (mean 3.3/255) while one dropped *surface*
-/// octave moves 3% (mean 1.3). The soft layer is the one you notice, because it
-/// is broad and low-contrast and the eye reads its silhouette. So the surface
-/// octave goes first and clouds only follow past 400px.
-#[derive(Clone, Copy, PartialEq)]
-struct Lod {
-    surface: u32,
-    cloud: u32,
-}
-
-/// Every octave, always — the hero framing and any tile below the threshold.
-const LOD_FULL: Lod = Lod { surface: 0, cloud: 0 };
-
-/// The floor used past the terminator (see `NIGHT_DIFF`).
-const LOD_NIGHT: Lod = Lod { surface: 9, cloud: 9 };
-
-// Thinning starts exactly at the geometric terminator (`diff <= 0`), where
-// `shade` bottoms out at the 0.10 ambient floor and the output has ~3 of its 22
-// levels left to say anything with.
-
-impl Lod {
-    fn for_size(size: u32, enabled: bool) -> Lod {
-        if !enabled || size <= 200 {
-            LOD_FULL
-        } else if size <= 400 {
-            Lod { surface: 1, cloud: 0 }
-        } else {
-            Lod { surface: 1, cloud: 1 }
-        }
-    }
-    /// Octaves for the terrain/band field. Floored at 4: below that a
-    /// terrestrial world loses its coastlines, not just its grain.
-    #[inline(always)]
-    fn surf(self, n: u32) -> u32 {
-        n.saturating_sub(self.surface).max(4)
-    }
-    /// Octaves for the cloud field. Floored at 2 — fronts stay ragged.
-    #[inline(always)]
-    fn cld(self, n: u32) -> u32 {
-        n.saturating_sub(self.cloud).max(2)
-    }
-}
 
 // ---------------------------------------------------------------------------
-// Baked cloud deck (F_BAKED_CLOUDS)
+// Baked sphere maps (F_BAKED_*)
 // ---------------------------------------------------------------------------
 //
-// The live deck costs 14 `value_noise` evaluations per pixel — a 4-octave
-// domain warp for the cloud tops (3 inner fields + 1 outer = 10) plus a plain
-// 4-octave field for the self-shadow (4). That is the single most expensive
-// thing on a cloudy planet, ~55% of a `terran` frame.
+// A screen-space sprite strip cannot work here: it has to be re-baked for every
+// (spin, light) pair and scales as r^3 — at r=80 that is 503 frames and 51 MB,
+// and it breaks even only after a full revolution, because building it means
+// rendering one. Indexing by (longitude, y) on the SPHERE instead makes the bake
+// invariant to both, so one map serves every frame at every angle.
 //
-// All 14 collapse into two table reads the moment the deck stops *evolving*.
-// The deck already rotates at its own rate (2x the surface, so weather drifts
-// across the continents); what makes it per-frame work is the billowing morph
-// and the churning storm swirl, both driven by `angle`. Freeze those and the
-// density becomes a fixed function of a direction on the sphere — bakeable.
+// y rather than latitude is deliberate: a sphere point is (r·cos t, y, r·sin t)
+// with r = sqrt(1-y^2), so a row is exactly a circle of constant y, the vertical
+// axis costs no transcendental at lookup, and the map is equal-area.
 //
-// The map is equirectangular in (longitude, y). y rather than latitude is
-// deliberate: the sphere point is (r·cos θ, y, r·sin θ) with r = √(1−y²), so a
-// row of the map is exactly a circle of constant y and the vertical axis needs
-// no transcendental at lookup time. It is also equal-area (Lambert), so texels
-// carry uniform detail instead of piling up at the poles.
-//
-// Stored as `u8`. The map feeds `smoothstep(0.52, 0.70, ·)`, an 0.18-wide ramp,
-// so one quantum of storage moves the result by 2.2% of the ramp — against a
-// dither step of 0.045 in the output, invisible.
+// Planes are u8. They feed ramps 0.18 wide or narrower, so one quantum moves the
+// result by ~2% of a ramp against a dither step of 0.045 — invisible.
 
 /// Where in its cycle the storm swirl is frozen.
 ///
-/// Live, the eddies churn back and forth as `(angle · 0.6).sin()` — they spend
-/// most of the cycle part-wound and pass through 0 (no swirl at all) twice per
-/// turn. Baking the mean would straighten the cells out entirely, so this picks
-/// a well-wound state instead: high enough that the vortices read as storms,
-/// short of the peak where the tightest ones start to smear into rings.
+/// Live, the eddies churn back and forth as `(angle · 0.6).sin()` — they pass
+/// through 0 (no swirl at all) twice per turn, so baking the mean would
+/// straighten the cells out. This picks a well-wound state instead.
 const STORM_STATIC: f32 = 0.7;
 
-/// Where the band shear is frozen.
-///
-/// `Base::Cloudy` shears the field along longitude by `(…).sin(angle)`, which
-/// is what makes its bands churn. Unlike the swirl there is nothing to lose by
-/// taking the zero of that cycle: the shear only *displaces* an already
-/// domain-warped field, so at zero the bands are exactly as turbulent, they
-/// just stop sliding past each other.
+/// Where the `Base::Cloudy` band shear is frozen. Unlike the swirl there is
+/// nothing to lose at zero: the shear only *displaces* an already domain-warped
+/// field, so the bands are exactly as turbulent, they just stop sliding.
 const SHEAR_STATIC: f32 = 0.0;
 
-/// A frozen weather layer, equirectangular in (longitude, y) — see the notes
-/// above. Two kinds of planet get one, and a plane is empty when it does not
-/// apply:
-///
-/// * a **deck** over a solid surface (`clouds > 0`): `warp` is the
-///   domain-warped density that colours the cloud tops, `dens` the plain
-///   density the self-shadow reads.
-/// * a **shroud** that *is* the surface (`Base::Cloudy`): `shroud` is the
-///   finished band/turbulence mix factor, so the lookup lands one `mix` away
-///   from the pixel's colour.
-///
-/// Every plane covers the whole sphere, so one map serves every angle the
-/// planet will ever be seen at.
+/// A frozen layer, equirectangular in (longitude, y).
 struct CloudMap {
     w: u32,
     h: u32,
@@ -557,8 +522,8 @@ struct CloudMap {
     dens: Vec<u8>,
     phases: u8,
     /// The baked base surface, for the families whose base is one or two scalar
-    /// fields rather than a colour. What they hold depends on `ct.base`, and a
-    /// planet has exactly one base, so there is no ambiguity:
+    /// fields rather than a colour. A planet has exactly one base, so there is
+    /// no ambiguity:
     ///
     /// | base | `base_a` | `base_b` |
     /// |---|---|---|
@@ -566,67 +531,58 @@ struct CloudMap {
     /// | `Emissive` | the static rock field `n` | — |
     /// | `Banded` | band mix factor | fine-detail mix factor |
     ///
-    /// `Banded` needs two because its two fields drift at different rates (1.0
-    /// and 1.4), so one lookup offset cannot serve both.
+    /// `Banded` needs two because its fields drift at different rates (1.0 and
+    /// 1.4), so one lookup offset cannot serve both.
     base_a: Vec<u8>,
     base_b: Vec<u8>,
     /// Base albedo for `Terrestrial`/`Cratered`, RGB interleaved (3 bytes/texel)
-    /// — see [`F_BAKED_SURFACE`]. Interleaved rather than three planes so one
-    /// lookup touches one cache line instead of three.
+    /// so one lookup touches one cache line instead of three.
     surf: Vec<u8>,
 }
 
-/// Everything the baked layer depends on. `clouds` is absent on purpose — it
-/// only scales the deck's opacity after the lookup, so changing it re-uses the
-/// map. So is the light direction: the shadow tap moves, the field does not.
-/// The `f32`s that do matter are keyed by bit pattern, since `f32` is not `Eq`.
+/// Everything a baked map depends on. `clouds` is absent on purpose — it only
+/// scales the deck's opacity after the lookup. So is the light direction: the
+/// shadow tap moves, the field does not.
 #[derive(PartialEq, Clone, Copy)]
 struct CloudKey {
     seed: u32,
     w: u32,
-    /// `(octaves, warp inner, storm_cells, morph phases)` — `None` when the
-    /// planet has no deck.
+    /// `(octaves, warp octaves, storm_cells, morph phases)`, or `None` for a
+    /// planet with no deck.
     deck: Option<(u32, u32, u32, u8)>,
-    /// The baked base surface: `(lod thinning, shape hash, plane count)`.
-    /// `None` when this planet's base is not baked — either its family cannot
-    /// be, or the caller did not ask for it.
-    base: Option<(u32, u64, u8)>,
+    /// `(shape hash, plane count)`, or `None` when the base is not baked.
+    base: Option<(u64, u8)>,
 }
 
 impl CloudKey {
-    /// Heap the baked map will occupy — one `u8` plane per scalar field it
-    /// holds, three for the interleaved albedo.
+    /// Heap the baked map will occupy — one `u8` plane per scalar field.
     fn bytes(&self) -> usize {
         let texels = (self.w * (self.w / 2)) as usize;
-        texels * (2 * self.deck.map_or(0, |d| d.3 as usize) + self.base.map_or(0, |b| b.2 as usize))
+        texels * (2 * self.deck.map_or(0, |d| d.3 as usize) + self.base.map_or(0, |b| b.1 as usize))
     }
 }
 
 /// How many baked layers to keep. A scene draws every planet in the system on
 /// the way to drawing one, so a one-deep cache would evict on every body and
-/// re-bake on the next — turning the optimization into a pessimization. Eight
-/// covers `solar`'s largest roster.
+/// re-bake on the next — turning the optimization into a pessimization.
 const CLOUD_CACHE_SLOTS: usize = 8;
-
-/// ...but only up to a budget, because the slots are not the same size. Zoomed
-/// in, one map is 1 MB; eight of those is a heap growth in wasm for maps that
-/// are mostly off-screen. Whichever limit binds first wins.
+/// ...but only up to a budget, because the slots are not the same size. With the
+/// morph LUT one zoomed planet's deck is six planes deep.
 const CLOUD_CACHE_BYTES: usize = 24 << 20;
 
 thread_local! {
     /// Per-thread, most-recently-used first. Native rendering fans frames across
-    /// rayon, so each worker bakes its own copies once and then reuses them for
-    /// every frame it is handed; wasm is single-threaded and bakes exactly once
-    /// per planet per zoom level.
+    /// rayon, so each worker bakes its own copies once; wasm is single-threaded
+    /// and bakes once per planet per zoom level.
     static CLOUD_CACHE: RefCell<Vec<(CloudKey, Rc<CloudMap>)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Map width for a disc of `rad` pixels, as a power of two.
 ///
-/// The visible hemisphere is half the map, spread over `2·rad` pixels, so
-/// `w = 4·rad` puts one texel on one pixel. Rounding up to a power of two is
-/// what keeps solar's adaptive detail cap from re-baking on every nudge — the
-/// radius has to cross an octave before the key changes.
+/// The visible hemisphere is half the map over `2·rad` pixels, so `w = 4·rad`
+/// puts one texel on one pixel. Rounding to a power of two keeps a scene's
+/// adaptive detail cap from re-baking on every nudge — the radius has to cross
+/// an octave before the key changes.
 fn cloud_map_w(rad: f32) -> u32 {
     let want = (4.0 * rad).max(1.0);
     let pow2 = 1u32 << (32 - (want as u32).leading_zeros()).min(31);
@@ -634,12 +590,12 @@ fn cloud_map_w(rad: f32) -> u32 {
 }
 
 /// The frozen layer for this planet, baked on first use and kept until the key
-/// moves. Returns `None` when the planet has no weather to freeze.
+/// moves. `None` when there is nothing to freeze.
 fn cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, feat: u32, rad: f32) -> Option<Rc<CloudMap>> {
     let deck = (feat & F_BAKED_CLOUDS != 0 && ct.clouds > 0.0).then(|| {
-        let o = lod.cld(4);
+        let o = lod.oct(2.8, 4);
         let phases = if feat & F_MORPH_LUT != 0 { MORPH_PHASES } else { 1 };
-        (o, warp_inner(feat, o), ct.storm_cells.to_bits(), phases)
+        (o, warp_oct(feat, o), ct.storm_cells.to_bits(), phases)
     });
     // Which switch owns a family's base, and how many planes it needs.
     let planes = match ct.base {
@@ -649,9 +605,9 @@ fn cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, feat: u32, rad: f32
         Base::Banded if feat & F_BAKED_BANDS != 0 => 2,
         _ => 0,
     };
-    let base = (planes > 0).then(|| (lod.surface, base_shape_key(ct, feat), planes));
+    let base = (planes > 0).then(|| (base_shape_key(ct, lod, feat), planes));
     if deck.is_none() && base.is_none() {
-        return None; // nothing to freeze
+        return None;
     }
     let key = CloudKey { seed, w: cloud_map_w(rad), deck, base };
     CLOUD_CACHE.with(|c| {
@@ -662,8 +618,8 @@ fn cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, feat: u32, rad: f32
             cache.insert(0, hit); // most-recently-used first
             return Some(m);
         }
-        // Evict before baking: at 1024x512 a map is 1 MB, and holding the old
-        // one while building the new one straddles a wasm heap growth.
+        // Evict before baking: holding the old map while building the new one
+        // straddles a wasm heap growth.
         let want = key.bytes();
         while !cache.is_empty()
             && (cache.len() >= CLOUD_CACHE_SLOTS
@@ -677,108 +633,41 @@ fn cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, feat: u32, rad: f32
     })
 }
 
-fn bake_cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, feat: u32, key: &CloudKey) -> CloudMap {
-    let w = key.w;
-    let h = w / 2;
-    let n = (w * h) as usize;
-    let sized = |on: bool| if on { vec![0u8; n] } else { Vec::new() };
-    let phases = key.deck.map_or(1, |d| d.3);
-    let deck_n = n * phases as usize;
-    let (mut warp, mut dens) = if key.deck.is_some() {
-        (vec![0u8; deck_n], vec![0u8; deck_n])
-    } else {
-        (Vec::new(), Vec::new())
+/// Everything a baked base plane depends on, folded into one comparable value.
+/// Over-inclusive on purpose: a field no family reads costs one hash step, while
+/// one left out silently serves a stale map. The octave counts are in here too,
+/// since `Lod` derives them from a continuous radius and only their integer
+/// results matter.
+fn base_shape_key(ct: &PType, lod: Lod, feat: u32) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix1 = |v: u64| {
+        h ^= v;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
     };
-    let planes = key.base.map_or(0, |b| b.2);
-    let mut base_a = sized(planes == 1 || planes == 2);
-    let mut base_b = sized(planes == 2);
-    let mut surf = if planes == 3 { vec![0u8; n * 3] } else { Vec::new() };
-    // Vortex centers, hoisted: they are per-seed constants, and the live path
-    // pays for them per pixel.
-    let mut vort = [(0.0f32, 0.0f32); 2];
-    for k in 0..2 {
-        vort[k] = (
-            (hash3(seed as i32, k as i32 * 7 + 1, 3) * 2.0 - 1.0) * 1.6 + ofs[0],
-            (hash3(seed as i32, k as i32 * 7 + 2, 3) * 2.0 - 1.0) * 1.6 + ofs[2],
-        );
+    mix1(ct.base as u64);
+    mix1(ct.freq.to_bits() as u64);
+    mix1(ct.contrast.to_bits() as u64);
+    mix1(ct.ridged as u64);
+    // `stops` is `&'static`, so its address identifies the palette without
+    // walking it.
+    mix1(ct.stops.as_ptr() as usize as u64);
+    mix1(ct.stops.len() as u64);
+    mix1(ct.caps.to_bits() as u64);
+    mix1(ct.bands.to_bits() as u64);
+    mix1(ct.turb.to_bits() as u64);
+    for c in ct.dark.iter().chain(ct.light.iter()) {
+        mix1(c.to_bits() as u64);
     }
-    for j in 0..h {
-        let y = -1.0 + 2.0 * (j as f32 + 0.5) / h as f32;
-        let r = (1.0 - y * y).max(0.0).sqrt();
-        for i in 0..w {
-            let lon = TAU * (i as f32 + 0.5) / w as f32;
-            let (sl, cl) = lon.sin_cos();
-            let (sx, sz) = (r * cl, r * sl);
-            let t = (j * w + i) as usize;
-
-            if let Some((oct, inner, _, _)) = key.deck {
-                let (mut cx3, mut cz3) = (sx + ofs[0], sz + ofs[2]);
-                if ct.storm_cells > 0.0 {
-                    for (vx, vz) in vort {
-                        let (dx, dz) = (cx3 - vx, cz3 - vz);
-                        let fall = (-(dx * dx + dz * dz) * 2.2).exp();
-                        let (ss, sc) = (fall * STORM_STATIC * 1.6 * ct.storm_cells).sin_cos();
-                        cx3 = vx + dx * sc - dz * ss;
-                        cz3 = vz + dx * ss + dz * sc;
-                    }
-                }
-                for k in 0..phases as usize {
-                    // Phases are laid out across the morph's RANGE, not across
-                    // time: it oscillates, so the table is indexed by the value
-                    // and walked back and forth. One phase means morph 0, the
-                    // point the live cycle passes through twice a turn.
-                    let morph = morph_of_phase(k, phases);
-                    let py = y * 2.8 + ofs[1] + morph;
-                    let (zx, zz) = (cx3 * 2.8, cz3 * 2.8 + morph);
-                    let o = k * n + t;
-                    warp[o] = q8(fbm_warp_inner(zx, py, zz, oct, inner, 0.9));
-                    dens[o] = q8(fbm(zx, py, zz, oct));
-                }
-            }
-
-            if key.base.is_some() {
-                let (px, py, pz) = (sx + ofs[0], y + ofs[1], sz + ofs[2]);
-                match ct.base {
-                    Base::Terrestrial | Base::Cratered => {
-                        let col = static_albedo(ct, y, px, py, pz, lod);
-                        surf[t * 3] = q8(col[0]);
-                        surf[t * 3 + 1] = q8(col[1]);
-                        surf[t * 3 + 2] = q8(col[2]);
-                    }
-                    Base::Cloudy => {
-                        // The whole of the mix factor, not just its noise: `band`
-                        // folds in only `y` and the field, both known here, so the
-                        // per-pixel cost collapses to one `mix`.
-                        let o = lod.surf(5);
-                        let flow = (0.5 + 0.3 * (y * 3.0).cos()) * SHEAR_STATIC;
-                        let tv = fbm_warp_inner((px + flow) * 2.0, py * 2.0, pz * 2.0, o, warp_inner(feat, o), 0.7);
-                        let band = 0.5 + 0.5 * (y * ct.bands + (tv - 0.5) * 6.0 * ct.turb).sin();
-                        base_a[t] = q8(band * 0.6 + tv * 0.4);
-                    }
-                    Base::Emissive => {
-                        // Only the rock field. The flow that lights it advects in
-                        // three dimensions and cannot be a lookup offset, so it
-                        // stays live — which is why a lava world still flows.
-                        base_a[t] = q8(contrast(fbm(px * ct.freq, py * ct.freq, pz * ct.freq, lod.surf(6)), 1.7));
-                    }
-                    Base::Banded => {
-                        // Baked at zero drift; the live path puts the drift back
-                        // as a longitude offset on the lookup.
-                        let o = lod.surf(5);
-                        let warp = fbm_warp_inner(px * 1.3, py * 1.3, pz * 1.3, o, warp_inner(feat, o), 0.8);
-                        let lat = y + (warp - 0.5) * ct.turb;
-                        base_a[t] = q8(0.5 + 0.5 * (lat * ct.bands).sin());
-                        base_b[t] = q8(smoothstep(0.55, 0.8, fbm(px * 4.0, py * 4.0, pz * 4.0, 4)));
-                    }
-                }
-            }
-        }
+    for (freq, full) in [(ct.freq, 6u32), (ct.freq, 5), (1.2, 5), (1.3, 5), (4.0, 4), (2.0, 5)] {
+        let o = lod.oct(freq, full);
+        mix1(o as u64);
+        mix1(warp_oct(feat, o) as u64);
     }
-    CloudMap { w, h, warp, dens, phases, base_a, base_b, surf }
+    h
 }
 
-/// The morph value phase `k` of `phases` is baked at, spanning the full cycle.
-/// A single phase sits at 0 — the value the live cycle crosses twice a turn.
+/// The morph value phase `k` of `phases` is baked at. A single phase sits at 0 —
+/// the value the live cycle crosses twice a turn.
 #[inline(always)]
 fn morph_of_phase(k: usize, phases: u8) -> f32 {
     if phases <= 1 {
@@ -793,26 +682,118 @@ fn q8(v: f32) -> u8 {
     (clamp01(v) * 255.0 + 0.5) as u8
 }
 
+fn bake_cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, feat: u32, key: &CloudKey) -> CloudMap {
+    let w = key.w;
+    let h = w / 2;
+    let n = (w * h) as usize;
+    let phases = key.deck.map_or(1, |d| d.3);
+    let planes = key.base.map_or(0, |b| b.1);
+    let sized = |on: bool| if on { vec![0u8; n] } else { Vec::new() };
+    let (mut warp, mut dens) = if key.deck.is_some() {
+        (vec![0u8; n * phases as usize], vec![0u8; n * phases as usize])
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let mut base_a = sized(planes == 1 || planes == 2);
+    let mut base_b = sized(planes == 2);
+    let mut surf = if planes == 3 { vec![0u8; n * 3] } else { Vec::new() };
+    // Vortex centres, hoisted: per-seed constants the live path pays per pixel.
+    let vort: [(f32, f32); 2] = [0, 1].map(|k: i32| {
+        (
+            (hash3(seed as i32, k * 7 + 1, 3) * 2.0 - 1.0) * 1.6 + ofs[0],
+            (hash3(seed as i32, k * 7 + 2, 3) * 2.0 - 1.0) * 1.6 + ofs[2],
+        )
+    });
+    for j in 0..h {
+        let y = -1.0 + 2.0 * (j as f32 + 0.5) / h as f32;
+        let r = (1.0 - y * y).max(0.0).sqrt();
+        for i in 0..w {
+            let lon = TAU * (i as f32 + 0.5) / w as f32;
+            let (sl, cl) = lon.sin_cos();
+            let (sx, sz) = (r * cl, r * sl);
+            let t = (j * w + i) as usize;
+            let (px, py, pz) = (sx + ofs[0], y + ofs[1], sz + ofs[2]);
+
+            if let Some((oct, woct, _, _)) = key.deck {
+                let (mut cx3, mut cz3) = (px, pz);
+                if ct.storm_cells > 0.0 {
+                    for (vx, vz) in vort {
+                        let (dx, dz) = (cx3 - vx, cz3 - vz);
+                        let fall = (-(dx * dx + dz * dz) * 2.2).exp();
+                        let (ss, sc) = (fall * STORM_STATIC * 1.6 * ct.storm_cells).sin_cos();
+                        cx3 = vx + dx * sc - dz * ss;
+                        cz3 = vz + dx * ss + dz * sc;
+                    }
+                }
+                for k in 0..phases as usize {
+                    // Phases lie across the morph's RANGE, not across time: it
+                    // oscillates, so the table is indexed by value and walked
+                    // back and forth.
+                    let morph = morph_of_phase(k, phases);
+                    let (zx, zy, zz) = (cx3 * 2.8, y * 2.8 + ofs[1] + morph, cz3 * 2.8 + morph);
+                    let o = k * n + t;
+                    warp[o] = q8(fbm_warp(zx, zy, zz, woct, oct, 0.9));
+                    dens[o] = q8(fbm(zx, zy, zz, oct));
+                }
+            }
+
+            if key.base.is_some() {
+                match ct.base {
+                    Base::Terrestrial | Base::Cratered => {
+                        let col = static_albedo(ct, y, px, py, pz, lod);
+                        surf[t * 3] = q8(col[0]);
+                        surf[t * 3 + 1] = q8(col[1]);
+                        surf[t * 3 + 2] = q8(col[2]);
+                    }
+                    Base::Cloudy => {
+                        // The whole mix factor, not just its noise: `band` folds
+                        // in only `y` and the field, both known here.
+                        let o = lod.oct(2.0, 5);
+                        let flow = (0.5 + 0.3 * (y * 3.0).cos()) * SHEAR_STATIC;
+                        let tv = fbm_warp((px + flow) * 2.0, py * 2.0, pz * 2.0, warp_oct(feat, o), o, 0.7);
+                        let band = 0.5 + 0.5 * (y * ct.bands + (tv - 0.5) * 6.0 * ct.turb).sin();
+                        base_a[t] = q8(band * 0.6 + tv * 0.4);
+                    }
+                    Base::Emissive => {
+                        // Only the rock field. The flow that lights it advects in
+                        // three dimensions and stays live.
+                        base_a[t] =
+                            q8(contrast(fbm(px * ct.freq, py * ct.freq, pz * ct.freq, lod.oct(ct.freq, 6)), 1.7));
+                    }
+                    Base::Banded => {
+                        // Baked at zero drift; the live path puts the drift back
+                        // as a longitude offset on the lookup.
+                        let o = lod.oct(1.3, 5);
+                        let warpv = fbm_warp(px * 1.3, py * 1.3, pz * 1.3, warp_oct(feat, o), o, 0.8);
+                        let lat = y + (warpv - 0.5) * ct.turb;
+                        base_a[t] = q8(0.5 + 0.5 * (lat * ct.bands).sin());
+                        base_b[t] =
+                            q8(smoothstep(0.55, 0.8, fbm(px * 4.0, py * 4.0, pz * 4.0, lod.oct(4.0, 4))));
+                    }
+                }
+            }
+        }
+    }
+    CloudMap { w, h, warp, dens, phases, base_a, base_b, surf }
+}
+
 /// Longitude of `(x, z)` as a **turn** in `[-0.5, 0.5)` — `atan2(z, x) / τ`.
 ///
-/// The one place this is used is a bilinear index into [`CloudMap`], so what
-/// matters is the error in texels, not in radians. The classic minimax cubic in
-/// `a²` peaks at 2.0e-4 rad (measured, at the 45° fold where the two branches
-/// meet and the error is a small step rather than a wobble). At the widest map
-/// this builds, 1024 texels to the turn, that is 0.034 of a texel — a fortieth
-/// of the filter's own smoothing, and far under the `u8` a texel is stored in.
-/// libm's correctly-rounded `atan2f` is the wrong tool for that, and it was 6%
-/// of a baked frame.
+/// The only use is a bilinear index into a [`CloudMap`], so what matters is the
+/// error in texels, not radians. The classic minimax cubic in `a²` peaks at
+/// 2.0e-4 rad (measured, at the 45° fold where the branches meet). At the widest
+/// map this builds, 1024 texels to the turn, that is 0.034 of a texel — far
+/// under the filter's own smoothing. libm's correctly-rounded `atan2f` is the
+/// wrong tool for that, and it was 6% of a baked frame.
 ///
-/// Plain `f32` arithmetic with no FMA, so wasm and native agree bit-for-bit —
-/// the same rule `noise-core`'s `lanes.rs` documents.
+/// Plain `f32` with no FMA, so wasm and native agree bit-for-bit — the same rule
+/// `noise-core`'s `lanes.rs` documents.
 #[inline(always)]
 fn atan2_turns(z: f32, x: f32) -> f32 {
     const C: [f32; 3] = [-0.046_496_474, 0.159_314_22, -0.327_622_76];
     let (ax, az) = (x.abs(), z.abs());
-    // Ratio of the smaller to the larger keeps the polynomial on [0, 1]. The
-    // max() is the origin guard: both zero yields 0, an arbitrary but finite
-    // longitude for a point that has none.
+    // Smaller over larger keeps the polynomial on [0, 1]; the max() is the
+    // origin guard, where a point has no longitude and any finite one will do.
     let (num, den, folded) = if ax >= az { (az, ax, false) } else { (ax, az, true) };
     let a = num / den.max(f32::MIN_POSITIVE);
     let s = a * a;
@@ -832,8 +813,7 @@ fn atan2_turns(z: f32, x: f32) -> f32 {
 impl CloudMap {
     /// Texel addresses and weights for a bilinear fetch: `u` is a turn about the
     /// axis (any real — it wraps), `v` is `y` remapped to 0..1 and clamps, since
-    /// there is nothing past a pole. Shared so the scalar and RGB fetches cannot
-    /// disagree about where a sample lands.
+    /// there is nothing past a pole. Shared so the fetches cannot disagree.
     #[inline(always)]
     fn addr(&self, u: f32, v: f32) -> (usize, usize, usize, usize, f32, f32) {
         let fx = (u - u.floor()) * self.w as f32 - 0.5; // wrap first: fx > -1
@@ -844,6 +824,15 @@ impl CloudMap {
         let ya = y0 as u32;
         let yb = (ya + 1).min(self.h - 1);
         ((ya * self.w) as usize, (yb * self.w) as usize, xa as usize, xb as usize, fx - x0, fy - y0)
+    }
+
+    /// Bilinear fetch of one scalar plane.
+    #[inline(always)]
+    fn sample(&self, tab: &[u8], u: f32, v: f32) -> f32 {
+        let (ra, rb, xa, xb, tx, ty) = self.addr(u, v);
+        let top = lerp(tab[ra + xa] as f32, tab[ra + xb] as f32, tx);
+        let bot = lerp(tab[rb + xa] as f32, tab[rb + xb] as f32, tx);
+        lerp(top, bot, ty) * (1.0 / 255.0)
     }
 
     /// Where in the phase table a morph value falls: the lower plane and the
@@ -880,8 +869,7 @@ impl CloudMap {
     /// Bilinear despite `ramp` being a hard step function, which makes every
     /// coastline a colour discontinuity: at the width this bakes (~one texel per
     /// pixel) the filter is close to identity, while nearest makes texels pop as
-    /// the planet turns. Past the 1024 cap it does soften those edges — that is
-    /// the visible cost, and it lands where you are most zoomed in.
+    /// the planet turns. Past the 1024 cap it does soften those edges.
     #[inline(always)]
     fn sample_rgb(&self, u: f32, v: f32) -> Rgb {
         let (ra, rb, xa, xb, tx, ty) = self.addr(u, v);
@@ -894,31 +882,19 @@ impl CloudMap {
         }
         out
     }
-
-    /// Bilinear fetch. `u` is a turn about the axis (any real — it wraps), `v`
-    /// is `y` remapped to 0..1 and clamps, since there is nothing past a pole.
-    #[inline(always)]
-    fn sample(&self, tab: &[u8], u: f32, v: f32) -> f32 {
-        let (ra, rb, xa, xb, tx, ty) = self.addr(u, v);
-        let top = lerp(tab[ra + xa] as f32, tab[ra + xb] as f32, tx);
-        let bot = lerp(tab[rb + xa] as f32, tab[rb + xb] as f32, tx);
-        lerp(top, bot, ty) * (1.0 / 255.0)
-    }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Base albedo for `Terrestrial` and `Cratered`: a pure function of a direction
-/// on the sphere, with no `angle` term anywhere. That is exactly the property
-/// [`F_BAKED_SURFACE`] exploits, and the reason these two families can be baked
-/// while the banded and emissive ones cannot.
+/// on the sphere, with no `angle` term anywhere. That property is what
+/// [`F_BAKED_SURFACE`] exploits, and why these two bake while the banded and
+/// emissive ones need decomposing instead.
 ///
 /// `sy` is the sphere point's y (the ice caps are a latitude band); `px/py/pz`
-/// are the same point with the seed offset already added, which is the domain
-/// the noise is sampled in.
+/// are the same point with the seed offset added, the domain the noise is in.
 fn static_albedo(ct: &PType, sy: f32, px: f32, py: f32, pz: f32, lod: Lod) -> Rgb {
     match ct.base {
         Base::Cratered => {
-            let m = smoothstep(0.4, 0.6, fbm(px * 1.2, py * 1.2, pz * 1.2, lod.surf(5)));
+            let m = smoothstep(0.4, 0.6, fbm(px * 1.2, py * 1.2, pz * 1.2, lod.oct(1.2, 5)));
             let base_col = mix(ct.dark, ct.light, m);
             let w = worley(px * ct.freq, py * ct.freq, pz * ct.freq);
             let bowl = smoothstep(0.0, 0.35, w);
@@ -931,7 +907,7 @@ fn static_albedo(ct: &PType, sy: f32, px: f32, py: f32, pz: f32, lod: Lod) -> Rg
         }
         // Terrestrial, and the fallback for anything that asks by mistake.
         _ => {
-            let raw = fbm(px * ct.freq, py * ct.freq, pz * ct.freq, lod.surf(if ct.ridged { 5 } else { 6 }));
+            let raw = fbm(px * ct.freq, py * ct.freq, pz * ct.freq, lod.oct(ct.freq, if ct.ridged { 5 } else { 6 }));
             let n = if ct.ridged { 1.0 - (2.0 * raw - 1.0).abs() } else { raw };
             let h = contrast(n, ct.contrast);
             let col = ramp(ct.stops, h);
@@ -941,36 +917,7 @@ fn static_albedo(ct: &PType, sy: f32, px: f32, py: f32, pz: f32, lod: Lod) -> Rg
     }
 }
 
-/// Everything a baked base plane depends on, folded into one value the cache can
-/// compare. Over-inclusive on purpose: a field that no family reads costs one
-/// hash step, while a field left out silently serves a stale map.
-///
-/// `stops` is keyed by pointer: it is `&'static`, so its address identifies the
-/// palette without walking it. The rest are `f32` bit patterns, since `f32` is
-/// not `Eq` and a slider can move any of them.
-fn base_shape_key(ct: &PType, feat: u32) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut mix1 = |v: u64| {
-        h ^= v;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    };
-    mix1(ct.base as u64);
-    mix1(ct.freq.to_bits() as u64);
-    mix1(ct.contrast.to_bits() as u64);
-    mix1(ct.ridged as u64);
-    mix1(ct.stops.as_ptr() as usize as u64);
-    mix1(ct.stops.len() as u64);
-    mix1(ct.caps.to_bits() as u64);
-    mix1(ct.bands.to_bits() as u64);
-    mix1(ct.turb.to_bits() as u64);
-    // The warp's inner-octave count is a render mode, not a type field.
-    mix1(warp_inner(feat, 5) as u64);
-    for c in ct.dark.iter().chain(ct.light.iter()) {
-        mix1(c.to_bits() as u64);
-    }
-    h
-}
-
+#[allow(clippy::too_many_arguments)]
 fn surface(
     ct: &PType,
     sx: f32,
@@ -996,9 +943,7 @@ fn surface(
         }
         Base::Banded => {
             // Zonal jets: adjacent latitude bands drift in opposite directions,
-            // continuously — the real gas-giant look, not a uniform wobble. The
-            // rate is per-latitude and changes sign, which is what makes
-            // neighbouring bands shear past each other.
+            // continuously — the real gas-giant look, not a uniform wobble.
             let flow = angle * 0.16 * (sy * ct.bands * 0.5).sin();
             let (band, fine) = match baked.filter(|m| !m.base_b.is_empty()) {
                 Some(m) => {
@@ -1006,24 +951,24 @@ fn surface(
                     // a shift of the noise domain — one subtraction from the
                     // texture coordinate and the bands turn for free. The unit
                     // is a turn, and near the equator an arc of `flow` radians
-                    // on the unit sphere is the same distance the shear moved.
+                    // on the unit sphere is the distance the shear moved.
                     let (u, v) = (atan2_turns(sz, sx), (sy + 1.0) * 0.5);
                     let k = flow * (1.0 / TAU);
-                    // Two planes because the two fields drift at different rates.
+                    // Two planes: the two fields drift at different rates.
                     (m.sample(&m.base_a, u - k, v), m.sample(&m.base_b, u - k * 1.4, v))
                 }
                 None => {
                     // Domain warp makes the band turbulence curl and marble like fluid.
-                    let o = lod.surf(5);
-                    let warp = fbm_warp_inner((px + flow) * 1.3, py * 1.3, pz * 1.3, o, warp_inner(feat, o), 0.8);
+                    let o = lod.oct(1.3, 5);
+                    let warp = fbm_warp((px + flow) * 1.3, py * 1.3, pz * 1.3, warp_oct(feat, o), o, 0.8);
                     let lat = sy + (warp - 0.5) * ct.turb;
-                    let fine = fbm((px + flow * 1.4) * 4.0, py * 4.0, pz * 4.0, 4);
+                    let fine = fbm((px + flow * 1.4) * 4.0, py * 4.0, pz * 4.0, lod.oct(4.0, 4));
                     (0.5 + 0.5 * (lat * ct.bands).sin(), smoothstep(0.55, 0.8, fine))
                 }
             };
             let mut col = mix(mix(ct.dark, ct.light, band), ct.light, fine * 0.35);
             if ct.spot > 0.0 {
-                col = great_spot(col, sx, sy, sz, angle, ct.spot);
+                col = great_spot(col, sx, sy, sz, angle, ct.spot, lod);
             }
             (col, 0.0)
         }
@@ -1034,11 +979,11 @@ fn surface(
             // rate. 6 of the 9 octaves go, and the glow still flows.
             let n = match baked.filter(|m| !m.base_a.is_empty()) {
                 Some(m) => m.sample(&m.base_a, atan2_turns(sz, sx), (sy + 1.0) * 0.5),
-                None => contrast(fbm(px * ct.freq, py * ct.freq, pz * ct.freq, lod.surf(6)), 1.7),
+                None => contrast(fbm(px * ct.freq, py * ct.freq, pz * ct.freq, lod.oct(ct.freq, 6)), 1.7),
             };
             // Molten flow: a slow noise field advects across the surface, so the
             // glow brightens and dims in drifting patches instead of pulsing.
-            let flow = fbm(px * 2.2 + angle * 0.7, py * 2.2, pz * 2.2 - angle * 0.5, 3);
+            let flow = fbm(px * 2.2 + angle * 0.7, py * 2.2, pz * 2.2 - angle * 0.5, lod.oct(2.2, 3));
             let glow = clamp01(smoothstep(ct.glow_e0, ct.glow_e1, n) * (0.55 + 0.9 * flow));
             // Palette cycling: warm colors flow along the glow over time.
             let mid = mix(ct.glow_lo, ct.glow_hi, 0.5);
@@ -1049,14 +994,14 @@ fn surface(
             // Storm bands churn: latitude-dependent shear + domain warp for
             // roiling, fluid-looking cloud cover. On a shrouded world this IS
             // the weather, so it is what F_BAKED_CLOUDS freezes here — and the
-            // baked plane already holds the finished mix factor, so the frozen
-            // path is a table read and nothing else.
+            // baked plane holds the finished mix factor, so the frozen path is
+            // a table read and nothing else.
             let f = match baked.filter(|m| !m.base_a.is_empty()) {
                 Some(m) => m.sample(&m.base_a, atan2_turns(sz, sx), (sy + 1.0) * 0.5),
                 None => {
                     let flow = (0.5 + 0.3 * (sy * 3.0).cos()) * angle.sin();
-                    let o = lod.surf(5);
-                    let t = fbm_warp_inner((px + flow) * 2.0, py * 2.0, pz * 2.0, o, warp_inner(feat, o), 0.7);
+                    let o = lod.oct(2.0, 5);
+                    let t = fbm_warp((px + flow) * 2.0, py * 2.0, pz * 2.0, warp_oct(feat, o), o, 0.7);
                     let band = 0.5 + 0.5 * (sy * ct.bands + (t - 0.5) * 6.0 * ct.turb).sin();
                     clamp01(band * 0.6 + t * 0.4)
                 }
@@ -1068,7 +1013,7 @@ fn surface(
     // Aurora — shimmering polar curtains, hue palette-cycled over time/latitude
     // (green → cyan → violet). Glows on the night side via emis.
     if ct.aurora > 0.0 {
-        let a = aurora_glow(sx, sy, sz, angle) * ct.aurora;
+        let a = aurora_glow(sx, sy, sz, angle, lod) * ct.aurora;
         let ac = cycle3([0.25, 0.95, 0.45], [0.35, 0.85, 0.95], [0.65, 0.40, 1.0], sy * 1.4 + angle * 0.1);
         col[0] = clamp01(col[0] + ac[0] * a);
         col[1] = clamp01(col[1] + ac[1] * a);
@@ -1274,8 +1219,9 @@ struct Frame {
     /// Cut the planet out on transparent pixels — a tile a scene compositor can
     /// blit — instead of filling the frame with a starfield.
     sprite: bool,
-    /// Octave budget. The hero framing is always [`LOD_FULL`].
-    lod: Lod,
+    /// The sub-rect to write, `[x0, y0, x1, y1)`; outside it is left alone. The
+    /// hero framing passes the whole frame.
+    clip: [u32; 4],
 }
 
 /// The hero framing's fixed key light, over the viewer's left shoulder.
@@ -1289,7 +1235,7 @@ fn key_light() -> [f32; 3] {
 fn render_ct(size: u32, ct: &PType, seed: u32, angle: f32, style: &Style, out: &mut [u8]) {
     // 0.375 (was 0.42) leaves orbital margin for moons and rings.
     let rad = (size as f32 * 24.0 / 64.0) * ct.radius_scale;
-    let frame = Frame { size, rad, light: key_light(), sprite: false, lod: LOD_FULL };
+    let frame = Frame { size, rad, light: key_light(), sprite: false, clip: [0, 0, size, size] };
     render_frame(&frame, ct, seed, angle, style, out);
 }
 
@@ -1309,56 +1255,61 @@ fn tile_style(feat: u32) -> Style {
 /// `light` must be a unit vector in the tile's screen basis (+x right, +y up,
 /// +z toward the viewer). `angle` turns the surface and advances the weather,
 /// exactly as in the hero framing.
-///
-/// `lod_enabled` turns on octave thinning once the tile passes 200px — the same
-/// switch `sun_core::render_star_tile` takes, and the same threshold. It only
-/// bites when a body is zoomed in far enough to be expensive; below that the
-/// tile is bit-identical either way. Pass `false` for reference output.
-pub fn render_tile(type_idx: usize, seed: u32, angle: f32, light: [f32; 3], rad_px: f32, lod_enabled: bool) -> Tile {
-    render_tile_features(type_idx, seed, angle, light, rad_px, lod_enabled, F_ALL)
+pub fn render_tile(type_idx: usize, seed: u32, angle: f32, light: [f32; 3], rad_px: f32) -> Tile {
+    let size = tile_size(type_idx, rad_px);
+    let mut tile = Tile::default();
+    render_tile_into(&mut tile, type_idx, seed, angle, light, rad_px, [0, 0, size, size], F_ALL);
+    tile
 }
 
-/// [`render_tile`] with the feature switches exposed — the scene framing's
-/// counterpart to [`render_rgba_features`]. A scene wants this for one bit in
-/// particular: [`F_BAKED_CLOUDS`], which is not in [`F_ALL`].
+/// The edge length [`render_tile`] produces for this type at this radius —
+/// needed *before* rendering, to ask `scene_core::visible_tile_rect` which part
+/// of the tile will be seen.
+pub fn tile_size(type_idx: usize, rad_px: f32) -> u32 {
+    // Rings reach `ring_outer` disc radii sideways; a plain world needs only a
+    // pixel of slack for its dark limb. `radius_scale` — which shrinks a ringed
+    // world so its rings fit the hero's fixed square — is deliberately ignored
+    // here: the tile is grown instead of the planet shrunk.
+    let ct = &TYPES[type_idx % TYPES.len()];
+    let margin = if ct.rings { rad_px * (ct.ring_outer - 1.0) + 1.5 } else { 1.5 };
+    (((rad_px + margin) * 2.0).ceil() as u32).max(6)
+}
+
+/// [`render_tile`] into a tile you already own, shading only the tile pixels in
+/// `clip` (`[x0, y0, x1, y1)`, tile px).
+///
+/// Pass `scene_core::visible_tile_rect` as the clip and the off-screen part of a
+/// zoomed-in body's tile is never shaded.
+///
+/// **Pixels outside `clip` are left as they were**, not cleared: the tile is only
+/// valid for the placement its clip came from. That is exactly what `blit` reads
+/// back, so a reused buffer cannot leak a previous body into the scene — but do
+/// not hand the tile to anything that reads wider.
 #[allow(clippy::too_many_arguments)]
-pub fn render_tile_features(
+pub fn render_tile_into(
+    tile: &mut Tile,
     type_idx: usize,
     seed: u32,
     angle: f32,
     light: [f32; 3],
     rad_px: f32,
-    lod_enabled: bool,
+    clip: [u32; 4],
     feat: u32,
-) -> Tile {
+) {
     let ct = &TYPES[type_idx % TYPES.len()];
-    // Rings reach `ring_outer` disc radii sideways; a plain world needs only a
-    // pixel of slack for its dark limb. `radius_scale` — which shrinks a ringed
-    // world so its rings fit the hero's fixed square — is deliberately ignored
-    // here: the tile is grown instead of the planet shrunk.
-    let margin = if ct.rings { rad_px * (ct.ring_outer - 1.0) + 1.5 } else { 1.5 };
-    let size = (((rad_px + margin) * 2.0).ceil() as u32).max(6);
-    let mut px = vec![0u8; (size * size * 4) as usize];
-    let frame = Frame { size, rad: rad_px, light, sprite: true, lod: Lod::for_size(size, lod_enabled) };
-    render_frame(&frame, ct, seed, angle, &tile_style(feat), &mut px);
-    Tile { px, size }
+    let size = tile_size(type_idx, rad_px);
+    tile.ensure(size);
+    let clip = [clip[0].min(size), clip[1].min(size), clip[2].min(size), clip[3].min(size)];
+    let frame = Frame { size, rad: rad_px, light, sprite: true, clip };
+    render_frame(&frame, ct, seed, angle, &tile_style(feat), &mut tile.px);
 }
+
+/// A glint below this cannot survive the 22-level quantization (one level is
+/// 1/22 ≈ 0.045), so the shimmer noise modulating it is not worth evaluating.
+const SPEC_FLOOR: f32 = 1.0 / 1024.0;
 
 fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, out: &mut [u8]) {
     let size = fr.size;
-    let lod = fr.lod;
-    // Past the terminator `shade` bottoms out at the 0.10 ambient floor, and the
-    // output then snaps to 22 levels — roughly 3 of which are reachable. The
-    // fine octaves and the whole cloud deck cannot survive that, so they are not
-    // computed there. Lightning fires at a seeded point anywhere on the disc and
-    // lights the cloud deck when it does, so those types opt out wholesale;
-    // aurora is confined to a polar band, so it opts out by latitude below
-    // rather than excluding every type that merely has one.
-    // Lightning fires at a seeded point anywhere on the disc and lights the
-    // cloud deck when it does, so those types opt out wholesale. Aurora is
-    // confined to a polar band, so it opts out by latitude instead — excluding
-    // every type that merely *has* an aurora would rule out most of the table.
-    let night_ok = style.feat & F_NIGHT_LOD != 0 && ct.lightning == 0.0 && ct.base != Base::Emissive;
     let (cx, cy) = (size as f32 / 2.0, size as f32 / 2.0);
     let ofs = seed_offsets(seed);
     let l = fr.light;
@@ -1366,18 +1317,6 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
     let has_atmo = ct.atmo != [0.0; 3];
     let rad = fr.rad;
     const RING_SQUASH: f32 = 0.38;
-
-    // Bake the frozen deck once, outside the loop. `cld`/`warp_inner` are the
-    // same octave counts the live path would have used, so the two agree on
-    // detail and differ only in that this one does not move.
-    // Any one of the three switches can want a map, and each owns a different
-    // set of planes — gating the whole map on the cloud bit alone made the other
-    // two silently free, which an ablation panel reports as "costs nothing".
-    let cloud_bake = if style.feat & (F_BAKED_CLOUDS | F_BAKED_SURFACE | F_BAKED_BANDS) != 0 {
-        cloud_map(ct, seed, ofs, lod, style.feat, rad)
-    } else {
-        None
-    };
 
     // Precompute orbiting moons (mx, my, radius, depth, seed).
     let mut moons: [(f32, f32, f32, f32, f32); 2] = [(0.0, 0.0, 0.0, 0.0, 0.0); 2];
@@ -1399,38 +1338,70 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
         }
     }
 
-    // An oversized tile is mostly empty: a ringed giant reserves out to
-    // `ring_outer` disc radii sideways, so its tile is ~4.4r across for a 2r
-    // disc — only ~16% of it is ever drawn. Bound each row to the content and
-    // zero the rest, instead of running the ring/rim/moon tests and a quantize
-    // on every transparent pixel.
-    let row_span = |iy: u32| -> (u32, u32) {
-        if !fr.sprite || style.moons {
-            return (0, size);
-        }
-        let ny = (cy - (iy as f32 + 0.5)) / rad;
-        let disc = 1.0 - ny * ny;
-        let ring = if ct.rings {
-            let t = ny / RING_SQUASH;
-            ct.ring_outer * ct.ring_outer - t * t
+    let lod = Lod::for_disc(rad);
+    // Any one of the switches can want a map, and each owns a different set of
+    // planes — gating the whole map on the cloud bit alone made the others
+    // silently free, which an ablation panel reports as "costs nothing".
+    let cloud_bake = if style.feat & (F_BAKED_CLOUDS | F_BAKED_SURFACE | F_BAKED_BANDS) != 0 {
+        cloud_map(ct, seed, ofs, lod, style.feat, rad)
+    } else {
+        None
+    };
+    // Past the terminator `shade` bottoms out at the 0.10 ambient floor and the
+    // output snaps to 22 levels, roughly 3 of which are reachable — the fine
+    // octaves and the whole cloud deck cannot survive that, so they are not
+    // computed there. Lightning fires at a seeded point anywhere on the disc and
+    // lights the deck when it does, so those types opt out wholesale; aurora is
+    // confined to a polar band, so it opts out by latitude below rather than
+    // excluding every type that merely has one.
+    let night_ok = style.feat & F_NIGHT_LOD != 0 && ct.lightning == 0.0 && ct.base != Base::Emissive;
+    // Functions of `angle` and `seed` alone — hoisted out of the pixel loop.
+    let (cs, cc) = (angle * 2.0).sin_cos();
+    let morph = angle.sin() * 0.6;
+    let swirl_phase = (angle * 0.6).sin() * 1.6 * ct.storm_cells;
+    let vortex: [(f32, f32); 2] = [0, 1].map(|k: i32| {
+        (
+            (hash3(seed as i32, k * 7 + 1, 3) * 2.0 - 1.0) * 1.6 + ofs[0],
+            (hash3(seed as i32, k * 7 + 2, 3) * 2.0 - 1.0) * 1.6 + ofs[2],
+        )
+    });
+
+    // A sprite is empty off the disc and off a ringed world's ring ellipse, so a
+    // row need only be walked across those. Moons orbit out in the margin, so a
+    // frame that draws them opts out.
+    let narrow = fr.sprite && nmoon == 0;
+    // Half-width of the covered band at row offset `ny`, in disc radii.
+    let cover = |ny: f32| {
+        let disc = (1.0 - ny * ny).max(0.0).sqrt();
+        if ct.rings {
+            let rr = (ct.ring_outer * ct.ring_outer - (ny / RING_SQUASH).powi(2)).max(0.0).sqrt();
+            disc.max(rr)
         } else {
-            f32::NEG_INFINITY
-        };
-        let half = disc.max(ring);
-        if half < 0.0 {
-            return (0, 0);
+            disc
         }
-        let h = half.sqrt() * rad;
-        let lo = (cx - h - 1.0).floor().max(0.0) as u32;
-        let hi = ((cx + h + 1.0).ceil().max(0.0) as u32).min(size);
-        (lo.min(size), hi)
     };
 
-    for iy in 0..size {
-        let (rlo, rhi) = row_span(iy);
-        for ix in rlo..rhi {
+    let [clip_x0, clip_y0, clip_x1, clip_y1] = fr.clip;
+    for iy in clip_y0..clip_y1 {
+        let ny = (cy - (iy as f32 + 0.5)) / rad;
+        // Clear whatever of the clip the narrowing leaves uncovered — a reused
+        // buffer must not show the previous body there.
+        let (mut x0, mut x1) = (clip_x0, clip_x1);
+        if narrow {
+            let half = cover(ny) * rad + 1.0; // +1 px of slack for the rounding
+            x0 = clip_x0.max((cx - half).floor().max(0.0) as u32);
+            x1 = clip_x1.min((cx + half).ceil().clamp(0.0, size as f32) as u32);
+            let row = (iy * size * 4) as usize;
+            let span = |a: u32, b: u32| row + (a * 4) as usize..row + (b * 4) as usize;
+            if x1 <= x0 {
+                out[span(clip_x0, clip_x1)].fill(0);
+                continue;
+            }
+            out[span(clip_x0, x0)].fill(0);
+            out[span(x1, clip_x1)].fill(0);
+        }
+        for ix in x0..x1 {
             let nx = (ix as f32 + 0.5 - cx) / rad;
-            let ny = (cy - (iy as f32 + 0.5)) / rad;
             let d2 = nx * nx + ny * ny;
 
             let mut o;
@@ -1444,14 +1415,9 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                 let sz = -nx * sina + nz * cosa;
 
                 let diff = (nx * l[0] + ny * l[1] + nz * l[2]).max(0.0);
-                // Past the terminator every colour is multiplied by ~0.10 and
-                // then snapped to 22 levels, so the fine octaves and the cloud
-                // layer cannot survive into the output. Drop them there.
                 let night = night_ok && diff <= 0.0 && (ct.aurora == 0.0 || sy.abs() < 0.52);
-                // The night path drops surface octaves, which the map was not
-                // baked at — so past the terminator the shroud goes live. Both
-                // `Cloudy` types have lightning and so never take that path;
-                // this is belt and braces for a future row that does not.
+                // The night path drops octaves the map was not baked at, so past
+                // the terminator the baked bases go live.
                 let (mut col, emis) = surface(
                     ct,
                     sx,
@@ -1459,82 +1425,86 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                     sz,
                     ofs,
                     angle,
-                    if night { LOD_NIGHT } else { lod },
+                    if night { lod.capped(NIGHT_OCT) } else { lod },
                     style.feat,
                     if night { None } else { cloud_bake.as_deref() },
                 );
                 if ct.clouds > 0.0 && !night {
-                    // The deck rotates at 2x the surface either way — that is
-                    // the parallax that makes weather read as a separate layer,
-                    // and it loops. What the two paths disagree about is whether
-                    // the field itself also evolves as it turns.
-                    let (cs, cc) = (angle * 2.0).sin_cos();
-                    let (cloud, sh) = if let Some(m) = cloud_bake.as_deref().filter(|m| !m.warp.is_empty()) {
-                        // Frozen: one direction on the sphere, two table reads.
-                        // `ofs` is folded into the bake, so what the map wants
-                        // is the bare rotated sphere point.
-                        let px = nx * cc + nz * cs;
-                        let pz = -nx * cs + nz * cc;
-                        let v = (ny + 1.0) * 0.5;
-                        let (k, kf) = m.phase_at(angle.sin() * MORPH_SPAN);
-                        let cloud = m.sample_phase(&m.warp, k, kf, atan2_turns(pz, px), v);
-                        let sh = if style.feat & F_CLOUD_SHADOW == 0 {
-                            1.0
-                        } else {
+                    // Clouds drift over the surface (2x = parallax, loops) and
+                    // slowly billow — a periodic morph reveals new cloud structure
+                    // so weather forms and dissipates rather than sliding rigidly.
+                    let mut cx3 = nx * cc + nz * cs + ofs[0];
+                    let mut cz3 = -nx * cs + nz * cc + ofs[2];
+
+                    // Rotating storm cells: swirl the cloud field around a couple
+                    // of seeded vortex centers, spinning with the animation.
+                    if ct.storm_cells > 0.0 {
+                        for (vx, vz) in vortex {
+                            let (dx, dz) = (cx3 - vx, cz3 - vz);
+                            let d2v = dx * dx + dz * dz;
+                            // exp(-2.2·d²) is under 1e-4 past here and only
+                            // scales a rotation angle, so the eddy does nothing.
+                            // Most of a disc is this far out.
+                            if d2v > 4.2 {
+                                continue;
+                            }
+                            let fall = (-d2v * 2.2).exp();
+                            // Bounded (periodic) swirl: the eddy churns back and forth
+                            // rather than winding into ever-tighter rings as `angle`
+                            // grows unbounded on the continuously-running web.
+                            let (ss, sc) = (fall * swirl_phase).sin_cos();
+                            cx3 = vx + dx * sc - dz * ss;
+                            cz3 = vz + dx * ss + dz * sc;
+                        }
+                    }
+
+                    let (cloud, shadow) = match cloud_bake.as_deref().filter(|m| !m.warp.is_empty()) {
+                        Some(m) => {
+                            // Frozen: one direction on the sphere, two table
+                            // reads. `ofs` is folded into the bake, so what the
+                            // map wants is the bare rotated sphere point.
+                            let px3 = nx * cc + nz * cs;
+                            let pz3 = -nx * cs + nz * cc;
+                            let v = (ny + 1.0) * 0.5;
+                            let (k, kf) = m.phase_at(morph);
+                            let cloud = m.sample_phase(&m.warp, k, kf, atan2_turns(pz3, px3), v);
                             // The live shadow reads the plain field 0.45 toward
                             // the light, which steps off the sphere. The map
                             // holds directions only, so the displaced point is
                             // read at its own longitude and the same y: the
                             // tangential half of the same offset, which is the
                             // half that moves the shadow across the deck.
-                            let (qx, qz) = (px + l[0] * 0.45, pz + l[2] * 0.45);
-                            let shadow = smoothstep(0.55, 0.72, m.sample_phase(&m.dens, k, kf, atan2_turns(qz, qx), v));
-                            1.0 - 0.22 * shadow * ct.clouds
-                        };
-                        (cloud, sh)
-                    } else {
-                        // Live: the deck also slowly billows — a periodic morph
-                        // reveals new structure so weather forms and dissipates
-                        // rather than sliding rigidly.
-                        let mut cx3 = nx * cc + nz * cs + ofs[0];
-                        let mut cz3 = -nx * cs + nz * cc + ofs[2];
-                        let morph = angle.sin() * 0.6;
-
-                        // Rotating storm cells: swirl the cloud field around a couple
-                        // of seeded vortex centers, spinning with the animation.
-                        if ct.storm_cells > 0.0 {
-                            for k in 0..2 {
-                                let vx = (hash3(seed as i32, k * 7 + 1, 3) * 2.0 - 1.0) * 1.6 + ofs[0];
-                                let vz = (hash3(seed as i32, k * 7 + 2, 3) * 2.0 - 1.0) * 1.6 + ofs[2];
-                                let (dx, dz) = (cx3 - vx, cz3 - vz);
-                                let fall = (-(dx * dx + dz * dz) * 2.2).exp();
-                                // Bounded (periodic) swirl: the eddy churns back and forth
-                                // rather than winding into ever-tighter rings as `angle`
-                                // grows unbounded on the continuously-running web.
-                                let sw = fall * (angle * 0.6).sin() * 1.6 * ct.storm_cells;
-                                let (ss, sc) = sw.sin_cos();
-                                cx3 = vx + dx * sc - dz * ss;
-                                cz3 = vz + dx * ss + dz * sc;
-                            }
+                            let (qx, qz) = (px3 + l[0] * 0.45, pz3 + l[2] * 0.45);
+                            let sh = smoothstep(
+                                0.55,
+                                0.72,
+                                m.sample_phase(&m.dens, k, kf, atan2_turns(qz, qx), v),
+                            );
+                            (cloud, sh)
                         }
-
-                        let dens = |ox: f32, oz: f32| {
-                            fbm((cx3 + ox) * 2.8, ny * 2.8 + ofs[1] + morph, (cz3 + oz) * 2.8 + morph, lod.cld(4))
-                        };
-                        // Wispy, fractal cloud tops (domain-warped) so they break into
-                        // ragged fronts instead of clumping into round blobs. Shadow
-                        // uses the cheap plain density.
-                        let co = lod.cld(4);
-                        let cloud = fbm_warp_inner(cx3 * 2.8, ny * 2.8 + ofs[1] + morph, cz3 * 2.8 + morph, co, warp_inner(style.feat, co), 0.9);
-
-                        let sh = if style.feat & F_CLOUD_SHADOW == 0 { 1.0 } else {
-                            let shadow = smoothstep(0.55, 0.72, dens(l[0] * 0.45, l[2] * 0.45));
-                            1.0 - 0.22 * shadow * ct.clouds
-                        };
-                        (cloud, sh)
+                        None => {
+                            let n = lod.oct(2.8, 4);
+                            let dens = |ox: f32, oz: f32| {
+                                fbm((cx3 + ox) * 2.8, ny * 2.8 + ofs[1] + morph, (cz3 + oz) * 2.8 + morph, n)
+                            };
+                            // Wispy, fractal cloud tops (domain-warped) so they
+                            // break into ragged fronts instead of round blobs.
+                            // Shadow uses the cheap plain density.
+                            let cloud = fbm_warp(
+                                cx3 * 2.8,
+                                ny * 2.8 + ofs[1] + morph,
+                                cz3 * 2.8 + morph,
+                                warp_oct(style.feat, n),
+                                n,
+                                0.9,
+                            );
+                            (cloud, smoothstep(0.55, 0.72, dens(l[0] * 0.45, l[2] * 0.45)))
+                        }
                     };
-                    col = [col[0] * sh, col[1] * sh, col[2] * sh];
-
+                    if style.feat & F_CLOUD_SHADOW != 0 {
+                        let sh = 1.0 - 0.22 * shadow * ct.clouds;
+                        col = [col[0] * sh, col[1] * sh, col[2] * sh];
+                    }
                     col = mix(col, [1.0, 1.0, 1.0], smoothstep(0.52, 0.70, cloud) * ct.clouds);
                 }
                 let shade = (0.10 + 0.90 * diff).max(emis);
@@ -1547,15 +1517,23 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                     // moon's dark maria glare far less than its bright highlands.
                     let alb = col[0] * 0.3 + col[1] * 0.59 + col[2] * 0.11;
                     let mat = 1.0 - ct.spec_albedo * (1.0 - alb);
-                    // Cycling shimmer so water/ice glints twinkle over time.
-                    let shimmer = 0.82 + 0.18 * fbm(sx * 5.0 + angle * 2.5, sy * 5.0, sz * 5.0, 2);
-                    let sp = ndh.powf(ct.shininess) * ct.specular * mat * shimmer;
-                    o[0] = clamp01(o[0] + sp);
-                    o[1] = clamp01(o[1] + sp);
-                    o[2] = clamp01(o[2] + sp);
+                    // `ndh^shininess` collapses fast, so over most of the disc
+                    // the glint cannot show at all. `shimmer <= 1`, so bound the
+                    // whole term first and skip its fBm where it can't.
+                    let peak = ndh.powf(ct.shininess) * ct.specular * mat;
+                    if peak > SPEC_FLOOR {
+                        // Cycling shimmer so water/ice glints twinkle over time.
+                        let shimmer =
+                            0.82 + 0.18 * fbm(sx * 5.0 + angle * 2.5, sy * 5.0, sz * 5.0, lod.oct(5.0, 2));
+                        let sp = peak * shimmer;
+                        o[0] = clamp01(o[0] + sp);
+                        o[1] = clamp01(o[1] + sp);
+                        o[2] = clamp01(o[2] + sp);
+                    }
                 }
                 if has_atmo && style.feat & F_ATMO != 0 {
-                    let rim = (1.0 - nz).powf(3.0) * 0.6;
+                    // `powf(3.0)` is a full exp/log even for a literal exponent.
+                    let rim = (1.0 - nz).powi(3) * 0.6;
                     o[0] = clamp01(o[0] + ct.atmo[0] * rim);
                     o[1] = clamp01(o[1] + ct.atmo[1] * rim);
                     o[2] = clamp01(o[2] + ct.atmo[2] * rim);
@@ -1565,7 +1543,7 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                 o = [0.0, 0.0, 0.0];
                 a = 0.0;
             } else {
-                let s = if style.feat & F_STARFIELD != 0 { star_bg(ix, iy, seed) } else { [9, 8, 20, 255] };
+                let s = if style.feat & F_STARFIELD != 0 { star_bg(ix, iy, seed) } else { [0, 0, 0, 255] };
                 o = [s[0] as f32 / 255.0, s[1] as f32 / 255.0, s[2] as f32 / 255.0];
             }
 
@@ -1632,74 +1610,5 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
             out[idx + 2] = (clamp01(px[2]) * 255.0) as u8;
             out[idx + 3] = if fr.sprite { (clamp01(a) * 255.0) as u8 } else { 255 };
         }
-    }
-}
-
-#[cfg(test)]
-mod cloud_tests {
-    use super::*;
-
-    /// The fast longitude has to be good to well under a texel of the widest
-    /// map (1024), or the frozen deck would shear along the seam where the
-    /// approximation's fold sits.
-    #[test]
-    fn atan2_turns_tracks_libm() {
-        let mut worst: f32 = 0.0;
-        for i in 0..2000 {
-            let a = (i as f32 / 2000.0) * TAU - PI;
-            // Sweep radii too: the polynomial is fed a ratio, so a near-axis
-            // point is a different case from a diagonal one.
-            for &r in &[1.0f32, 0.05, 8.0] {
-                let (x, z) = (r * a.cos(), r * a.sin());
-                let want = z.atan2(x) * (1.0 / TAU);
-                let got = atan2_turns(z, x);
-                // Both wrap at ±0.5; compare the shorter way round.
-                let d = (got - want).abs();
-                worst = worst.max(d.min(1.0 - d));
-            }
-        }
-        // 1024 texels to the turn, so a texel is 9.8e-4 of a turn. The cubic
-        // lands at 3.3e-5 (2.0e-4 rad); the bound is where it stops being
-        // negligible against the bilinear filter, not where it sits today.
-        assert!(worst < 1.0e-4, "worst {worst} turns");
-    }
-
-    #[test]
-    fn atan2_turns_handles_axes_and_origin() {
-        for (z, x, want) in [(0.0, 1.0, 0.0), (1.0, 0.0, 0.25), (0.0, -1.0, 0.5), (-1.0, 0.0, -0.25)] {
-            let got: f32 = atan2_turns(z, x);
-            assert!((got - want).abs() < 1e-5, "atan2_turns({z}, {x}) = {got}, want {want}");
-        }
-        assert!(atan2_turns(0.0, 0.0).is_finite());
-    }
-
-    /// A bilinear fetch dead on a texel centre must return that texel, and the
-    /// longitude axis must wrap rather than clamp — a clamped seam would show
-    /// as a stationary band down the middle of every planet.
-    #[test]
-    fn cloud_map_sampling_is_exact_and_wraps() {
-        let m = CloudMap { w: 4, h: 2, warp: vec![0, 64, 128, 255, 10, 20, 30, 40], dens: vec![], phases: 1, base_a: vec![], base_b: vec![], surf: vec![] };
-        for i in 0..4 {
-            let u = (i as f32 + 0.5) / 4.0;
-            let got = m.sample(&m.warp, u, 0.25);
-            assert!((got - m.warp[i] as f32 / 255.0).abs() < 1e-6, "texel {i}: {got}");
-        }
-        // Half a texel before column 0 blends columns 3 and 0, not 0 and 0.
-        let seam = m.sample(&m.warp, 0.0, 0.25);
-        let want = (255.0 + 0.0) / 2.0 / 255.0;
-        assert!((seam - want).abs() < 1e-6, "seam {seam}, want {want}");
-        // And a whole turn later is the same place.
-        assert_eq!(m.sample(&m.warp, 0.0, 0.25), m.sample(&m.warp, 1.0, 0.25));
-        assert_eq!(m.sample(&m.warp, 0.3, 0.25), m.sample(&m.warp, -0.7, 0.25));
-    }
-
-    /// The map is the whole sphere, so one bake serves every angle — and the
-    /// cache must not rebuild for a change that cannot move it.
-    #[test]
-    fn cloud_map_cache_keys_on_what_it_depends_on() {
-        let w = cloud_map_w(128.0);
-        assert_eq!(w, cloud_map_w(200.0), "same octave of radius must reuse the bake");
-        assert!(cloud_map_w(4096.0) <= 1024, "capped");
-        assert!(cloud_map_w(1.0) >= 128, "floored");
     }
 }

@@ -159,8 +159,6 @@
     <div class="ctl"><label for="auto">Hold 60 fps automatically <b id="autoV">on</b></label>
       <input type="checkbox" id="auto" checked style="width:auto;accent-color:#f4b74a;cursor:pointer" /></div>
     <div class="ctl"><label>Sun detail cap <b id="sdetV">110</b></label><input type="range" id="sdet" min="16" max="176" step="8" value="110" /></div>
-    <div class="ctl"><label for="lod">Octave LOD on big tiles <b id="lodV">on</b></label>
-      <input type="checkbox" id="lod" checked style="width:auto;accent-color:#f4b74a;cursor:pointer" /></div>
     <div class="ctl"><label for="froz">Frozen weather <b id="frozV">on</b></label>
       <input type="checkbox" id="froz" checked style="width:auto;accent-color:#f4b74a;cursor:pointer" /></div>
 
@@ -302,7 +300,6 @@ function buildSystem() {
   // stored thickness — keeps the chosen look across seed/planet-count changes.
   if (sys) wasm.system_set_orbit_width(sys, vOrbitW);
   if (sys) wasm.system_set_eccentricity(sys, vEcc);
-  if (sys) wasm.system_set_lod(sys, $("lod").checked ? 1 : 0);
   if (sys) wasm.system_set_frozen_clouds(sys, $("froz").checked ? 1 : 0);
   $("sysinfo").textContent = `${SUN_NAMES[sunKind] ?? "star"} · ${nPlanets} planets · seed ${seed}`;
 }
@@ -549,14 +546,6 @@ $("ecc").addEventListener("input", () => {
   vEcc = parseFloat($("ecc").value);
   $("eccV").textContent = vEcc.toFixed(2) + "×";
   if (sys) wasm.system_set_eccentricity(sys, vEcc);
-});
-
-// Octave LOD: thins planet-tile fBm past 200px. Raise the planet detail cap and
-// zoom into a world to A/B it — the perf readout shows what it buys.
-$("lod").addEventListener("change", () => {
-  const on = $("lod").checked;
-  $("lodV").textContent = on ? "on" : "off";
-  if (sys) wasm.system_set_lod(sys, on ? 1 : 0);
 });
 
 // Frozen weather: bakes each planet's cloud deck once and reads it back per

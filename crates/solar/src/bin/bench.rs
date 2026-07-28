@@ -9,7 +9,7 @@
 //!   • zooming onto the sun vs a planet compares the two body shaders.
 //! Native only (uses `std::time::Instant`); run: `cargo run --release --bin bench`.
 
-use solar::{render_system, render_system_cached, Camera, System};
+use solar::{planet_world_pos, render_system, render_system_cached, Camera, System};
 use std::time::Instant;
 
 const W: u32 = 1000;
@@ -33,21 +33,18 @@ fn ms(sys: &System, cam: &Camera, buf: &mut [u8]) -> f64 {
     t.elapsed().as_secs_f64() * 1000.0 / FRAMES as f64
 }
 
-/// Mean ms/frame with the camera LOCKED ON planet `pi` as it orbits, so the
-/// body actually fills the view for every frame timed.
-fn ms_follow(sys: &System, pi: usize, zoom: f32, buf: &mut [u8]) -> f64 {
-    let cam_at = |t: f32| {
-        let (x, y) = solar::planet_pos_of(sys, pi, t);
-        Camera { x, y, zoom }
-    };
+/// Mean ms/frame with the ORBIT clock frozen, so a camera aimed at a body stays
+/// aimed at it; the spin/boil clocks still advance, so nothing is cached away.
+/// Without this a body scenario sweeps its planet out of frame within a few
+/// frames and quietly measures an empty sky.
+fn ms_still(sys: &System, cam: &Camera, buf: &mut [u8]) -> f64 {
     for i in 0..4 {
-        let ta = i as f32 * 0.013;
-        render_system(sys, W, H, &cam_at(ta), 0.0, 0.0, ta, ta * 1.3, ta * 0.7, buf);
+        render_system(sys, W, H, cam, 0.0, 0.0, 0.0, i as f32 * 0.1, i as f32 * 0.1, buf);
     }
     let t = Instant::now();
     for i in 0..FRAMES {
         let ta = i as f32 * 0.013;
-        render_system(sys, W, H, &cam_at(ta), 0.0, 0.0, ta, ta * 1.3, ta * 0.7, buf);
+        render_system(sys, W, H, cam, 0.0, 0.0, 0.0, ta * 1.3, ta * 0.7, buf);
     }
     t.elapsed().as_secs_f64() * 1000.0 / FRAMES as f64
 }
@@ -74,7 +71,9 @@ fn main() {
     let far = Camera { x: 1.0e7, y: 1.0e7, zoom: fz }; // all bodies off-screen -> background only
     let far_zoomed = Camera { x: 1.0e7, y: 1.0e7, zoom: fz * 12.0 }; // + nebula & far-layer faded
     let sun = Camera { x: 0.0, y: 0.0, zoom: fz * 22.0 }; // fill screen with the sun
-    let pidx = (0..sys.planets.len()).find(|&i| sys.planets[i].orbit > 0.0);
+    // A mid-system world, framed where it actually IS at t = 0 (see `ms_still`).
+    let probe = sys.planets.len() / 2;
+    let (bx, by) = planet_world_pos(&sys, probe, 0.0);
 
     set_density(&mut sys, 0.5); // default
     let t_full = ms(&sys, &fit, &mut buf);
@@ -83,47 +82,36 @@ fn main() {
     let t_bg_nostars = ms(&sys, &far, &mut buf); // base + nebula + orbits
     let t_base = ms(&sys, &far_zoomed, &mut buf); // base fill + orbits (nebula faded)
     set_density(&mut sys, 0.5);
-    let t_sun = ms(&sys, &sun, &mut buf); // sun tile dominates
+    let t_sun = ms_still(&sys, &sun, &mut buf); // sun tile dominates
 
-    // A planet filling the view. The camera has to TRACK it: parking one where
-    // the planet starts leaves an empty frame within a few of the 80 timed
-    // frames, and an empty frame times the backdrop. These two rows read 0.3 ms
-    // that way — a hundredth of the truth.
-    let t_planet = if let Some(pi) = pidx { ms_follow(&sys, pi, fz * 22.0, &mut buf) } else { 0.0 };
+    // A planet filling the view, at the shipped detail cap.
+    let pcam = Camera { x: bx, y: by, zoom: fz * 22.0 };
+    let t_planet = ms_still(&sys, &pcam, &mut buf);
 
-    // The same full-screen planet with the detail cap pinned LOW (56): the tile
-    // stays small, so the per-pixel surface shader is cheap — the recommended way
-    // to keep a fills-the-screen planet fast.
-    let t_planet_lowcap = if let Some(pi) = pidx {
-        sys.set_view(1.0, 1.0, 1.0, 1.0, 1.0, 56.0, 110.0, 0.5, 1.0); // planet_detail = 56
-        let m = ms_follow(&sys, pi, fz * 22.0, &mut buf);
-        sys.set_view(1.0, 1.0, 1.0, 1.0, 1.0, 160.0, 110.0, 0.5, 1.0); // restore default
-        m
-    } else {
-        0.0
-    };
+    // The cap bounds the tile RADIUS, so cost falls with its square — still the
+    // biggest single lever on a zoomed-in scene.
+    sys.set_view(1.0, 1.0, 1.0, 1.0, 1.0, 56.0, 110.0, 0.5, 1.0); // planet_detail = 56
+    let t_planet_lowcap = ms_still(&sys, &pcam, &mut buf);
+    sys.set_view(1.0, 1.0, 1.0, 1.0, 1.0, 160.0, 110.0, 0.5, 1.0); // restore default
 
     // Frozen weather (`set_frozen_clouds`) — the A/B that matters is a planet
-    // filling the view, where the cloud shader is most of the frame.
-    //
-    // It has to FOLLOW the planet: a camera parked where a planet happened to
-    // start drifts off it as the orbit clock advances, and a scene whose bodies
-    // are all off-screen measures the backdrop. That is how the fixed-camera
-    // rows above come out at 0.3 ms.
+    // filling the view, where the surface and cloud shaders are most of the
+    // frame. Interleaved because this machine's timings drift within a run.
     let cloudy = (0..sys.planets.len())
-        .find(|&i| planet_core::param(sys.planets[i].ptype, 4) > 0.3);
+        .find(|&i| planet_core::param(sys.planets[i].ptype, 4) > 0.3)
+        .unwrap_or(probe);
+    let (cx, cy) = planet_world_pos(&sys, cloudy, 0.0);
+    let ccam = Camera { x: cx, y: cy, zoom: fz * 22.0 };
     let (mut t_froz, mut t_live) = (0.0, 0.0);
-    if let Some(pi) = cloudy {
-        for _ in 0..2 {
-            sys.set_frozen_clouds(true);
-            t_froz += ms_follow(&sys, pi, fz * 22.0, &mut buf);
-            sys.set_frozen_clouds(false);
-            t_live += ms_follow(&sys, pi, fz * 22.0, &mut buf);
-        }
+    for _ in 0..2 {
         sys.set_frozen_clouds(true);
-        t_froz /= 2.0;
-        t_live /= 2.0;
+        t_froz += ms_still(&sys, &ccam, &mut buf);
+        sys.set_frozen_clouds(false);
+        t_live += ms_still(&sys, &ccam, &mut buf);
     }
+    sys.set_frozen_clouds(false);
+    t_froz /= 2.0;
+    t_live /= 2.0;
 
     let bodies = (t_full - t_bg).max(0.0);
     let stars = (t_bg - t_bg_nostars).max(0.0);
@@ -149,8 +137,8 @@ fn main() {
     println!("  zoomed onto the sun               {:7.2} ms   ({:.0} fps)", t_sun, 1000.0 / t_sun);
     println!("  zoomed onto a planet (cap 160)    {:7.2} ms   ({:.0} fps)", t_planet, 1000.0 / t_planet);
     println!("  zoomed onto a planet (cap 56)     {:7.2} ms   ({:.0} fps)  <- low detail cap", t_planet_lowcap, 1000.0 / t_planet_lowcap);
-    println!("  followed cloudy planet, live      {:7.2} ms   ({:.0} fps)", t_live, 1000.0 / t_live);
-    println!("  followed cloudy planet, frozen    {:7.2} ms   ({:.0} fps)  <- {:.2}x, set_frozen_clouds", t_froz, 1000.0 / t_froz, t_live / t_froz);
+    println!("  zoomed cloudy planet, live       {:7.2} ms   ({:.0} fps)", t_live, 1000.0 / t_live);
+    println!("  zoomed cloudy planet, frozen    {:7.2} ms   ({:.0} fps)  <- {:.2}x, set_frozen_clouds", t_froz, 1000.0 / t_froz, t_live / t_froz);
     println!("\n── fit breakdown (panning) ──────────────────");
     println!("  background total                  {:7.2} ms   {:5.1}%", t_bg, 100.0 * t_bg / t_full);
     println!("    ├ base fill + orbit paths       {:7.2} ms   {:5.1}%", t_base, 100.0 * t_base / t_full);

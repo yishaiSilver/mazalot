@@ -57,6 +57,28 @@ of it. If you find yourself writing a "simpler" planet shader for a new crate,
 add a framing to `planet-core` instead — that duplication has been removed once
 already.
 
+**Bodies go through the compositor's clip, not a hand-rolled cull.** A scene
+draws a body by asking `scene_core::visible_tile_rect` where its tile lands, and
+passing that rect back into `render_tile_into` / `render_star_tile_into`. Two
+things follow, and both matter:
+
+- An **empty rect is the visibility test** — exact, and free. Do not add a
+  "body radius × some margin" off-screen check next to it. There was one; it had
+  to over-estimate for ringed giants and corona halos, so it kept rendering
+  full-price tiles for bodies that were entirely off-screen.
+- Pixels **outside the rect are not shaded**, so a tile is only valid for the
+  placement its clip came from. Anything that caches a tile must put the clip in
+  the cache key (`SunCache` does) — and then snap the rect outward to a grid
+  (`snap_out`), or a camera drifting a pixel a frame invalidates the cache every
+  frame and the caching buys nothing.
+
+The rect is **exact**, not padded — `blit` reads tile pixel `map(dd)` for each
+destination offset it visits and `map` is monotone, so the two endpoints bound
+the set. Both functions share that expression for exactly that reason. Keep them
+in step: a rect that under-reports by a pixel leaves an unshaded seam only
+visible at the zoom levels nobody screenshots, which is what `scene-core`'s
+million-read sweep is there to catch.
+
 **One backdrop, likewise.** Every scene paints through `background-core`:
 `paint_backdrop` (ground + optional nebula) then `paint_stars`. A new scene crate
 supplies a `Backdrop` and a `Starfield` const and a closure that mixes its seed
@@ -128,6 +150,21 @@ Run wasm builds **from the repo root** so `.cargo/config.toml` applies. It adds
 
 ## Gotchas
 
+- **The star's corona is tabulated, not shaded.** `sun_core::Shade` samples the
+  halo's streamers, its falloff and the disc's limb darkening along one axis each,
+  once per bake — the halo is ~65% of a star tile's pixels and none of those
+  fields has per-pixel detail. The angular table is sized to the halo's outer
+  circumference ×2.2 (`diamond_angle` covers a turn in 4 units but not at a
+  constant rate — it is twice as steep at the diagonals). Shrink that factor and
+  you get angular stair-steps in the halo that no still frame makes obvious; the
+  crate's tests pin it against direct evaluation.
+- **Octave counts are derived, not fixed.** `planet_core::Lod` picks each fBm
+  field's octave count from the disc's pixel radius, dropping octaves whose
+  lattice cell falls under two pixels (past Nyquist — they can't be resolved, and
+  on a turning planet they read as crawling speckle). So the *same planet at a
+  different on-screen size is legitimately different pixels*, and a change that
+  moves a body's radius will move its imagery. That is working as intended; what
+  must stay stable is a body at a **fixed** radius.
 - **Float codegen is load-bearing.** Moving code between crates changes LTO and
   FMA-contraction decisions, which shifts pixels by a few /255 across dither
   quantization thresholds. This is not a logic bug, but it *will* break
@@ -176,6 +213,11 @@ Run wasm builds **from the repo root** so `.cargo/config.toml` applies. It adds
   by the morph value (it oscillates; do not index by time), recover 61% of what
   freezing cost for 4% of the frame. Memory and bake go up by the phase count,
   so the cache budget is sized for one zoomed planet's stack.
+- **`F_ALL` is not every `F_*` bit.** It is the five that leave the picture
+  alone. `F_NIGHT_LOD` was in it until `Lod` started feeding the aurora and the
+  great spot as well as the base field — capping octaves past the terminator
+  then moved pixels, and `out/` caught it. If a switch changes the image, it
+  lives outside `F_ALL` and the web demos opt in.
 - **A per-family optimization needs its gate checked one bit at a time.** The
   baked map was built only when `F_BAKED_CLOUDS` was set, so `F_BAKED_SURFACE`
   and `F_BAKED_BANDS` did nothing on their own — and the verification missed it
@@ -183,7 +225,8 @@ Run wasm builds **from the repo root** so `.cargo/config.toml` applies. It adds
   Hash each bit against `F_ALL` alone, not against `F_ALL | <the other bits>`.
 - **`F_BAKED_*` are deliberately outside `F_ALL`.** Every other `F_*` bit is
   either a feature the ablation panel switches off or an optimization that is
-  invisible; these change the picture (frozen weather, baked albedo) to buy ~2.8x together.
+  invisible; these change the picture (frozen weather, baked albedo, thinned night side) to
+  buy ~2x together on top of the shipped renderer.
   Keeping them out of `F_ALL` is what lets `out/` stay byte-identical while the
   web demos run with them. `System::frozen_clouds` / `MoonSystem::frozen_clouds` default to
   `false` for the same reason — the JS turns them on at construction.
