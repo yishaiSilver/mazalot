@@ -199,9 +199,9 @@ impl Comet {
 /// eccentric orbits around it. Deterministic in `seed`.
 pub struct CometScene {
     pub seed: u32,
-    /// Reused star-tile buffer. The star is baked fresh every frame, so without
-    /// this each one allocates and zero-fills a tile that at the 120 px render
-    /// cap is ~800 KB. Interior-mutable because `render` takes `&self`.
+    /// Reused star-tile buffer — the star is baked fresh every frame, and at
+    /// the 120 px cap that is a ~800 KB allocation each time. Interior-mutable
+    /// because `render` takes `&self`.
     star_tile: RefCell<Tile>,
     pub star_kind: usize,
     pub star_radius: f32, // world units
@@ -290,8 +290,7 @@ impl CometScene {
         if rad_px >= 0.5 {
             let rad_render = rad_px.clamp(2.0, 120.0);
             let scale = rad_px / rad_render;
-            // Shade only what the compositor will read back: zoomed onto the
-            // star, most of its tile hangs off the viewport.
+            // Shade only what the compositor reads back.
             let tsize = sun_core::star_tile_size(rad_render, CORONA_REACH);
             let clip = visible_tile_rect(tsize, w, h, starx, stary, scale);
             if clip[2] != clip[0] {

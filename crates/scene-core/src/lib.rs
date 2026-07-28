@@ -72,10 +72,8 @@ impl Rng {
 
 /// A rendered body ready to blit: RGBA pixels + its tile size. Alpha is 0
 /// off-body, 255 on the opaque disc, and partial in soft halos (e.g. a corona).
-///
-/// [`Default`] is an empty tile — the starting point for a scene that keeps one
-/// around and lets each body renderer resize it, rather than allocating a fresh
-/// one per body per frame.
+/// [`Default`] is empty — the starting point for a scene that keeps one around
+/// instead of allocating per body per frame.
 #[derive(Default)]
 pub struct Tile {
     pub px: Vec<u8>,
@@ -83,11 +81,8 @@ pub struct Tile {
 }
 
 impl Tile {
-    /// Resize to `size`×`size`, reusing the allocation when it already is.
-    ///
-    /// Every body renderer that writes into a caller-owned tile starts here, so
-    /// that "does this buffer already fit?" is decided in one place rather than
-    /// once per renderer.
+    /// Resize to `size`×`size`, reusing the allocation when it already fits.
+    /// Every body renderer that writes into a caller-owned tile starts here.
     pub fn ensure(&mut self, size: u32) {
         let len = (size * size * 4) as usize;
         if self.size != size || self.px.len() != len {
@@ -98,9 +93,8 @@ impl Tile {
     }
 }
 
-/// Where a tile lands on screen: the destination rect `blit` would fill, as
-/// `(x0, y0, edge)` in px. `edge` is the scaled tile's edge length; the rect is
-/// square because tiles are.
+/// Where a tile lands on screen, as `(x0, y0, edge)` in px. Shared with `blit`
+/// so the two cannot disagree about it.
 #[inline]
 fn dest_rect(tile_size: u32, sx: f32, sy: f32, scale: f32) -> (i32, i32, i32) {
     let edge = (tile_size as f32 * scale).round().max(1.0) as i32;
@@ -115,23 +109,13 @@ fn dest_rect(tile_size: u32, sx: f32, sy: f32, scale: f32) -> (i32, i32, i32) {
 /// drawn at `(sx, sy)` scaled by `scale` — as `[tx0, ty0, tx1, ty1)` in TILE px.
 /// Empty (`tx0 == tx1`) means the tile misses the viewport entirely.
 ///
-/// This exists so a body renderer can shade only the part of its tile that will
-/// be seen. Zoomed in far enough that a planet overflows the viewport, most of
-/// its tile is off-screen — at a disc twice the viewport height, roughly 70% of
-/// it — and shading that is pure waste: `blit` reads a tile pixel at most once
-/// per destination pixel, so a tile pixel with no on-screen destination is never
-/// read at all.
-///
-/// An empty result is also the exact visibility test, which is why callers can
-/// use it in place of a hand-rolled "is this body off-screen" margin: it asks
-/// the compositor where the tile really lands instead of guessing how far a
-/// body's rings or corona reach.
+/// A body renderer shades this and nothing else; an empty result is the exact
+/// visibility test, so callers need no off-screen margin of their own.
 ///
 /// Exact, not padded: `blit` reads tile pixel `map(dd)` for each destination
-/// offset `dd` it visits, and `map` is non-decreasing in `dd`, so the tile
-/// pixels it touches are exactly those between the two endpoints' images. The
-/// two functions share the `map` expression below for that reason — keep them
-/// in step, and keep `visible_rect_covers_every_tile_pixel_blit_reads` passing.
+/// offset it visits and `map` is monotone, so the two endpoints bound the set.
+/// Both functions share that expression — keep them in step, or a zoomed-in body
+/// grows an unshaded seam down its edge.
 pub fn visible_tile_rect(tile_size: u32, w: u32, h: u32, sx: f32, sy: f32, scale: f32) -> [u32; 4] {
     let (x0, y0, edge) = dest_rect(tile_size, sx, sy, scale);
     // The on-screen slice of the destination rect, in destination-local px.
@@ -164,12 +148,10 @@ pub fn visible_tile_rect(tile_size: u32, w: u32, h: u32, sx: f32, sy: f32, scale
 /// rectangle is iterated — clamping the loop bounds instead of testing every
 /// pixel keeps blit cost proportional to visible area, not tile size.
 ///
-/// Within a row the destination is walked in RUNS of pixels that share one tile
-/// pixel — the same trick `background-core::composite` uses for its cloud cells.
-/// At the upscales a zoomed-in scene reaches, a run is tens of px long, so the
-/// source fetch, the alpha test and the blend factors are computed once per run
-/// instead of once per pixel, and a fully transparent run (a tile's corners are
-/// all transparent) is skipped without touching the destination at all.
+/// Within a row the destination is walked in RUNS sharing one tile pixel — tens
+/// of px long at a zoomed-in upscale — so the source fetch, the alpha test and
+/// the blend factors happen once per run, and a transparent run is skipped
+/// without touching the destination.
 pub fn blit(out: &mut [u8], w: u32, h: u32, tile: &Tile, sx: f32, sy: f32, scale: f32) {
     let (x0, y0, dsize) = dest_rect(tile.size, sx, sy, scale);
     let inv = 1.0 / scale;
@@ -187,9 +169,8 @@ pub fn blit(out: &mut [u8], w: u32, h: u32, tile: &Tile, sx: f32, sy: f32, scale
         let mut ddx = ddx0;
         while ddx < ddx1 {
             let tx = ((ddx as f32 + 0.5) * inv) as u32;
-            // The run ends where the next tile pixel starts: tx+1 <= (ddx+0.5)/scale.
-            // `max(ddx + 1)` guarantees progress when scale <= 1 (a downscale
-            // steps more than one tile px per destination px).
+            // The run ends where the next tile px starts; the `ddx + 1` floor
+            // guarantees progress when scale <= 1.
             let run_end = (((tx + 1) as f32 * scale - 0.5).ceil() as i32).clamp(ddx + 1, ddx1);
             if tx >= tile.size {
                 ddx = run_end;
@@ -213,8 +194,7 @@ pub fn blit(out: &mut [u8], w: u32, h: u32, tile: &Tile, sx: f32, sy: f32, scale
                     p[3] = 255;
                 }
             } else {
-                // Premultiply the source side once; only the destination term
-                // varies down the run.
+                // Only the destination term varies down the run.
                 let ia = 255 - a;
                 let (pr, pg, pb) = (sr as u32 * a, sg as u32 * a, sb as u32 * a);
                 for p in dst.chunks_exact_mut(4) {
@@ -235,8 +215,7 @@ pub fn blit(out: &mut [u8], w: u32, h: u32, tile: &Tile, sx: f32, sy: f32, scale
 mod tests {
     use super::*;
 
-    /// A tile with a bit of everything: opaque core, a translucent ring, fully
-    /// transparent corners — so a blit exercises all three run kinds.
+    /// Opaque core, translucent ring, transparent corners — all three run kinds.
     fn tile(size: u32) -> Tile {
         let c = size as f32 / 2.0;
         let mut px = vec![0u8; (size * size * 4) as usize];
@@ -254,9 +233,8 @@ mod tests {
         Tile { px, size }
     }
 
-    /// The per-destination-pixel form `blit` replaced. The run-length walk must
-    /// land on exactly these bytes — the compositor is the last thing every
-    /// scene passes through, so a drift here shows up everywhere at once.
+    /// The per-pixel form `blit` replaced. Every scene passes through the
+    /// compositor, so a drift here shows up everywhere at once.
     fn blit_reference(out: &mut [u8], w: u32, h: u32, t: &Tile, sx: f32, sy: f32, scale: f32) {
         let dsize = (t.size as f32 * scale).round().max(1.0) as i32;
         let x0 = (sx - dsize as f32 * 0.5).floor() as i32;
@@ -296,9 +274,8 @@ mod tests {
         }
     }
 
-    /// Placements worth covering: dead centre, hanging off each edge, bigger
-    /// than the viewport (the zoomed-in case), fractional centres, and the
-    /// downscale where a run is a single px.
+    /// Dead centre, off each edge, bigger than the viewport, fractional
+    /// centres, and the downscale where a run is a single px.
     const PLACEMENTS: &[(f32, f32, f32)] = &[
         (60.0, 40.0, 1.0),
         (60.0, 40.0, 0.4),
@@ -329,15 +306,11 @@ mod tests {
         }
     }
 
-    /// `visible_tile_rect` is only safe to shade against if it is a SUPERSET of
-    /// what `blit` reads. Under-reporting by one px would leave an unshaded
-    /// seam along the edge of a zoomed-in planet, which is exactly the kind of
-    /// bug that only shows up at the zoom levels nobody screenshots.
-    /// The rect is exact rather than padded, so this is the only thing standing
-    /// between a rounding change in either function and an unshaded seam down
-    /// the edge of a zoomed-in body. Sweep far wider than `PLACEMENTS`: every
-    /// scale from a heavy downscale to a 50x blow-up, at sub-pixel centres, on
-    /// and off every edge.
+    /// The same property over the named placements, plus the converse: an empty
+    /// rect must mean `blit` really reads nothing.
+    /// The rect is exact, so this is all that stands between a rounding change
+    /// in either function and an unshaded seam. Sweeps every scale from a heavy
+    /// downscale to a 50x blow-up, at sub-pixel centres, on and off every edge.
     #[test]
     fn visible_rect_is_exact_across_a_wide_sweep() {
         let (w, h) = (121u32, 83u32);
@@ -382,7 +355,7 @@ mod tests {
         for size in [6u32, 17, 64, 131] {
             for &(sx, sy, scale) in PLACEMENTS {
                 let [tx0, ty0, tx1, ty1] = visible_tile_rect(size, w, h, sx, sy, scale);
-                // Replay blit's own indexing and collect what it touches.
+                // Replay blit's own indexing.
                 let dsize = (size as f32 * scale).round().max(1.0) as i32;
                 let x0 = (sx - dsize as f32 * 0.5).floor() as i32;
                 let y0 = (sy - dsize as f32 * 0.5).floor() as i32;
@@ -406,8 +379,6 @@ mod tests {
                         read += 1;
                     }
                 }
-                // And the converse direction of usefulness: an empty rect must
-                // mean blit really does read nothing.
                 if tx1 == tx0 {
                     assert_eq!(read, 0, "reported empty but blit read {read} tile px");
                 }
@@ -415,8 +386,8 @@ mod tests {
         }
     }
 
-    /// The whole point of the rect: when a body overflows the viewport it must
-    /// report substantially less than the whole tile.
+    /// The point of the rect: a body overflowing the viewport must report
+    /// substantially less than its whole tile.
     #[test]
     fn a_tile_larger_than_the_viewport_reports_only_its_visible_part() {
         let (w, h) = (1680u32, 944u32);

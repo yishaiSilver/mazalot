@@ -265,9 +265,7 @@ impl MoonSystem {
         // upsizes the fixed-resolution tile (bigger blocks, no new detail). The
         // buffer term keeps tiles bounded when zoomed way in.
         let buf_cap = w.max(h) as f32 * 0.6;
-        // One tile buffer for every body in the scene: `*_tile` resizes it as
-        // the zoom demands, instead of a fresh heap allocation per body per
-        // frame. Bodies are drawn one at a time, so they can share it.
+        // Bodies are drawn one at a time, so they share one buffer.
         let mut tile = Tile::default();
 
         let (pcx, pcy) = to_screen(0.0, 0.0, cam, w, h);
@@ -280,9 +278,8 @@ impl MoonSystem {
                 }
                 let rad_render = rad_px.clamp(2.0, buf_cap.min(200.0));
                 let scale = rad_px / rad_render;
-                // Let the compositor decide what is worth shading: an empty rect
-                // is the exact visibility test, and a partial one is the part of
-                // a zoomed-in planet that hangs off the viewport.
+                // An empty rect is the visibility test; a partial one is the
+                // part of a zoomed-in planet hanging off the viewport.
                 let tsize = planet_core::tile_size(self.parent_type, rad_render);
                 let clip = visible_tile_rect(tsize, w, h, pcx, pcy, scale);
                 if clip[2] == clip[0] {
@@ -392,8 +389,7 @@ fn render_moon_tile(
         [clip[0].min(size), clip[1].min(size), clip[2].min(size), clip[3].min(size)];
     for iy in clip_y0..clip_y1 {
         let ny = (c - (iy as f32 + 0.5)) / rad_px;
-        // Off the disc a moon tile is empty, so walk only the row's disc span
-        // and clear the rest — a reused buffer must not keep the last frame.
+        // Off the disc a moon tile is empty; clear what the narrowing leaves.
         let half = (1.0 - ny * ny).max(0.0).sqrt() * rad_px + 1.0;
         let x0 = clip_x0.max((c - half).floor().max(0.0) as u32);
         let x1 = clip_x1.min((c + half).ceil().clamp(0.0, size as f32) as u32);
@@ -444,8 +440,8 @@ fn render_moon_tile(
     }
 }
 
-/// Edge length of the tile [`render_moon_tile`] fills at this radius — needed
-/// before rendering, to ask the compositor what part of it will be seen.
+/// Edge length [`render_moon_tile`] fills — needed before rendering, to ask
+/// `scene_core::visible_tile_rect` what part of it will be seen.
 fn moon_tile_size(rad_px: f32) -> u32 {
     (((rad_px + 1.5) * 2.0).ceil() as u32).max(6)
 }

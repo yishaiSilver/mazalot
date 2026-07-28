@@ -39,29 +39,14 @@ use noise_core::{
 // Level of detail
 // ---------------------------------------------------------------------------
 
-/// How many octaves each fBm field in the shader is worth evaluating, for a disc
-/// of a given pixel radius.
+/// Octave counts for the shader's fBm fields, derived from the disc's pixel
+/// radius.
 ///
-/// The surface shader is mostly fBm by cost, and a fixed octave count is the
-/// wrong dial for it, in two separate ways.
-///
-/// **Octaves finer than the pixel grid are not detail — they are aliasing.**
 /// A tile puts one sphere radius across `rad` px, so a field sampled at
 /// `p · freq` has its `k`-th octave's lattice cell land at
-/// `rad / (freq · 2^(k-1))` px. Once that drops under two pixels the octave is
-/// past Nyquist: it cannot be resolved, and because the planet turns, what it
-/// actually contributes is a layer of per-pixel speckle that crawls. Dropping it
-/// is both cheaper and *steadier* — this is a mip level, not a quality knob.
-/// It also scales the right way on its own: a planet 20 px across pays for three
-/// octaves, the same planet filling the screen pays for six.
-///
-/// **A warp field is not the field it warps.** The three components of a domain
-/// warp only *displace* the sample point, by at most `w` domain units. Their
-/// fourth octave moves it under 2% of a lattice cell — invisible in whatever it
-/// displaces. Two octaves is the whole useful signal, which turns a 4-octave
-/// `fbm_warp`'s 16 octave evaluations into 10 with no visible change at all.
-///
-/// [`sun-core`](sun_core) makes the same trade for the star, keyed on tile size.
+/// `rad / (freq · 2^(k-1))` px. Under two pixels that octave is past Nyquist:
+/// unresolvable, and on a turning planet it reads as crawling speckle. Dropping
+/// it is cheaper *and* steadier — a mip level, not a quality knob.
 #[derive(Clone, Copy)]
 struct Lod {
     /// Disc radius in px — how finely this tile can resolve anything.
@@ -76,10 +61,8 @@ impl Lod {
     /// Octaves for a domain warp's three displacement components.
     const WARP: u32 = 2;
 
-    /// Octaves worth evaluating for a field sampled at `p · freq`, never more
-    /// than `full` and never fewer than one.
-    ///
-    /// Solves `rad / (freq · 2^(k-1)) >= 2` for the largest whole `k`.
+    /// Solves `rad / (freq · 2^(k-1)) >= 2` for the largest whole `k`, clamped
+    /// to `1..=full`.
     #[inline]
     fn oct(&self, freq: f32, full: u32) -> u32 {
         let cells = self.rad / (2.0 * freq.max(0.01)); // = 2^(k-1) at the limit
@@ -316,11 +299,9 @@ fn great_spot(col: Rgb, sx: f32, sy: f32, sz: f32, angle: f32, intensity: f32, l
     }
     let dlat = sy - spot_lat;
     let base = ((dlon * 1.05).powi(2) + (dlat * 2.2).powi(2)).sqrt();
-    // The turbulent boundary below scales `base` by `0.82 + 0.4·edge` with
-    // `edge` in [0, 1], so the smallest it can ever be is 0.82·base. Past that
-    // the pixel is outside the spot whatever the noise says — and on a banded
-    // world that is most of the disc, so the two fBm fields below are worth not
-    // evaluating. Rejecting on the bound keeps the result exact.
+    // The boundary below scales `base` by `0.82 + 0.4·edge`, `edge` in [0, 1],
+    // so 0.82·base is the smallest it can be: past that the pixel is outside
+    // whatever the noise says. Most of a banded disc is. Exact rejection.
     if base * 0.82 >= 1.0 {
         return col;
     }
@@ -645,9 +626,8 @@ struct Frame {
     /// Cut the planet out on transparent pixels — a tile a scene compositor can
     /// blit — instead of filling the frame with a starfield.
     sprite: bool,
-    /// The sub-rect of the frame to actually write, `[x0, y0, x1, y1)`. Pixels
-    /// outside it are left alone. The hero framing always passes the whole
-    /// frame; a scene passes what its compositor will read back.
+    /// The sub-rect to write, `[x0, y0, x1, y1)`; outside it is left alone. The
+    /// hero framing passes the whole frame.
     clip: [u32; 4],
 }
 
@@ -689,11 +669,9 @@ pub fn render_tile(type_idx: usize, seed: u32, angle: f32, light: [f32; 3], rad_
     tile
 }
 
-/// The edge length [`render_tile`] will produce for this type at this radius.
-///
-/// A caller needs this *before* rendering, to ask the compositor which part of
-/// the tile will be visible (`scene_core::visible_tile_rect`) and pass it back
-/// in as a clip.
+/// The edge length [`render_tile`] produces for this type at this radius —
+/// needed *before* rendering, to ask `scene_core::visible_tile_rect` which part
+/// of the tile will be seen.
 pub fn tile_size(type_idx: usize, rad_px: f32) -> u32 {
     // Rings reach `ring_outer` disc radii sideways; a plain world needs only a
     // pixel of slack for its dark limb. `radius_scale` — which shrinks a ringed
@@ -707,17 +685,13 @@ pub fn tile_size(type_idx: usize, rad_px: f32) -> u32 {
 /// [`render_tile`] into a tile you already own, shading only the tile pixels in
 /// `clip` (`[x0, y0, x1, y1)`, tile px).
 ///
-/// Zoomed in far enough that a body overflows the viewport, most of its tile has
-/// nowhere on screen to land — at a disc twice the viewport height, around 70%
-/// of it — and the compositor never reads those pixels. Pass
-/// `scene_core::visible_tile_rect` here and that work does not happen. Reusing
-/// the buffer also drops a heap allocation (and its zero-fill) per body per
-/// frame — 68 KB a time at detail cap 64.
+/// Pass `scene_core::visible_tile_rect` as the clip and the off-screen part of a
+/// zoomed-in body's tile is never shaded.
 ///
-/// **Pixels outside `clip` are left as they were**, not cleared: the tile is
-/// only valid for the placement its clip came from. That is exactly the range
-/// `blit` reads back, so a reused buffer cannot leak a previous body's pixels
-/// into the scene — but do not hand the tile to anything that reads wider.
+/// **Pixels outside `clip` are left as they were**, not cleared: the tile is only
+/// valid for the placement its clip came from. That is exactly what `blit` reads
+/// back, so a reused buffer cannot leak a previous body into the scene — but do
+/// not hand the tile to anything that reads wider.
 pub fn render_tile_into(
     tile: &mut Tile,
     type_idx: usize,
@@ -735,10 +709,8 @@ pub fn render_tile_into(
     render_frame(&frame, ct, seed, angle, &tile_style(), &mut tile.px);
 }
 
-/// Specular contributions below this cannot survive the 22-level quantization
-/// (one level is 1/22 ≈ 0.045, and the dither swings ±0.016), so the shimmer
-/// noise that modulates them is not worth evaluating. 1/1024 leaves two decades
-/// of headroom under a level.
+/// A glint below this cannot survive the 22-level quantization (one level is
+/// 1/22 ≈ 0.045), so the shimmer noise modulating it is not worth evaluating.
 const SPEC_FLOOR: f32 = 1.0 / 1024.0;
 
 fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, out: &mut [u8]) {
@@ -772,9 +744,7 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
     }
 
     let lod = Lod::for_disc(rad);
-    // Per-frame constants that used to be recomputed inside the pixel loop: the
-    // cloud layer's drift basis and morph phase, and the storm vortices' seeded
-    // centres. All are functions of `angle` and `seed` alone.
+    // Functions of `angle` and `seed` alone — hoisted out of the pixel loop.
     let (cs, cc) = (angle * 2.0).sin_cos();
     let morph = angle.sin() * 0.6;
     let swirl_phase = (angle * 0.6).sin() * 1.6 * ct.storm_cells;
@@ -785,9 +755,9 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
         )
     });
 
-    // A sprite is empty off the disc (and off a ringed world's ring ellipse), so
-    // each row only has to be walked across the part those two shapes cover.
-    // Moons orbit out in the margin, so a frame that draws them opts out.
+    // A sprite is empty off the disc and off a ringed world's ring ellipse, so a
+    // row need only be walked across those. Moons orbit out in the margin, so a
+    // frame that draws them opts out.
     let narrow = fr.sprite && nmoon == 0;
     // Half-width of the covered band at row offset `ny`, in disc radii.
     let cover = |ny: f32| {
@@ -803,8 +773,8 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
     let [clip_x0, clip_y0, clip_x1, clip_y1] = fr.clip;
     for iy in clip_y0..clip_y1 {
         let ny = (cy - (iy as f32 + 0.5)) / rad;
-        // Narrow the row, then clear whatever of the clip that leaves uncovered
-        // — a reused buffer must not show the previous frame there.
+        // Clear whatever of the clip the narrowing leaves uncovered — a reused
+        // buffer must not show the previous body there.
         let (mut x0, mut x1) = (clip_x0, clip_x1);
         if narrow {
             let half = cover(ny) * rad + 1.0; // +1 px of slack for the rounding
@@ -847,10 +817,9 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                         for (vx, vz) in vortex {
                             let (dx, dz) = (cx3 - vx, cz3 - vz);
                             let d2v = dx * dx + dz * dz;
-                            // exp(-2.2·d²) is under 1e-4 past here, and it only
-                            // scales a rotation angle — so the eddy does nothing
-                            // this far out, and neither `exp` nor `sin_cos` is
-                            // worth paying for. Most of a disc is this far out.
+                            // exp(-2.2·d²) is under 1e-4 past here and only
+                            // scales a rotation angle, so the eddy does nothing.
+                            // Most of a disc is this far out.
                             if d2v > 4.2 {
                                 continue;
                             }
@@ -897,10 +866,9 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                     // moon's dark maria glare far less than its bright highlands.
                     let alb = col[0] * 0.3 + col[1] * 0.59 + col[2] * 0.11;
                     let mat = 1.0 - ct.spec_albedo * (1.0 - alb);
-                    // `ndh^shininess` collapses fast, so on most of the disc the
-                    // glint is far below one quantization level (1/22) and cannot
-                    // change the output whatever the shimmer does. Bound it first
-                    // — `shimmer <= 1` — and skip the fBm where it can't show.
+                    // `ndh^shininess` collapses fast, so over most of the disc
+                    // the glint cannot show at all. `shimmer <= 1`, so bound the
+                    // whole term first and skip its fBm where it can't.
                     let peak = ndh.powf(ct.shininess) * ct.specular * mat;
                     if peak > SPEC_FLOOR {
                         // Cycling shimmer so water/ice glints twinkle over time.
@@ -913,9 +881,7 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                     }
                 }
                 if has_atmo {
-                    // `powf(3.0)` is a full exp/log even for a literal exponent;
-                    // `powi(3)` is two multiplies, and this runs on every lit
-                    // pixel of every world with an atmosphere.
+                    // `powf(3.0)` is a full exp/log even for a literal exponent.
                     let rim = (1.0 - nz).powi(3) * 0.6;
                     o[0] = clamp01(o[0] + ct.atmo[0] * rim);
                     o[1] = clamp01(o[1] + ct.atmo[1] * rim);

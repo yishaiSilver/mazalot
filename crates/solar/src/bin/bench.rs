@@ -34,13 +34,9 @@ fn ms(sys: &System, cam: &Camera, buf: &mut [u8]) -> f64 {
 }
 
 /// Mean ms/frame with the ORBIT clock frozen, so a camera aimed at a body stays
-/// aimed at it. The spin/boil clocks still advance, so nothing is cached away.
-///
-/// The body scenarios need this: they pin the camera on where a planet is, and
-/// with the orbit running it sweeps out of frame within a few frames and the
-/// scenario quietly measures an empty sky instead. (It used to, and the number
-/// looked plausible because the old cull margin — a blanket 2.2 body radii —
-/// kept rendering full-size tiles for bodies that were already off-screen.)
+/// aimed at it; the spin/boil clocks still advance, so nothing is cached away.
+/// Without this a body scenario sweeps its planet out of frame within a few
+/// frames and quietly measures an empty sky.
 fn ms_still(sys: &System, cam: &Camera, buf: &mut [u8]) -> f64 {
     for i in 0..4 {
         render_system(sys, W, H, cam, 0.0, 0.0, 0.0, i as f32 * 0.1, i as f32 * 0.1, buf);
@@ -92,9 +88,8 @@ fn main() {
     let pcam = Camera { x: bx, y: by, zoom: fz * 22.0 };
     let t_planet = ms_still(&sys, &pcam, &mut buf);
 
-    // The same full-screen planet with the detail cap pinned LOW (56). The cap
-    // bounds the tile RADIUS, so the shader cost falls with its square — this is
-    // still the biggest single lever on a zoomed-in scene.
+    // The cap bounds the tile RADIUS, so cost falls with its square — still the
+    // biggest single lever on a zoomed-in scene.
     sys.set_view(1.0, 1.0, 1.0, 1.0, 1.0, 56.0, 110.0, 0.5, 1.0); // planet_detail = 56
     let t_planet_lowcap = ms_still(&sys, &pcam, &mut buf);
     sys.set_view(1.0, 1.0, 1.0, 1.0, 1.0, 160.0, 110.0, 0.5, 1.0); // restore default

@@ -27,10 +27,9 @@ pub struct StarKind {
 // One-dimensional fields, sampled once per bake instead of once per pixel
 // ---------------------------------------------------------------------------
 
-/// A pseudo-angle for `(x, y)`: `[0, 4)`, strictly increasing with θ, no
-/// transcendentals. Walks the diamond `|x| + |y| = 1` instead of the unit
-/// circle, so it is not *proportional* to θ — but it is monotone, which is all
-/// an index into a table built in the same parameter needs.
+/// A pseudo-angle for `(x, y)`: `[0, 4)`, monotone in θ, no transcendentals.
+/// Walks the diamond `|x| + |y| = 1` rather than the unit circle, so it is not
+/// proportional to θ — monotone is all a table index needs.
 #[inline]
 fn diamond_angle(y: f32, x: f32) -> f32 {
     if y >= 0.0 {
@@ -46,8 +45,7 @@ fn diamond_angle(y: f32, x: f32) -> f32 {
     }
 }
 
-/// The unit direction at pseudo-angle `a` — the inverse of [`diamond_angle`],
-/// for filling a table indexed by it.
+/// Inverse of [`diamond_angle`], for filling a table indexed by it.
 fn from_diamond(a: f32) -> (f32, f32) {
     let (dx, dy) = if a < 1.0 {
         (1.0 - a, a)
@@ -75,23 +73,15 @@ fn sample(tab: &[f32], u: f32) -> f32 {
 /// The parts of the star's shading that vary along **one** axis, sampled once
 /// per bake rather than once per pixel.
 ///
-/// The star splits cleanly into a fast-varying part and three slow ones. The
-/// granulation cells genuinely need per-pixel Worley — they are the visible
-/// structure. But the corona's streamers depend only on the *angle* around the
-/// limb, its falloff only on the *distance* past the limb, and the disc's limb
-/// darkening only on `mu`. None of those has per-pixel detail in it.
-///
-/// That mattered because the corona is the *majority* of a star tile: the halo
-/// annulus out to `1 + corona_reach` radii is ~1.9× the disc's area, so ~65% of
-/// the shaded pixels were paying a two-octave fBm and a `powf` to evaluate a
-/// smooth 1-D function. Here each is tabulated along its own axis and
-/// interpolated — a lookup and a lerp — which is the same trade `planet-core`
-/// makes with octave counts: spend detail only where the pixel grid can hold it.
+/// The granulation cells need per-pixel Worley — they are the visible structure.
+/// The corona's streamers do not: they depend only on the angle around the limb,
+/// its falloff only on the distance past it, and the disc's limb darkening only
+/// on `mu`. That is worth splitting out because the halo annulus is ~1.9× the
+/// disc's area, so ~65% of a star tile's shaded pixels were running a two-octave
+/// fBm and a `powf` for a smooth 1-D function.
 struct Shade {
-    /// Corona streamer brightness around the limb, indexed by [`diamond_angle`]
-    /// over `[0, 4)`. Sized to the halo's outer circumference so the table is
-    /// finer than the pixel grid; the final entry repeats the first so the
-    /// wrap-around seam interpolates instead of stepping.
+    /// Streamer brightness around the limb, indexed by [`diamond_angle`]. The
+    /// final entry repeats the first so the wrap-around seam interpolates.
     flare: Vec<f32>,
     /// Corona falloff, indexed by `edge / corona_reach` over `[0, 1]`.
     fall: Vec<f32>,
@@ -101,10 +91,9 @@ struct Shade {
 
 impl Shade {
     fn build(t: f32, rad_px: f32, corona_reach: f32, corona_oct: u32) -> Shade {
-        // One entry per px of outer circumference, ×2.2: the diamond
-        // parametrization covers a full turn in 4 units but not at a constant
-        // rate — dθ/da is twice as steep at the diagonals as on the axes — so
-        // sizing to the circumference alone would under-sample two arcs of it.
+        // One entry per px of outer circumference, ×2.2 because `diamond_angle`
+        // covers a turn in 4 units at a non-constant rate — dθ/da is twice as
+        // steep at the diagonals, so the circumference alone under-samples those.
         let circ = 2.0 * core::f32::consts::PI * (1.0 + corona_reach) * rad_px;
         let n = ((circ * 2.2) as usize).clamp(64, 8192);
         let flare = (0..=n)
@@ -198,12 +187,8 @@ pub fn star_tile_size(rad_px: f32, corona_reach: f32) -> u32 {
 }
 
 /// [`render_star_tile`] into a tile you already own, shading only `clip`
-/// (`[x0, y0, x1, y1)`, tile px) and clearing the rest.
-///
-/// Zoomed onto the star, most of its tile hangs off the viewport and the
-/// compositor never reads it; passing `scene_core::visible_tile_rect` here skips
-/// that work. Reusing the buffer also drops a per-bake heap allocation, which
-/// for a star at detail cap 110 is a ~580 KB zero-fill.
+/// (`[x0, y0, x1, y1)`, tile px). Pass `scene_core::visible_tile_rect` and the
+/// part of the tile hanging off the viewport is never shaded.
 #[allow(clippy::too_many_arguments)]
 pub fn render_star_tile_into(
     tile: &mut Tile,
@@ -227,8 +212,8 @@ pub fn render_star_tile_into(
     let sh = Shade::build(t, rad_px, corona_reach, corona_oct);
     let px = &mut tile.px;
 
-    // Everything past the corona is transparent, so a row only needs walking
-    // across the disc-plus-halo circle it intersects.
+    // Past the corona a tile is empty, so a row need only be walked across the
+    // disc-plus-halo circle it intersects.
     let reach = 1.0 + corona_reach;
     let [clip_x0, clip_y0, clip_x1, clip_y1] = [
         clip[0].min(size),
@@ -266,12 +251,8 @@ pub fn render_star_tile_into(
             // Corona halo: a soft, shimmering falloff past the limb.
             let edge = r - 1.0;
             if edge > 0.0 && edge < corona_reach {
-                // The streamers are a function of the ANGLE around the limb, and
-                // the old code recovered that angle with `atan2` only to feed it
-                // straight back through `cos`/`sin`. Out here `r > 1`, so the
-                // unit direction is just `(nx, ny) / r` — same field, three
-                // transcendentals cheaper, on the ~65% of a star tile's shaded
-                // pixels that are corona rather than disc.
+                // Out here `r > 1`, so the unit direction the streamers want is
+                // just `(nx, ny) / r` — no `atan2`/`cos`/`sin` round-trip.
                 let inv_r = 1.0 / r;
                 let flare = sh.flare(nx * inv_r, ny * inv_r);
                 let fall = sample(&sh.fall, edge / corona_reach);
@@ -310,9 +291,8 @@ mod tests {
         gran: 5.5,
     };
 
-    /// `diamond_angle` is only usable as a table index because it rises
-    /// monotonically with θ over a full turn. Walk the circle and check it never
-    /// goes backwards, and that the inverse round-trips.
+    /// Usable as a table index only if it rises monotonically with θ over a
+    /// full turn — and the inverse has to round-trip.
     #[test]
     fn diamond_angle_is_monotone_and_invertible() {
         let n = 4000;
@@ -333,12 +313,9 @@ mod tests {
         }
     }
 
-    /// The corona's streamers and falloff and the disc's limb darkening are
-    /// tabulated per bake instead of evaluated per pixel. That is an
-    /// approximation, so pin how close it stays: the tables are sized to the
-    /// halo's circumference, and a regression there (too few entries, a bad
-    /// index) would show up as banding rings or angular stair-steps in the halo
-    /// — which no single still frame makes obvious.
+    /// The tables are an approximation, so pin how close they stay. Too few
+    /// entries or a bad index shows up as banding rings or angular stair-steps
+    /// in the halo, which no single still frame makes obvious.
     #[test]
     fn tabulated_shading_matches_direct_evaluation() {
         for &rad in &[8.0f32, 24.0, 60.0, 110.0, 176.0] {
@@ -350,7 +327,7 @@ mod tests {
                 let (mut worst, mut n) = (0i32, 0usize);
                 for iy in 0..size {
                     for ix in 0..size {
-                        // Only the halo and the limb depend on the tables.
+                        // Only the halo depends on `flare`/`fall`.
                         let nx = (ix as f32 + 0.5 - c) / rad;
                         let ny = (c - (iy as f32 + 0.5)) / rad;
                         let r = (nx * nx + ny * ny).sqrt();
@@ -358,7 +335,6 @@ mod tests {
                         if edge <= 0.0 || edge >= reach {
                             continue;
                         }
-                        // Direct evaluation of the same two fields.
                         let inv = 1.0 / r;
                         let oct = if size > 200 { 2 } else { 3 };
                         let flare =
@@ -369,16 +345,14 @@ mod tests {
                         let d = ((want - got) * 255.0).abs() as i32;
                         worst = worst.max(d);
                         n += 1;
-                        // And the tile really did get written out here.
                         let a = tile.px[((iy * size + ix) * 4 + 3) as usize];
                         assert!(a > 0 || want < 0.02, "halo px ({ix},{iy}) is transparent");
                     }
                 }
                 assert!(n > 20, "rad {rad}: only {n} halo px sampled");
 
-                // The disc's limb darkening is tabulated too, and it is the
-                // least forgiving of the three: `mu^0.45` has infinite slope at
-                // `mu = 0`, so the very limb is where interpolation is worst.
+                // `mu^0.45` has infinite slope at 0, so the very limb is where
+                // interpolation is worst.
                 let mut lw = 0i32;
                 for i in 0..=2048 {
                     let mu = i as f32 / 2048.0;
@@ -386,11 +360,9 @@ mod tests {
                     lw = lw.max(((want - sample(&sh.limb, mu)) * 255.0).abs() as i32);
                 }
                 assert!(lw <= 2, "limb darkening table is off by {lw}/255");
-                // Sized as above, the tables are exact to the byte from rad 24
-                // up (where the halo is more than a dozen px wide). Only a tiny
-                // star, whose table hits the 64-entry floor and whose halo is a
-                // few px across, drifts — and by a third of a quantization
-                // level, on a body nobody is looking at closely.
+                // Exact to the byte from rad 24 up. Only a tiny star, whose
+                // table hits the 64-entry floor, drifts — by a third of a
+                // quantization level, on a halo a few px wide.
                 let bound = if rad >= 24.0 { 0 } else { 3 };
                 assert!(
                     worst <= bound,
