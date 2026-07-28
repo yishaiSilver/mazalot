@@ -1,0 +1,188 @@
+<title>mazalot — parallel capability probe</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 28px; background: #05050b; color: #d7dae6;
+    font: 14px/1.6 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  h1 { font-size: 13px; letter-spacing: .16em; text-transform: uppercase; color: #8790ad; margin: 0 0 4px; }
+  h2 { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: #565d78;
+    margin: 26px 0 8px; border-top: 1px solid rgba(255,255,255,.08); padding-top: 12px; }
+  .lede { color: #7b83a2; max-width: 62ch; margin: 0 0 6px; }
+  table { border-collapse: collapse; width: 100%; max-width: 760px; font-variant-numeric: tabular-nums; }
+  td, th { text-align: left; padding: 5px 10px 5px 0; vertical-align: top; }
+  th { color: #565d78; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .1em; }
+  td.k { color: #9aa0bb; width: 30ch; }
+  b { color: #eef1f8; }
+  .yes { color: #57d38c; } .no { color: #ff8f8f; } .meh { color: #f4b74a; }
+  .note { color: #6b7290; font-size: 12px; max-width: 62ch; }
+  button { padding: 9px 16px; font: inherit; font-size: 13px; color: #06060c; font-weight: 700;
+    border: 0; border-radius: 8px; cursor: pointer; background: linear-gradient(180deg, #ffe8b0, #f4b74a); }
+  button:disabled { opacity: .5; cursor: default; }
+  .bar { height: 6px; border-radius: 3px; background: rgba(255,255,255,.10); overflow: hidden; max-width: 320px; }
+  .bar i { display: block; height: 100%; background: #57d38c; }
+  code { color: #aeb4cd; }
+</style>
+
+<h1>Parallel capability probe</h1>
+<p class="lede">Answers one question on the host you deploy to: <b>can this page use more than
+one core, and how much would it buy?</b> Everything below runs the real
+<code>planet.wasm</code> shader — no synthetic benchmark.</p>
+
+<h2>Environment</h2>
+<table id="env"><tbody></tbody></table>
+
+<h2>Throughput</h2>
+<p class="note">Each worker renders whole 256&times;256 planet frames — same work, independent.
+This measures how much parallel <em>throughput</em> the machine really has. Splitting one
+frame into bands gets you close to this, minus the per-frame dispatch cost measured below.</p>
+<p><button id="run">▶ measure parallel speedup</button></p>
+<table id="perf"><tbody></tbody></table>
+
+<script type="module">
+const WASM_B64 = "__WASM_B64__";
+const bytes = Uint8Array.from(atob(WASM_B64), c => c.charCodeAt(0));
+
+const $ = id => document.getElementById(id);
+const mark = (ok, t) => `<b class="${ok === null ? 'meh' : ok ? 'yes' : 'no'}">${t}</b>`;
+const rows = (tbl, list) => {
+  $(tbl).querySelector('tbody').innerHTML =
+    list.map(([k, v, n]) => `<tr><td class="k">${k}</td><td>${v}${n ? `<div class="note">${n}</div>` : ''}</td></tr>`).join('');
+};
+
+// --- environment -----------------------------------------------------------
+// A worker built from a blob: URL is how a single self-contained file gets off
+// the main thread. Some Content-Security-Policies block it; that is the one
+// thing worth testing rather than assuming.
+async function blobWorkerWorks() {
+  try {
+    const url = URL.createObjectURL(new Blob(["onmessage=()=>postMessage(1)"], { type: "text/javascript" }));
+    const w = new Worker(url);
+    const ok = await new Promise(res => {
+      const t = setTimeout(() => res(false), 3000);
+      w.onmessage = () => { clearTimeout(t); res(true); };
+      w.onerror = () => { clearTimeout(t); res(false); };
+      w.postMessage(0);
+    });
+    w.terminate(); URL.revokeObjectURL(url);
+    return ok;
+  } catch { return false; }
+}
+// simd128 is not optional for this shader — without it the portable fallback is
+// slower in wasm than the scalar code it replaced.
+function simdOk() {
+  try {
+    return WebAssembly.validate(new Uint8Array([
+      0,97,115,109,1,0,0,0,1,4,1,96,0,0,3,2,1,0,10,9,1,7,0,65,0,253,15,26,11]));
+  } catch { return false; }
+}
+
+const cores = navigator.hardwareConcurrency || 0;
+const coi = self.crossOriginIsolated === true;
+const sab = typeof SharedArrayBuffer !== "undefined";
+const blobOk = await blobWorkerWorks();
+const simd = simdOk();
+
+rows('env', [
+  ["Logical cores", `<b>${cores || "unknown"}</b>`,
+    "navigator.hardwareConcurrency — the ceiling on worker fan-out."],
+  ["Blob-URL workers", mark(blobOk, blobOk ? "allowed" : "BLOCKED by CSP"),
+    blobOk ? "A single self-contained file can move work off the main thread."
+           : "This host's CSP forbids it. A separate worker .js file served same-origin still works."],
+  ["wasm simd128", mark(simd, simd ? "supported" : "missing"),
+    "The four-lane noise kernels depend on it."],
+  ["crossOriginIsolated", mark(coi ? true : null, coi ? "yes" : "no"),
+    coi ? "COOP/COEP are set, so shared-memory threads are available."
+        : "Expected on GitHub Pages — it cannot set response headers. Costs you SharedArrayBuffer, <em>not</em> workers."],
+  ["SharedArrayBuffer", mark(sab ? true : null, sab ? "available" : "unavailable"),
+    sab ? "A rayon-style shared-memory port would work here."
+        : "Only needed for shared-memory threading. Worker-per-region uses transferable buffers instead."],
+]);
+
+// --- throughput ------------------------------------------------------------
+const WORKER_SRC = `
+let w = null, buf = 0, pp = 0, NUM = 0, SZ = 0, feat = 0;
+onmessage = async (e) => {
+  const m = e.data;
+  if (m.cmd === "init") {
+    const mod = await WebAssembly.instantiate(m.bytes, {});
+    w = mod.instance.exports;
+    SZ = m.size; feat = m.feat;
+    NUM = w.num_params();
+    buf = w.alloc(SZ * SZ * 4);
+    pp = w.alloc(NUM * 4);
+    const pv = new Float32Array(w.memory.buffer, pp, NUM);
+    for (let i = 0; i < NUM; i++) pv[i] = w.param(m.type, i);
+    for (let k = 0; k < 4; k++) w.render_features(buf, SZ, m.type, 1, k * 0.1, pp, 0, 0.7, 0, feat);
+    postMessage({ ok: 1 });
+  } else if (m.cmd === "ping") {
+    postMessage({ pong: 1 });
+  } else if (m.cmd === "render") {
+    const t0 = performance.now();
+    for (let k = 0; k < m.n; k++) w.render_features(buf, SZ, m.type, 1, m.a0 + k * 0.01, pp, 0, 0.7, 0, feat);
+    postMessage({ ms: performance.now() - t0 });
+  }
+};`;
+
+const spawn = () => new Worker(URL.createObjectURL(new Blob([WORKER_SRC], { type: "text/javascript" })));
+const ask = (w, msg) => new Promise(res => { w.onmessage = e => res(e.data); w.postMessage(msg); });
+
+$('run').onclick = async () => {
+  const btn = $('run');
+  btn.disabled = true;
+  if (!blobOk) {
+    rows('perf', [["Cannot run", mark(false, "blob workers are blocked here"),
+      "Serve the worker as its own same-origin .js file and this test applies unchanged."]]);
+    btn.disabled = false;
+    return;
+  }
+  const SZ = 256, TYPE = 0, FEAT = 47 | 16 | 64 | 128 | 256 | 512; // every switch on
+  const N = Math.max(1, cores || 4);
+  const FRAMES = 12;
+  const out = [];
+
+  // 1 worker = the single-threaded baseline this demo runs today.
+  btn.textContent = "measuring 1 core…";
+  const one = spawn();
+  await ask(one, { cmd: "init", bytes, size: SZ, type: TYPE, feat: FEAT });
+  const solo = (await ask(one, { cmd: "render", n: FRAMES, a0: 1.0 })).ms / FRAMES;
+
+  // Dispatch cost: an empty round trip to every worker, which is the floor on
+  // what splitting ONE frame across them can cost per frame.
+  btn.textContent = `spawning ${N} workers…`;
+  const pool = [one];
+  for (let i = 1; i < N; i++) pool.push(spawn());
+  await Promise.all(pool.slice(1).map(w => ask(w, { cmd: "init", bytes, size: SZ, type: TYPE, feat: FEAT })));
+  let ping = 0;
+  for (let r = 0; r < 20; r++) {
+    const t0 = performance.now();
+    await Promise.all(pool.map(w => ask(w, { cmd: "ping" })));
+    ping += performance.now() - t0;
+  }
+  ping /= 20;
+
+  btn.textContent = `measuring ${N} cores…`;
+  const t0 = performance.now();
+  await Promise.all(pool.map((w, i) => ask(w, { cmd: "render", n: FRAMES, a0: 1.0 + i * 0.5 })));
+  const wall = performance.now() - t0;
+  const perFrame = wall / (FRAMES * N); // N*FRAMES frames done in `wall`
+  pool.forEach(w => w.terminate());
+
+  const speedup = solo / perFrame;
+  const eff = 100 * speedup / N;
+  out.push(["1 worker (today)", `<b>${solo.toFixed(2)} ms</b> / frame &nbsp; <b>${(1000 / solo).toFixed(0)} fps</b>`,
+    "One 256&times;256 planet, every optimization on. This is what the demo does now."]);
+  out.push([`${N} workers`, `<b>${perFrame.toFixed(2)} ms</b> / frame &nbsp; <b>${(1000 / perFrame).toFixed(0)} fps</b>`,
+    "Aggregate throughput, divided by frames completed."]);
+  out.push(["Speedup", `<b>${speedup.toFixed(2)}×</b> &nbsp; <span class="note">(${eff.toFixed(0)}% of ${N} cores)</span>` +
+    `<div class="bar"><i style="width:${Math.min(100, eff).toFixed(0)}%"></i></div>`,
+    eff > 60 ? "Worth building — band-splitting should land near this."
+             : "Below 60% suggests the cores are shared/throttled; expect less than the core count implies."]);
+  out.push(["Dispatch overhead", `<b>${ping.toFixed(2)} ms</b> per frame`,
+    `Empty round trip to all ${N} workers. Splitting one frame pays this every frame, so it has to stay well under the ${perFrame.toFixed(1)} ms above.`]);
+  const net = solo / (perFrame + ping);
+  out.push(["Realistic net", `<b>${net.toFixed(2)}×</b>`,
+    "Speedup after the dispatch cost — the number to judge the idea on."]);
+  rows('perf', out);
+  btn.textContent = "▶ measure again";
+  btn.disabled = false;
+};
+</script>

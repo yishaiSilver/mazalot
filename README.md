@@ -461,6 +461,41 @@ shader work. At the same zoom, cap 32 is 5.8 ms, cap 64 is 17.8 ms and cap 160 i
 95 ms. The shipped default of 160 buys full six-octave detail on a screen-filling
 world and costs accordingly; drop it if you want the frame back.
 
+### Is the browser using your cores?
+
+It isn't. The demos render every frame in one wasm instance on the main thread,
+so they use exactly one core however many the machine has — and that, not the
+instruction set, is the largest gap left to native. On the measurements here
+wasm runs within roughly 1.3x of native single-threaded; the generators then fan
+frames across every core with rayon and the browser does not.
+
+Two things get called multithreading on the web, and only one of them is gated:
+
+| | needs COOP/COEP headers | works on GitHub Pages |
+|---|---|---|
+| shared-memory threads (`SharedArrayBuffer`, what a rayon port compiles to) | yes | **no** — Pages cannot set response headers |
+| worker-per-region + transferable `ArrayBuffer` | no | **yes** |
+
+The shader is a pure function of pixel position, so it wants the second one:
+each worker renders a band into its own buffer and transfers it back with no
+copy. `scripts/make-parallel-probe.sh` builds a single self-contained page that
+checks the parts worth checking rather than assuming them — whether a strict CSP
+forbids blob-URL workers (the only way a one-file build gets off the main
+thread), whether `simd128` is there, and what the cores are really worth. It
+runs the actual `planet.wasm`, not a synthetic loop.
+
+Measured in this container (4 shared cores), a 256px planet with every switch on:
+
+| | ms/frame | fps |
+|---|---:|---:|
+| 1 worker — what the demos do today | 17.79 | 56 |
+| 4 workers | 6.10 | 164 |
+
+**2.9x, at 73% of four cores**, with 0.18 ms of dispatch overhead against a 6 ms
+frame — so band-splitting costs ~3% to set up, not enough to eat the win. The
+probe prints throughput and dispatch separately on purpose: throughput is the
+optimistic number, and the dispatch cost is the part it hides.
+
 ### Feature cost lab
 
 The `planet` demo carries an ablation panel: a tick-box per shader feature, and a

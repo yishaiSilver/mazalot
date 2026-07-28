@@ -251,6 +251,13 @@ Run wasm builds **from the repo root** so `.cargo/config.toml` applies. It adds
   between a microbenchmark and a real frame.
 - `cargo build --workspace` warns about a `bench` output-filename collision between
   `planet` and `solar`. Pre-existing; ignore it.
+- **The browser build is single-threaded, and that is a choice, not a limit.** A
+  wasm *instance* is one thread, but nothing stops N instances in N workers, and
+  worker-per-region needs no COOP/COEP (unlike `SharedArrayBuffer`, which
+  GitHub Pages can never provide). `scripts/make-parallel-probe.sh` measures
+  what the cores are worth on a given host before anyone writes the pool —
+  including whether its CSP allows the blob-URL workers a single-file build
+  needs. 2.9x on 4 shared cores here.
 - `scripts/make-artifact.sh <crate>` bundles a demo into one self-contained HTML
   with the wasm inlined as base64. It rebuilds the wasm unless given `--no-build`.
 - The committed `crates/*/web/*.wasm` files go stale easily. If you change a
