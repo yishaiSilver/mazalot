@@ -463,11 +463,14 @@ world and costs accordingly; drop it if you want the frame back.
 
 ### Is the browser using your cores?
 
-It isn't. The demos render every frame in one wasm instance on the main thread,
-so they use exactly one core however many the machine has — and that, not the
-instruction set, is the largest gap left to native. On the measurements here
-wasm runs within roughly 1.3x of native single-threaded; the generators then fan
-frames across every core with rayon and the browser does not.
+A wasm *instance* is one thread, so a single instance uses exactly one core
+however many the machine has — and that, not the instruction set, is the largest
+gap left to native. On the measurements here wasm runs within roughly 1.3x of
+native single-threaded; the generators then fan frames across every core with
+rayon. The `planet` and `solar` demos now fan a frame across a **worker pool**
+instead, which closes most of it; see the numbers below and the caveat in
+[WebGL2](#webgl2-the-same-shader-on-the-gpu) about what the pool does *not*
+reach.
 
 Two things get called multithreading on the web, and only one of them is gated:
 
@@ -720,6 +723,70 @@ separately (`Night-side thinning`, `Frozen cloud deck`, `Baked surface`,
 `Baked bands`, `billow (morph LUT)`) so each can be A/B'd on its own — the last
 is nested under the deck, which it needs.
 
+
+### WebGL2: the same shader on the GPU
+
+Everything above divides the frame. The worker pool splits a scene's *bodies*
+across cores, but the backdrop is full-screen serial work that scales with the
+window and the pool never touches it — and a camera following a planet
+invalidates the backdrop cache every frame, so it really is repainted. That is
+an Amdahl term, and no number of workers removes it. Moving the whole frame to
+the GPU does.
+
+The port is far cheaper than it sounds, for a reason worth stating plainly:
+
+> **`hash3` and `value_noise` are `u32` integer math.** Wrapping multiplies,
+> xors, shifts — no transcendentals, nothing a driver is free to round its own
+> way. They transliterate into GLSL ES 3.00 *exactly*, so the lattice under the
+> GPU picture is bit-identical to the lattice under the CPU one. Worley and the
+> fBm stack fall out of that for free.
+
+So there is no "port `noise-core` to the GPU" problem. What is actually rewritten
+is ~200 lines of ramps, mixes and smoothsteps, in
+`crates/planet-core/src/shader.glsl`. Everything else stays in Rust:
+`gl_uniforms()` computes the `PType` row with the slider overrides applied, the
+seed offsets, the vortex centres, this frame's moons, the key light, the colour
+ramp, the palette and the whole `Lod` octave budget, and ships them as one flat
+float array. **The type table is transported, not duplicated** — adding a planet
+type is still one row, and the GPU picks it up.
+
+The shader source lives inside `planet.wasm` (`gl_shader_ptr`/`gl_shader_len`),
+so it cannot go stale against the module it was built with and the single-file
+artifact keeps working.
+
+It runs the **live** shader — no `F_BAKED_*`. Those bakes exist to make a CPU
+afford the weather; they cost frozen storms, and in a worker pool they cost a
+private ~7.5 MB copy of the sphere maps *per instance* (60 MB at 8 workers),
+because workers cannot share memory without COOP/COEP. A GPU would rather
+evaluate the noise. So the GPU path is both faster and less frozen.
+
+**Verification.** `out/` is the regression test for the native path;
+`scripts/verify-gl.mjs` is its equivalent here. It renders both paths in headless
+Chromium and diffs them per pixel. All 26 types, 4 angles × 2 seeds, 128px:
+
+| | |
+|---|---|
+| types bit-identical to the wasm renderer | **15 of 26** |
+| worst per-type pixel disagreement | **0.09%** (`ocean`) |
+| pixels differing by more than one quantization level | **0.00%** |
+
+Every differing pixel differs by exactly one 22-level step (12/255). That is the
+signature of a value landing on the other side of a quantizer threshold, not of
+a shading bug: ANGLE is free to round `sin`, `exp`, `pow` and `sqrt` its own way,
+and a 1e-7 difference before `quant` becomes a whole level after it. The types
+that come out *exactly* equal are the ones whose shading is ramps and steps with
+no transcendental in the path — `barren`, `moon`, `lava`, `desert`, `chrome`.
+
+**What this repo cannot tell you: whether it is faster.** This container has no
+`/dev/dri`, so the only WebGL2 available is ANGLE over SwiftShader — a *software*
+rasterizer. It proves the shader is right and says nothing about GPU throughput;
+timing it would be timing the CPU. The demo's `Renderer` dropdown is there so you
+can run the A/B on hardware that has a GPU.
+
+```bash
+node scripts/verify-gl.mjs                    # 9 representative types, 96px
+node scripts/verify-gl.mjs --types all --size 128
+```
 
 ## Adding a planet type
 

@@ -391,6 +391,39 @@ fn seed_offsets(seed: u32) -> [f32; 3] {
     noise_core::seed_offsets(seed, 256.0)
 }
 
+/// The two seeded storm-cell centres, as `(x, z)` in the noise domain — `ofs` is
+/// already folded in. One definition, because the live deck, the baked map and
+/// the GL port all have to swirl the clouds around the same two points.
+fn vortex_centres(seed: u32, ofs: [f32; 3]) -> [(f32, f32); 2] {
+    [0, 1].map(|k: i32| {
+        (
+            (hash3(seed as i32, k * 7 + 1, 3) * 2.0 - 1.0) * 1.6 + ofs[0],
+            (hash3(seed as i32, k * 7 + 2, 3) * 2.0 - 1.0) * 1.6 + ofs[2],
+        )
+    })
+}
+
+/// The frame's orbiting moons as `(mx, my, radius, depth, moon seed)` in disc
+/// radii, plus how many of the two slots are real (0..=2).
+///
+/// They orbit in the margin around the disc and cross in front of / behind it at
+/// the top and bottom of a tilted orbit, which is what `depth`'s sign says.
+fn moon_ring(ct: &PType, seed: u32, angle: f32) -> ([(f32, f32, f32, f32, f32); 2], usize) {
+    let mut moons = [(0.0, 0.0, 0.0, 0.0, 0.0); 2];
+    let count = (hash3(seed as i32, 50, 1) * 2.6) as usize; // 0..2
+    for k in 0..count.min(2) {
+        let ks = k as i32 * 5;
+        let orbit = 1.16 + hash3(seed as i32, ks + 1, 2) * 0.14;
+        let tilt = 0.34 + hash3(seed as i32, ks + 2, 2) * 0.30;
+        let speed = 0.25 + hash3(seed as i32, ks + 3, 2) * 0.4;
+        let phase = hash3(seed as i32, ks + 4, 2) * TAU;
+        let mr = (0.12 + hash3(seed as i32, ks + 5, 2) * 0.09) * ct.radius_scale.max(0.6);
+        let oa = angle * speed + phase;
+        moons[k] = (oa.cos() * orbit, oa.sin() * orbit * tilt, mr, oa.sin(), k as f32 + 1.0);
+    }
+    (moons, count.min(2))
+}
+
 /// A drifting spiral cyclone (great-spot) tint on a banded world, with a calm eye.
 fn great_spot(col: Rgb, sx: f32, sy: f32, sz: f32, angle: f32, intensity: f32, lod: Lod) -> Rgb {
     let spot_lat = 0.28;
@@ -698,12 +731,7 @@ fn bake_cloud_map(ct: &PType, seed: u32, ofs: [f32; 3], lod: Lod, feat: u32, key
     let mut base_b = sized(planes == 2);
     let mut surf = if planes == 3 { vec![0u8; n * 3] } else { Vec::new() };
     // Vortex centres, hoisted: per-seed constants the live path pays per pixel.
-    let vort: [(f32, f32); 2] = [0, 1].map(|k: i32| {
-        (
-            (hash3(seed as i32, k * 7 + 1, 3) * 2.0 - 1.0) * 1.6 + ofs[0],
-            (hash3(seed as i32, k * 7 + 2, 3) * 2.0 - 1.0) * 1.6 + ofs[2],
-        )
-    });
+    let vort = vortex_centres(seed, ofs);
     for j in 0..h {
         let y = -1.0 + 2.0 * (j as f32 + 0.5) / h as f32;
         let r = (1.0 - y * y).max(0.0).sqrt();
@@ -1364,24 +1392,7 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
     const RING_SQUASH: f32 = 0.38;
 
     // Precompute orbiting moons (mx, my, radius, depth, seed).
-    let mut moons: [(f32, f32, f32, f32, f32); 2] = [(0.0, 0.0, 0.0, 0.0, 0.0); 2];
-    let mut nmoon = 0usize;
-    if style.moons {
-        let count = (hash3(seed as i32, 50, 1) * 2.6) as usize; // 0..2
-        for k in 0..count.min(2) {
-            let ks = k as i32 * 5;
-            // Orbit in the margin around the disc; moons cross in front / behind
-            // at the top and bottom of the tilted orbit.
-            let orbit = 1.16 + hash3(seed as i32, ks + 1, 2) * 0.14;
-            let tilt = 0.34 + hash3(seed as i32, ks + 2, 2) * 0.30;
-            let speed = 0.25 + hash3(seed as i32, ks + 3, 2) * 0.4;
-            let phase = hash3(seed as i32, ks + 4, 2) * TAU;
-            let mr = (0.12 + hash3(seed as i32, ks + 5, 2) * 0.09) * ct.radius_scale.max(0.6);
-            let oa = angle * speed + phase;
-            moons[k] = (oa.cos() * orbit, oa.sin() * orbit * tilt, mr, oa.sin(), k as f32 + 1.0);
-            nmoon += 1;
-        }
-    }
+    let (moons, nmoon) = if style.moons { moon_ring(ct, seed, angle) } else { (Default::default(), 0) };
 
     let lod = Lod::for_disc(rad);
     // Any one of the switches can want a map, and each owns a different set of
@@ -1404,12 +1415,7 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
     let (cs, cc) = (angle * 2.0).sin_cos();
     let morph = angle.sin() * 0.6;
     let swirl_phase = (angle * 0.6).sin() * 1.6 * ct.storm_cells;
-    let vortex: [(f32, f32); 2] = [0, 1].map(|k: i32| {
-        (
-            (hash3(seed as i32, k * 7 + 1, 3) * 2.0 - 1.0) * 1.6 + ofs[0],
-            (hash3(seed as i32, k * 7 + 2, 3) * 2.0 - 1.0) * 1.6 + ofs[2],
-        )
-    });
+    let vortex = vortex_centres(seed, ofs);
 
     // A sprite is empty off the disc and off a ringed world's ring ellipse, so a
     // row need only be walked across those. Moons orbit out in the margin, so a
@@ -1657,6 +1663,23 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// WebGL2 port
+// ---------------------------------------------------------------------------
+
+/// The uniform block and the GLSL source the browser's GPU path needs.
+///
+/// **Browser-only, and gated so that it is.** Compiling it into the native build
+/// changed nothing about what the CPU renderer computes — and still moved
+/// `out/moon_*.png` by up to 4/255 across 5% of its pixels, because another
+/// caller of `Lod::oct`/`moon_ring`/`seed_offsets` in the same LTO unit is
+/// enough to re-price their inlining and re-contract a multiply-add. The
+/// generators have no GPU, so the honest fix is for them not to carry it.
+#[cfg(any(target_arch = "wasm32", test))]
+mod gl;
+#[cfg(any(target_arch = "wasm32", test))]
+pub use gl::{gl_uniforms, GL_SHADER, GL_UNIFORMS_LEN};
 
 #[cfg(test)]
 mod cloud_tests {

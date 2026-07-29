@@ -117,6 +117,57 @@ pub extern "C" fn feat_all() -> u32 {
     planet_core::F_ALL
 }
 
+// --- WebGL2 path -----------------------------------------------------------
+//
+// The GPU renders `planet_core::GL_SHADER`; these three exports are everything
+// the JS needs to drive it. The shader travels inside the module rather than as
+// a sibling file, so the single-file artifact keeps working and the GLSL cannot
+// go stale against the wasm it was built with.
+
+/// Pointer to the GLSL ES 3.00 fragment shader in wasm memory, with
+/// [`gl_shader_len`] bytes of UTF-8 after it.
+#[no_mangle]
+pub extern "C" fn gl_shader_ptr() -> *const u8 {
+    planet_core::GL_SHADER.as_ptr()
+}
+
+/// Length of the shader source in bytes.
+#[no_mangle]
+pub extern "C" fn gl_shader_len() -> u32 {
+    planet_core::GL_SHADER.len() as u32
+}
+
+/// Number of `f32`s [`gl_uniforms`] writes — the buffer JS must allocate.
+#[no_mangle]
+pub extern "C" fn gl_uniforms_len() -> u32 {
+    planet_core::GL_UNIFORMS_LEN as u32
+}
+
+/// Fill `out_ptr` with one frame's uniforms for the WebGL2 shader. Same
+/// arguments as `render_features`, minus the pixel buffer: the type row, the
+/// seeded constants and the octave budget all come from the same Rust that the
+/// CPU path uses, so the GPU renders the type table rather than a copy of it.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gl_uniforms(
+    out_ptr: *mut f32,
+    size: u32,
+    type_idx: u32,
+    seed: u32,
+    angle: f32,
+    params_ptr: *const f32,
+    palette: u32,
+    dither: f32,
+    moons: u32,
+    features: u32,
+) {
+    let out = unsafe { slice::from_raw_parts_mut(out_ptr, planet_core::GL_UNIFORMS_LEN) };
+    let params = unsafe { slice::from_raw_parts(params_ptr, crate::NUM_PARAMS) };
+    planet_core::gl_uniforms(
+        size, type_idx as usize, seed, angle, params, dither, moons, features, palette, out,
+    );
+}
+
 /// Number of planet types (for the JS "random type" picker).
 #[no_mangle]
 pub extern "C" fn type_count() -> u32 {
