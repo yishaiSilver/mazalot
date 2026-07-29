@@ -159,6 +159,7 @@
     <div class="ctl"><label for="auto">Hold 60 fps automatically <b id="autoV">on</b></label>
       <input type="checkbox" id="auto" checked style="width:auto;accent-color:#f4b74a;cursor:pointer" /></div>
     <div class="ctl"><label>Sun detail cap <b id="sdetV">110</b></label><input type="range" id="sdet" min="16" max="176" step="8" value="110" /></div>
+    <div class="ctl"><label>Render workers <b id="poolV">—</b></label><input type="range" id="pool" min="0" max="16" step="1" value="0" /></div>
     <div class="ctl"><label for="froz">Frozen weather <b id="frozV">on</b></label>
       <input type="checkbox" id="froz" checked style="width:auto;accent-color:#f4b74a;cursor:pointer" /></div>
 
@@ -189,6 +190,111 @@ const off = document.createElement("canvas");
 const octx = off.getContext("2d");
 
 let wasm, sys = 0, bufPtr = 0, bufLen = 0, posPtr = 0, imgData;
+
+// --- worker pool ------------------------------------------------------------
+// The backdrop stays on the main thread — it is a small share of a zoomed-in
+// frame. The BODIES fan out: each worker gets its own `System` and shades a
+// horizontal band, drawn over that band's rows of the backdrop. Bands are
+// bit-identical to the whole frame (`banded_bodies_match_whole_scene` pins it
+// in Rust), so this is exact, not an approximation.
+//
+// Transferable ArrayBuffers, never SharedArrayBuffer: shared memory needs
+// COOP/COEP headers that a static host cannot set. This needs neither.
+const SOLAR_WORKER = `
+let w = null, sys = 0, buf = 0, cap = 0;
+onmessage = async (e) => {
+  const m = e.data;
+  if (m.cmd === "init") {
+    w = (await WebAssembly.instantiate(m.bytes, {})).instance.exports;
+    postMessage({ ready: 1 });
+  } else if (m.cmd === "sys") {
+    if (sys) w.system_free(sys);
+    sys = w.system_new_params(m.seed, m.count);
+    w.system_set_view(sys, ...m.view);
+    w.system_set_orbit_width(sys, m.orbitW);
+    w.system_set_eccentricity(sys, m.ecc);
+    w.system_set_frozen_clouds(sys, m.frozen);
+    postMessage({ ready: 1 });
+  } else if (m.cmd === "band") {
+    const need = m.rows.byteLength;
+    if (need > cap) { if (buf) w.dealloc(buf, cap); buf = w.alloc(need); cap = need; }
+    new Uint8Array(w.memory.buffer, buf, need).set(new Uint8Array(m.rows));
+    w.render_bodies_band(sys, buf, m.w, m.h, m.cx, m.cy, m.zoom, m.tO, m.tS, m.tU, m.y0, m.y1);
+    const rows = new Uint8Array(w.memory.buffer, buf, need).slice();
+    postMessage({ y0: m.y0, rows: rows.buffer }, [rows.buffer]);
+  }
+};`;
+
+const pool = { workers: [] };
+let poolWant = 0, wasmBytes = null;
+
+const askWorker = (w, msg, xfer) => new Promise((res, rej) => {
+  const entry = { res, rej };
+  (w.__pending ||= []).push(entry);
+  w.onmessage = e => { w.__pending = (w.__pending || []).filter(x => x !== entry); res(e.data); };
+  w.postMessage(msg, xfer || []);
+});
+
+// Serialized, and it settles whatever is in flight: a terminated worker never
+// fires `onmessage`, so an awaiting frame would hang and the demo would freeze.
+let resizeChain = Promise.resolve();
+function queueResize(n) {
+  resizeChain = resizeChain.then(() => poolResize(n), () => poolResize(n));
+  return resizeChain;
+}
+async function poolResize(n) {
+  n = Math.max(0, Math.min(32, n | 0));
+  for (const w of pool.workers) {
+    for (const e of w.__pending || []) e.rej(new Error("pool resized"));
+    w.__pending = [];
+    w.terminate();
+  }
+  pool.workers = [];
+  if (n === 0 || !wasmBytes) return;
+  const url = URL.createObjectURL(new Blob([SOLAR_WORKER], { type: "text/javascript" }));
+  const ws = Array.from({ length: n }, () => new Worker(url));
+  URL.revokeObjectURL(url);
+  await Promise.all(ws.map(w => new Promise((res, rej) => {
+    w.onerror = () => rej(new Error("worker failed — a CSP may forbid blob: workers"));
+    w.onmessage = () => res();
+    w.postMessage({ cmd: "init", bytes: wasmBytes });
+  })));
+  pool.workers = ws;
+}
+
+// Everything a worker's System has to match. Used as its own epoch, so a worker
+// re-syncs exactly when something it depends on moved — tracked PER WORKER,
+// because a pool-wide flag races a resize (that bug froze the planet demo).
+function sysCfg() {
+  return {
+    seed, count: countAuto ? 0 : planetCount,
+    view: [vSpacing, vPsize, vSsize, vPpix, vSpix, autoDetail ? effDetail : vPdetail, vSdetail, vStarDen, vStarPar],
+    orbitW: vOrbitW, ecc: vEcc, frozen: $("froz").checked ? 1 : 0,
+  };
+}
+
+/// Backdrop on this thread, bodies across the pool, stitched into `imgData`.
+async function renderPooled(w, h, cam, zoomArg, bgPanX, bgPanY, tOrbit, tSpin, tSun) {
+  wasm.render_backdrop(sys, bufPtr, w, h, cam.x, cam.y, zoomArg, bgPanX, bgPanY);
+  const full = new Uint8Array(wasm.memory.buffer, bufPtr, w * h * 4);
+  const cfg = sysCfg(), key = JSON.stringify(cfg);
+  const stale = pool.workers.filter(k => k.__key !== key);
+  if (stale.length) {
+    await Promise.all(stale.map(k =>
+      askWorker(k, { cmd: "sys", ...cfg }).then(() => { k.__key = key; })));
+  }
+  const n = pool.workers.length, step = Math.ceil(h / n), jobs = [];
+  for (let i = 0; i < n; i++) {
+    const y0 = i * step, y1 = Math.min(h, (i + 1) * step);
+    if (y0 >= y1) continue;
+    const rows = full.slice(y0 * w * 4, y1 * w * 4).buffer;
+    jobs.push(askWorker(pool.workers[i], {
+      cmd: "band", w, h, y0, y1, cx: cam.x, cy: cam.y, zoom: zoomArg,
+      tO: tOrbit, tS: tSpin, tU: tSun, rows,
+    }, [rows]));
+  }
+  for (const r of await Promise.all(jobs)) imgData.data.set(new Uint8Array(r.rows), r.y0 * w * 4);
+}
 // Two INDEPENDENT quantities:
 //   • cam.zoom = MAGNIFICATION — display (CSS) px per world unit; wheel / pinch /
 //     fit change it. Bigger = a closer camera: things look larger AND resolve
@@ -313,7 +419,8 @@ function generate(s) {
   fitView();
 }
 
-function frame(now) {
+let inFlight = false;
+async function frame(now) {
   const frameStart = performance.now();
   const dt = Math.min(0.05, (now - last) / 1000); last = now;
   tOrbit += dt * orbitSpeed;
@@ -351,10 +458,30 @@ function frame(now) {
 
   // Time the actual WASM procedural render — the CPU cost the profiling targets.
   const r0 = performance.now();
-  wasm.render_t(sys, bufPtr, w, h, cam.x, cam.y, zoomArg, bgPanX, bgPanY, tOrbit, tSpin, tSun);
+  if (pool.workers.length > 0) {
+    if (inFlight) { requestAnimationFrame(frame); return; }
+    inFlight = true;
+    try {
+      await renderPooled(w, h, cam, zoomArg, bgPanX, bgPanY, tOrbit, tSpin, tSun);
+    } catch (e) {
+      // Resized mid-frame is benign; anything else drops the pool rather than
+      // leaving the demo stuck on a stale picture.
+      if (!/resized/.test(String(e && e.message))) {
+        $("poolV").textContent = "unavailable";
+        queueResize(0);
+        poolWant = 0;
+      }
+      inFlight = false;
+      requestAnimationFrame(frame);
+      return;
+    } finally {
+      inFlight = false;
+    }
+  } else {
+    wasm.render_t(sys, bufPtr, w, h, cam.x, cam.y, zoomArg, bgPanX, bgPanY, tOrbit, tSpin, tSun);
+    imgData.data.set(new Uint8Array(wasm.memory.buffer, bufPtr, w * h * 4));
+  }
   const renderMs = performance.now() - r0;
-  const view = new Uint8Array(wasm.memory.buffer, bufPtr, w * h * 4);
-  imgData.data.set(view);
   octx.putImageData(imgData, 0, 0);
   // Crisp upscale of the small render buffer to the full display (no smoothing).
   ctx.drawImage(off, 0, 0, w, h, 0, 0, canvas.width, canvas.height);
@@ -552,6 +679,17 @@ $("ecc").addEventListener("input", () => {
 // pixel instead of evaluating ~14 noise octaves there every frame. ~2x on a
 // planet that fills the view. Off restores the billowing and the churning storm
 // cells — zoom into a cloudy world and toggle it to see both halves of the deal.
+const poolLabel = () => (pool.workers.length === 0 ? "off (main thread)" : String(pool.workers.length));
+$("pool").addEventListener("input", () => {
+  const n = parseInt($("pool").value);
+  $("poolV").textContent = n === 0 ? "off (main thread)" : `${n}…`;
+});
+$("pool").addEventListener("change", async () => {
+  await queueResize(parseInt($("pool").value));
+  poolWant = pool.workers.length;
+  $("poolV").textContent = poolLabel();
+});
+
 $("froz").addEventListener("change", () => {
   const on = $("froz").checked;
   $("frozV").textContent = on ? "on" : "off";
@@ -579,7 +717,8 @@ window.addEventListener("resize", setupCanvas);
 
 async function main() {
   const res = await fetch("./solar.wasm?v=" + Date.now(), { cache: "no-store" });
-  const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
+  wasmBytes = await res.arrayBuffer();
+  const { instance } = await WebAssembly.instantiate(wasmBytes, {});
   wasm = instance.exports;
   posPtr = wasm.alloc(2 * 4);              // scratch for planet_pos
   // Sized to the budget once (+ margin to absorb rounding in computeRender, so
@@ -588,6 +727,12 @@ async function main() {
   bufPtr = wasm.alloc(bufLen);
   setupCanvas();
   generate(7);
+  // Default off: the pool is a real win only once a body fills the view, and the
+  // sweep in `scripts/parallel-probe.template.html` is how to pick the size.
+  poolWant = 0;
+  $("pool").value = String(poolWant);
+  $("poolV").textContent = poolLabel();
+
   requestAnimationFrame(frame);
 }
 main().catch(e => { $("err").style.display = "grid"; $("err").textContent = "failed to load solar.wasm — " + e; console.error(e); });
