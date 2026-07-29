@@ -76,6 +76,10 @@ if i == -1:
 html = html[i:]
 for tag in ("</head>", "<body>", "</body>", "</html>"):
     html = html.replace(tag, "")
+# A demo may carry its own <link rel="icon"> to stop a self-hosted page asking
+# for /favicon.ico. Inside an artifact the host supplies the tab icon, and a
+# later <link> in the body would blank it — so drop those.
+html = re.sub(r'\n?[ \t]*<link[^>]*rel="icon"[^>]*>', "", html)
 
 # Inline the wasm blob at the top of the module script, then instantiate from it
 # instead of fetching a sibling file (sandboxed hosts block cross-file fetches).
