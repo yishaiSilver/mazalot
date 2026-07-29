@@ -70,6 +70,7 @@
   .grp { font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: #565d78;
     margin: 15px 0 8px; border-top: 1px solid rgba(255,255,255,.07); padding-top: 11px; }
   .ctl { margin: 0 0 10px; }
+  .ctl.dim { opacity: .38; pointer-events: none; }
   .ctl label { display: flex; justify-content: space-between; font-size: 12px; color: #9aa0bb; margin-bottom: 4px; }
   .ctl label b { color: #eef1f8; font-variant-numeric: tabular-nums; font-weight: 600; }
   input[type=number] { width: 100%; box-sizing: border-box; padding: 8px 9px; font: inherit; font-size: 13px;
@@ -159,8 +160,15 @@
     <div class="ctl"><label for="auto">Hold 60 fps automatically <b id="autoV">on</b></label>
       <input type="checkbox" id="auto" checked style="width:auto;accent-color:#f4b74a;cursor:pointer" /></div>
     <div class="ctl"><label>Sun detail cap <b id="sdetV">110</b></label><input type="range" id="sdet" min="16" max="176" step="8" value="110" /></div>
-    <div class="ctl"><label>Render workers <b id="poolV">—</b></label><input type="range" id="pool" min="0" max="16" step="1" value="0" /></div>
-    <div class="ctl"><label for="froz">Frozen weather <b id="frozV">on</b></label>
+    <div class="ctl" id="rendctl"><label>Renderer</label>
+      <select id="renderer" style="width:100%;box-sizing:border-box;padding:6px 8px;font:inherit;font-size:12px;color:#eef1f8;background:#0e0f18;border:1px solid rgba(255,255,255,.12);border-radius:6px">
+        <option value="wasm">WebAssembly (CPU)</option>
+        <option value="gl">WebGL2 (GPU)</option>
+      </select>
+      <div id="glnote" style="font-size:11px;line-height:1.45;color:#6b7290;margin-top:5px"></div>
+    </div>
+    <div class="ctl" id="poolctl"><label>Render workers <b id="poolV">—</b></label><input type="range" id="pool" min="0" max="16" step="1" value="0" /></div>
+    <div class="ctl" id="frozctl"><label for="froz">Frozen weather <b id="frozV">on</b></label>
       <input type="checkbox" id="froz" checked style="width:auto;accent-color:#f4b74a;cursor:pointer" /></div>
 
     <div class="grp">Background</div>
@@ -295,6 +303,202 @@ async function renderPooled(w, h, cam, zoomArg, bgPanX, bgPanY, tOrbit, tSpin, t
   }
   for (const r of await Promise.all(jobs)) imgData.data.set(new Uint8Array(r.rows), r.y0 * w * 4);
 }
+// --- WebGL2 scene renderer --------------------------------------------------
+// The same scene, drawn by the rasterizer instead of by a compositor. Three
+// passes: one fullscreen triangle for the backdrop, the dashed orbit paths as
+// point sprites, then one quad per body back-to-front with alpha blending —
+// which is painter's algorithm, i.e. exactly what `blit` was doing by hand.
+//
+// Rust still owns the scene. `gl_bodies` hands over a draw list whose every
+// number comes from the same expressions `draw_bodies_band` uses (`Planet::at`,
+// `to_screen`, `dest_rect`, the detail caps, the sunward light), and each record
+// carries that shader's uniform block; the GLSL travels inside solar.wasm. So
+// the archetype tables, the orbital mechanics and the octave budgets are
+// transported, not duplicated.
+//
+// What disappears here is everything the CPU path had to cache. No backdrop
+// sprite, no star-tile memo, no quantized boil clock, no `visible_tile_rect` —
+// and, crucially, no per-frame pixel plumbing: nothing is read back, so the
+// ~32 MB/frame of copies that the worker pool could never divide is simply gone.
+const VS_FULL = `#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+// A body's quad, straight from the destination rect the compositor computed.
+const VS_QUAD = `#version 300 es
+uniform vec4 u_rect;   // x0, y0, w, h in screen px, top-down
+uniform vec2 u_view;
+void main() {
+  vec2 c = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));
+  vec2 p = u_rect.xy + c * u_rect.zw;
+  gl_Position = vec4(p.x / u_view.x * 2.0 - 1.0, 1.0 - p.y / u_view.y * 2.0, 0.0, 1.0);
+}`;
+
+// One orbit dot. Positions come up from Rust already in screen px, so Kepler's
+// equation stays in `Planet::plane_point` and is not restated here.
+const VS_POINT = `#version 300 es
+layout(location = 0) in vec2 a_pos;   // pinned: the VAO enables attribute 0
+uniform vec2 u_view;
+uniform float u_size;
+void main() {
+  gl_PointSize = u_size;
+  gl_Position = vec4(a_pos.x / u_view.x * 2.0 - 1.0, 1.0 - a_pos.y / u_view.y * 2.0, 0.0, 1.0);
+}`;
+
+// `paint_orbit` adds a faint blue-grey and clamps at (90, 96, 120). Plain
+// additive blending saturates at 1.0 instead, which differs only where dots
+// overlap over an already-bright pixel — the navy ground is nowhere near it.
+const FS_POINT = `#version 300 es
+precision highp float;
+out vec4 fragColor;
+void main() { fragColor = vec4(26.0 / 255.0, 30.0 / 255.0, 40.0 / 255.0, 1.0); }`;
+
+const glc = document.createElement("canvas");
+let gl = null, renderer = "wasm";
+let progBg, progStar, progPlanet, progOrbit, orbitVBO, orbitVAO;
+let glBgPtr, glOrbPtr, glBodyPtr, bgLen, bodyStride, bodyHeader, maxBodies, orbCap, glFeat;
+
+function glCompile(type, src, what) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    throw new Error(`${what}: ${gl.getShaderInfoLog(sh)}`);
+  }
+  return sh;
+}
+
+function glLink(vs, fs, what, unis) {
+  const p = gl.createProgram();
+  gl.attachShader(p, glCompile(gl.VERTEX_SHADER, vs, `${what} vertex`));
+  gl.attachShader(p, glCompile(gl.FRAGMENT_SHADER, fs, `${what} fragment`));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(`${what} link: ${gl.getProgramInfoLog(p)}`);
+  p.loc = {};
+  for (const u of unis) p.loc[u] = gl.getUniformLocation(p, u);
+  return p;
+}
+
+/// Read GLSL source `i` out of wasm memory. A complete fragment shader is the
+/// two preludes (noise + dither, index 0 and 1) followed by one body.
+function glSrc(i) {
+  return new TextDecoder().decode(
+    new Uint8Array(wasm.memory.buffer, wasm.gl_src_ptr(i), wasm.gl_src_len(i)));
+}
+
+function glInit() {
+  if (gl) return gl;
+  gl = glc.getContext("webgl2", {
+    alpha: false, antialias: false, depth: false, stencil: false,
+    premultipliedAlpha: false, preserveDrawingBuffer: true, desynchronized: true,
+  });
+  if (!gl) return null;
+  const pre = glSrc(0) + glSrc(1);
+  progBg = glLink(VS_FULL, pre + glSrc(2), "backdrop", ["B", "u_skySalt", "u_vh"]);
+  progStar = glLink(VS_QUAD, pre + glSrc(3), "star", ["S", "u_size", "u_vh", "u_rect", "u_view"]);
+  progPlanet = glLink(VS_QUAD, pre + glSrc(4), "planet",
+    ["U", "u_seed", "u_feat", "u_size", "u_vh", "u_palette", "u_rect", "u_view"]);
+  progOrbit = glLink(VS_POINT, FS_POINT, "orbit", ["u_view", "u_size"]);
+
+  bgLen = wasm.gl_backdrop_len();
+  bodyStride = wasm.gl_body_stride();
+  bodyHeader = wasm.gl_body_header();
+  maxBodies = wasm.gl_max_bodies();
+  orbCap = 16 * 220;                        // the planet cap x `paint_orbit`'s steps
+  glBgPtr = wasm.alloc(bgLen * 4);
+  glOrbPtr = wasm.alloc(orbCap * 2 * 4);
+  glBodyPtr = wasm.alloc(maxBodies * bodyStride * 4);
+
+  glFeat = wasm.gl_feat();
+  orbitVAO = gl.createVertexArray();
+  orbitVBO = gl.createBuffer();
+  gl.bindVertexArray(orbitVAO);
+  gl.bindBuffer(gl.ARRAY_BUFFER, orbitVBO);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  return gl;
+}
+
+/// One GPU frame. `finish()` before returning, so the caller's clock measures
+/// the draw rather than the time it took to queue it.
+function renderGLScene(w, h, cam, zoomArg, bgPanX, bgPanY, tOrbit, tSpin, tSun) {
+  if (glc.width !== w || glc.height !== h) { glc.width = w; glc.height = h; }
+  gl.viewport(0, 0, w, h);
+  gl.disable(gl.BLEND);
+
+  // 1 — backdrop. This is the pass the worker pool never reached: full-frame,
+  // serial on the CPU, and re-painted every frame whenever the camera follows a
+  // body. Here it is one triangle.
+  const salt = wasm.gl_backdrop(sys, glBgPtr, cam.x, cam.y, zoomArg, bgPanX, bgPanY);
+  gl.useProgram(progBg);
+  gl.uniform1fv(progBg.loc.B, new Float32Array(wasm.memory.buffer, glBgPtr, bgLen));
+  gl.uniform1i(progBg.loc.u_skySalt, salt);
+  gl.uniform1i(progBg.loc.u_vh, h);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  // 2 — the dashed orbit paths, as point sprites over an additive blend.
+  const nPts = wasm.gl_orbit_points(sys, glOrbPtr, orbCap, w, h, cam.x, cam.y, zoomArg);
+  if (nPts > 0) {
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.bindVertexArray(orbitVAO);
+    gl.bindBuffer(gl.ARRAY_BUFFER, orbitVBO);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(wasm.memory.buffer, glOrbPtr, nPts * 2), gl.DYNAMIC_DRAW);
+    gl.useProgram(progOrbit);
+    gl.uniform2f(progOrbit.loc.u_view, w, h);
+    gl.uniform1f(progOrbit.loc.u_size, wasm.gl_orbit_width(sys));
+    gl.drawArrays(gl.POINTS, 0, nPts);
+    gl.bindVertexArray(null);
+  }
+
+  // 3 — the bodies, back to front. Alpha over is the painter's algorithm `blit`
+  // implemented by hand, so the depth sort reads the same.
+  const n = wasm.gl_bodies(sys, glBodyPtr, w, h, cam.x, cam.y, zoomArg, tOrbit, tSpin, tSun);
+  if (n > 0) {
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    const recs = new Float32Array(wasm.memory.buffer, glBodyPtr, n * bodyStride);
+    for (let i = 0; i < n; i++) {
+      const r = i * bodyStride;
+      const isStar = recs[r] === 0;
+      const p = isStar ? progStar : progPlanet;
+      const uni = recs.subarray(r + bodyHeader, r + bodyStride);
+      gl.useProgram(p);
+      gl.uniform4f(p.loc.u_rect, recs[r + 1], recs[r + 2], recs[r + 3], recs[r + 3]);
+      gl.uniform2f(p.loc.u_view, w, h);
+      gl.uniform1i(p.loc.u_size, recs[r + 4] | 0);
+      gl.uniform1i(p.loc.u_vh, h);
+      if (isStar) {
+        gl.uniform1fv(p.loc.S, uni.subarray(0, 32));
+      } else {
+        gl.uniform1fv(p.loc.U, uni);
+        // `u_seed` only feeds the hero framing's starfield, which a tile never
+        // reaches — the body's own seed is already folded into `U`.
+        gl.uniform1ui(p.loc.u_seed, 0);
+        gl.uniform1ui(p.loc.u_feat, glFeat);
+        gl.uniform1i(p.loc.u_palette, 0);
+      }
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+  }
+  gl.finish();
+}
+
+/// Grey out what the GPU path does not have: the worker pool splits a CPU frame
+/// into bands, and the sphere-map bakes are a CPU optimization the live shader
+/// does not read.
+function syncRendererUI() {
+  const isGL = renderer === "gl";
+  $("poolctl").classList.toggle("dim", isGL);
+  $("frozctl").classList.toggle("dim", isGL);
+  $("glnote").textContent = isGL
+    ? "Whole scene on the GPU — no backdrop cache, no tile blits, and nothing read back."
+    : "";
+}
+
 // Two INDEPENDENT quantities:
 //   • cam.zoom = MAGNIFICATION — display (CSS) px per world unit; wheel / pinch /
 //     fit change it. Bigger = a closer camera: things look larger AND resolve
@@ -447,6 +651,7 @@ async function frame(now) {
     curW = w; curH = h;
     off.width = w; off.height = h;
     imgData = octx.createImageData(w, h);
+    if (gl) { glc.width = w; glc.height = h; }
   }
   curZoom = zoomArg;
   // Does this frame reuse the cached backdrop? Mirror the Rust bg cache key: if
@@ -458,7 +663,9 @@ async function frame(now) {
 
   // Time the actual WASM procedural render — the CPU cost the profiling targets.
   const r0 = performance.now();
-  if (pool.workers.length > 0) {
+  if (renderer === "gl") {
+    renderGLScene(w, h, cam, zoomArg, bgPanX, bgPanY, tOrbit, tSpin, tSun);
+  } else if (pool.workers.length > 0) {
     if (inFlight) { requestAnimationFrame(frame); return; }
     inFlight = true;
     try {
@@ -482,9 +689,11 @@ async function frame(now) {
     imgData.data.set(new Uint8Array(wasm.memory.buffer, bufPtr, w * h * 4));
   }
   const renderMs = performance.now() - r0;
-  octx.putImageData(imgData, 0, 0);
-  // Crisp upscale of the small render buffer to the full display (no smoothing).
-  ctx.drawImage(off, 0, 0, w, h, 0, 0, canvas.width, canvas.height);
+  // Both paths end with the same crisp upscale onto the display canvas, so the
+  // timer above is the render and nothing else. The GPU path has nothing to put
+  // back: it drew straight into `glc`.
+  if (renderer !== "gl") octx.putImageData(imgData, 0, 0);
+  ctx.drawImage(renderer === "gl" ? glc : off, 0, 0, w, h, 0, 0, canvas.width, canvas.height);
 
   // HUD: what's under the crosshair (viewport centre)?
   const near = follow >= 0 ? follow : wasm.nearest_center(sys, w, h, cam.x, cam.y, zoomArg, tOrbit);
@@ -690,6 +899,27 @@ $("pool").addEventListener("change", async () => {
   $("poolV").textContent = poolLabel();
 });
 
+// WebGL2 is opt-in: probed on selection, not at load, so a machine without it
+// never pays for a failed context. Switching to it drops the worker pool, which
+// exists only to divide the CPU frame.
+$("renderer").addEventListener("change", async () => {
+  const want = $("renderer").value;
+  if (want === "gl") {
+    try {
+      if (!glInit()) throw new Error("this browser has no WebGL2 context");
+    } catch (e) {
+      $("renderer").value = "wasm";
+      $("glnote").textContent = String(e.message || e);
+      return;
+    }
+    await queueResize(0);
+    $("pool").value = "0";
+    $("poolV").textContent = poolLabel();
+  }
+  renderer = want;
+  syncRendererUI();
+});
+
 $("froz").addEventListener("change", () => {
   const on = $("froz").checked;
   $("frozV").textContent = on ? "on" : "off";
@@ -733,6 +963,7 @@ async function main() {
   $("pool").value = String(poolWant);
   $("poolV").textContent = poolLabel();
 
+  syncRendererUI();
   requestAnimationFrame(frame);
 }
 main().catch(e => { $("err").style.display = "grid"; $("err").textContent = "failed to load solar.wasm — " + e; console.error(e); });

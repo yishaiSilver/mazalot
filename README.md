@@ -770,12 +770,45 @@ Chromium and diffs them per pixel. All 26 types, 4 angles × 2 seeds, 128px:
 | worst per-type pixel disagreement | **0.09%** (`ocean`) |
 | pixels differing by more than one quantization level | **0.00%** |
 
+`--demo solar` diffs whole scenes the same way, at three zooms (fit, mid, and
+zoomed onto a body), and also lands at **0.00%** past a level. Its raw
+disagreement rate is much higher — 17–30% of pixels — and that is the nebula
+rather than the bodies: at a zoom where the clouds have faded out, the backdrop
+is **byte-exact**. The GPU evaluates the cloud fBm per *pixel* (quantized to the
+same 8x8 lattice) where the CPU bakes it per *cell*, so the two round differently
+right at the density threshold. Nothing is wrong with the picture; the numbers
+just are not the same numbers. See below for the version of that which would also
+be faster.
+
 Every differing pixel differs by exactly one 22-level step (12/255). That is the
 signature of a value landing on the other side of a quantizer threshold, not of
 a shading bug: ANGLE is free to round `sin`, `exp`, `pow` and `sqrt` its own way,
 and a 1e-7 difference before `quant` becomes a whole level after it. The types
 that come out *exactly* equal are the ones whose shading is ramps and steps with
 no transcendental in the path — `barren`, `moon`, `lava`, `desert`, `chrome`.
+
+**The whole scene, not just a disc.** `solar` renders on the GPU in three passes
+— one fullscreen triangle for the backdrop, the dashed orbit paths as point
+sprites, then one quad per body back-to-front with alpha blending, which *is*
+the painter's algorithm `blit` was implementing by hand. Rust still owns the
+scene: `gl_bodies()` hands over a draw list whose every number comes from the
+same expressions `draw_bodies_band` uses (`Planet::at`, `to_screen`,
+`dest_rect`, the detail caps, the sunward light), and each record carries that
+shader's uniform block.
+
+Everything the CPU path had to cache is simply absent:
+
+| CPU | GPU |
+|---|---|
+| `BackdropCache` — a scrolling ground/nebula sprite, memmoved on a pan | one triangle; a camera that follows a body costs the same as a still one |
+| `SunCache` + a quantized boil clock, so a costly tile bake can be reused | no bake, so `t_sun` passes straight through and the convection stops stepping |
+| `visible_tile_rect`, hand-arranging which tile pixels get shaded | the rasterizer clips the quad |
+| ~32 MB/frame of copies: band slices, worker transfers, `putImageData` | nothing is read back |
+
+The per-body pixelation knobs still work, and exactly: the fragment shader maps
+its destination pixel back through the *same* expression `blit` uses, so a body
+is blocky in the places `planet_pixel` and the detail cap make it blocky, with no
+second render target.
 
 **What this repo cannot tell you: whether it is faster.** This container has no
 `/dev/dri`, so the only WebGL2 available is ANGLE over SwiftShader — a *software*
@@ -784,9 +817,20 @@ timing it would be timing the CPU. The demo's `Renderer` dropdown is there so yo
 can run the A/B on hardware that has a GPU.
 
 ```bash
-node scripts/verify-gl.mjs                    # 9 representative types, 96px
-node scripts/verify-gl.mjs --types all --size 128
+node scripts/verify-gl.mjs                       # planet, 9 types, 96px
+node scripts/verify-gl.mjs --demo all --types all
+node scripts/verify-gl.mjs --demo solar --size 240
 ```
+
+**The one lever left, and it is the CPU's own trick.** The nebula is the only
+place where the GPU does *more* work than the CPU: `BackdropCache` bakes one fBm
+sample per 8x8 cell and scrolls the sprite, so a pan repaints a sliver; the
+fragment shader recomputes that same per-cell value at every pixel, which is 64x
+the noise evaluations. It is cheap enough not to matter at these sizes, but if
+the backdrop turns out to be the GPU's bottleneck on real hardware, the fix is to
+port the sprite rather than to thin the shader: render the cell field into a
+low-res texture, scroll it with a blit, repaint only the exposed strip, and let
+hardware sampling do the rest. That is the same idea, one level down.
 
 ## Adding a planet type
 

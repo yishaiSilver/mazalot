@@ -1676,10 +1676,10 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
 /// caller of `Lod::oct`/`moon_ring`/`seed_offsets` in the same LTO unit is
 /// enough to re-price their inlining and re-contract a multiply-add. The
 /// generators have no GPU, so the honest fix is for them not to carry it.
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(any(feature = "gl", test))]
 mod gl;
-#[cfg(any(target_arch = "wasm32", test))]
-pub use gl::{gl_uniforms, GL_SHADER, GL_UNIFORMS_LEN};
+#[cfg(any(feature = "gl", test))]
+pub use gl::{gl_tile_uniforms, gl_uniforms, GL_SHADER, GL_SOURCES, GL_UNIFORMS_LEN};
 
 #[cfg(test)]
 mod cloud_tests {

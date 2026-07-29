@@ -27,6 +27,12 @@ image = { version = "0.25", default-features = false, features = ["png", "gif"],
 rand = { version = "0.8", optional = true }
 rand_chacha = { version = "0.3", optional = true }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The GPU path is a browser feature: switch on each core crate's `gl`
+# module for the wasm build only, so the native generators keep the exact
+# float codegen `out/` is pinned against.
+planet-core = { path = "../planet-core", features = ["gl"] }
+
 [features]
 default = ["native"]
 native = ["dep:image", "dep:rand", "dep:rand_chacha", "dep:render-io"]

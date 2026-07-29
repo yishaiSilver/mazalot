@@ -23,13 +23,17 @@ use super::*;
 // of sphere maps per instance.
 
 /// Length of the array [`gl_uniforms`] fills, in `f32`s.
-pub const GL_UNIFORMS_LEN: usize = 152;
+pub const GL_UNIFORMS_LEN: usize = 160;
 
 // Slot indices. These MUST match the `U_*` defines at the top of `shader.glsl`
 // — the pairing IS the wire format, and nothing but `verify-gl.mjs` checks it.
+// Some are read only by the tests that pin that pairing; they are the wire
+// format either way, so they stay named rather than being inlined.
 const GL_U_BASE: usize = 0;
+#[allow(dead_code)]
 const GL_U_RAD: usize = 22;
 const GL_U_ATMO: usize = 32;
+#[allow(dead_code)]
 const GL_U_OFS: usize = 53;
 const GL_U_L: usize = 56;
 const GL_U_VORTEX: usize = 59;
@@ -38,10 +42,22 @@ const GL_U_STOPS: usize = 73;
 const GL_U_OCT: usize = 101;
 const GL_U_PAL_LEN: usize = 131;
 const GL_U_PAL: usize = 132;
+const GL_U_SPRITE: usize = 147;
+const GL_U_TILE_X0: usize = 148;
+const GL_U_TILE_INV: usize = 150;
 
-/// The GLSL ES 3.00 fragment shader, so the browser gets it from the same module
-/// that renders the planets rather than from a file that can go stale.
+/// The GLSL ES 3.00 fragment shader body, so the browser gets it from the same
+/// module that renders the planets rather than from a file that can go stale.
+///
+/// Not a complete program: it is concatenated after `noise_core::GL_PRELUDE` and
+/// `dither_core::GL_PRELUDE`, which carry the `#version` line and the lattice
+/// kernels. See [`GL_SOURCES`].
 pub const GL_SHADER: &str = include_str!("shader.glsl");
+
+/// The three sources a caller concatenates, in order, to get a complete planet
+/// fragment shader. Exposed as a list so the browser never has to know which
+/// crates the prelude comes from.
+pub const GL_SOURCES: &[&str] = &[noise_core::GL_PRELUDE, dither_core::GL_PRELUDE, GL_SHADER];
 
 /// The octave count of every fBm field in the shader, in the order the GLSL
 /// indexes them (see `O_*` in `shader.glsl`). Derived rather than listed, so a
@@ -74,35 +90,31 @@ fn gl_octaves(ct: &PType, lod: Lod, feat: u32, out: &mut [f32]) {
 }
 
 /// Fill `out` (at least [`GL_UNIFORMS_LEN`] long) with everything `shader.glsl`
-/// needs for one frame — the type row with the caller's slider overrides applied,
-/// the seeded offsets and vortex centres, this frame's moons and trig, the
-/// colour ramp, the palette, and the `Lod` octave budget.
+/// needs to shade one body: the type row, the seeded offsets and vortex centres,
+/// this frame's moons and trig, the colour ramp, the palette, and the `Lod`
+/// octave budget.
 ///
-/// Arguments mirror [`render_rgba_features`]. `seed`, `features` and `palette`
-/// go to the shader as their own scalar uniforms and are not in this array;
-/// `seed` because a `u32` does not survive an `f32`.
+/// Shared by both framings so they cannot disagree about what a planet is.
+/// `seed`, `features` and `palette` also go to the shader as their own scalar
+/// uniforms — `seed` because a `u32` does not survive an `f32`.
 #[allow(clippy::too_many_arguments)]
-pub fn gl_uniforms(
-    size: u32,
-    type_idx: usize,
+fn fill(
+    ct: &PType,
     seed: u32,
     angle: f32,
-    p: &[f32],
+    rad: f32,
+    light: [f32; 3],
     dither: f32,
     moons: u32,
     features: u32,
     palette: u32,
     out: &mut [f32],
 ) {
-    let ct = ct_with_params(type_idx, p);
     let ofs = seed_offsets(seed);
-    // Same expression as `render_ct_band`, so the disc lands where the CPU path
-    // puts it — and `Lod` reads the same radius.
-    let rad = (size as f32 * 24.0 / 64.0) * ct.radius_scale;
     let lod = Lod::for_disc(rad);
     let (sina, cosa) = angle.sin_cos();
     let (cs, cc) = (angle * 2.0).sin_cos();
-    let (mn, nmoon) = if moons != 0 { moon_ring(&ct, seed, angle) } else { (Default::default(), 0) };
+    let (mn, nmoon) = if moons != 0 { moon_ring(ct, seed, angle) } else { (Default::default(), 0) };
     let vortex = vortex_centres(seed, ofs);
 
     out[..GL_UNIFORMS_LEN].fill(0.0);
@@ -150,7 +162,7 @@ pub fn gl_uniforms(
     {
         s[GL_U_ATMO + i * 3..GL_U_ATMO + i * 3 + 3].copy_from_slice(c);
     }
-    s[GL_U_L..GL_U_L + 3].copy_from_slice(&key_light());
+    s[GL_U_L..GL_U_L + 3].copy_from_slice(&light);
     for (k, (vx, vz)) in vortex.iter().enumerate() {
         s[GL_U_VORTEX + k * 2] = *vx;
         s[GL_U_VORTEX + k * 2 + 1] = *vz;
@@ -161,14 +173,72 @@ pub fn gl_uniforms(
     for (i, (t, c)) in ct.stops.iter().enumerate() {
         s[GL_U_STOPS + i * 4..GL_U_STOPS + i * 4 + 4].copy_from_slice(&[*t, c[0], c[1], c[2]]);
     }
-    gl_octaves(&ct, lod, features, &mut s[GL_U_OCT..GL_U_OCT + 15]);
-    gl_octaves(&ct, lod.capped(NIGHT_OCT), features, &mut s[GL_U_OCT + 15..GL_U_OCT + 30]);
+    gl_octaves(ct, lod, features, &mut s[GL_U_OCT..GL_U_OCT + 15]);
+    gl_octaves(ct, lod.capped(NIGHT_OCT), features, &mut s[GL_U_OCT + 15..GL_U_OCT + 30]);
     if let Some(pal) = self::palette(palette) {
         s[GL_U_PAL_LEN] = pal.len() as f32;
         for (i, c) in pal.iter().enumerate() {
             s[GL_U_PAL + i * 3..GL_U_PAL + i * 3 + 3].copy_from_slice(c);
         }
     }
+}
+
+/// Uniforms for the **hero** framing — the GPU twin of [`render_rgba_features`].
+/// The planet fills a `size` square under the fixed key light. Arguments mirror
+/// that function, minus the pixel buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn gl_uniforms(
+    size: u32,
+    type_idx: usize,
+    seed: u32,
+    angle: f32,
+    p: &[f32],
+    dither: f32,
+    moons: u32,
+    features: u32,
+    palette: u32,
+    out: &mut [f32],
+) {
+    let ct = ct_with_params(type_idx, p);
+    // Same expression as `render_ct_band`, so the disc lands where the CPU path
+    // puts it — and `Lod` reads the same radius.
+    let rad = (size as f32 * 24.0 / 64.0) * ct.radius_scale;
+    fill(&ct, seed, angle, rad, key_light(), dither, moons, features, palette, out);
+}
+
+/// Uniforms for the **tile** framing — the GPU twin of [`render_tile_into`].
+///
+/// A scene draws the body as one screen-space quad instead of shading a tile and
+/// blitting it, so the placement travels in the uniforms: `x0`/`y0` are
+/// `scene_core`'s destination-rect origin and `scale` the blit's magnification.
+/// The shader maps a destination pixel back through the same expression `blit`
+/// uses, which is what keeps `planet_pixel` and the detail cap meaningful — the
+/// body is blocky in exactly the places the CPU compositor makes it blocky.
+///
+/// Returns the tile edge in px ([`tile_size`]), which the shader needs as
+/// `u_size` and the caller needs to size the quad.
+#[allow(clippy::too_many_arguments)]
+pub fn gl_tile_uniforms(
+    type_idx: usize,
+    seed: u32,
+    angle: f32,
+    light: [f32; 3],
+    rad_px: f32,
+    features: u32,
+    x0: i32,
+    y0: i32,
+    scale: f32,
+    out: &mut [f32],
+) -> u32 {
+    let ct = &TYPES[type_idx % TYPES.len()];
+    // `tile_style`: natural palette, the house dither, no orbiting moons — a
+    // scene composites its own bodies.
+    fill(ct, seed, angle, rad_px, light, 0.7, 0, features, 0, out);
+    out[GL_U_SPRITE] = 1.0;
+    out[GL_U_TILE_X0] = x0 as f32;
+    out[GL_U_TILE_X0 + 1] = y0 as f32;
+    out[GL_U_TILE_INV] = 1.0 / scale;
+    tile_size(type_idx, rad_px)
 }
 
 #[cfg(test)]

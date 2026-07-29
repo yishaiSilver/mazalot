@@ -374,8 +374,12 @@ function glInit() {
     premultipliedAlpha: false, preserveDrawingBuffer: true, desynchronized: true,
   });
   if (!gl) { gl = null; return null; }
-  const src = new TextDecoder().decode(
-    new Uint8Array(wasm.memory.buffer, wasm.gl_shader_ptr(), wasm.gl_shader_len()));
+  // A complete fragment shader is the two preludes (noise, then dither) from
+  // `noise-core`/`dither-core`, followed by the planet body.
+  const srcOf = i => new TextDecoder().decode(
+    new Uint8Array(wasm.memory.buffer, wasm.gl_src_ptr(i), wasm.gl_src_len(i)));
+  let src = "";
+  for (let i = 0; i < wasm.gl_src_count(); i++) src += srcOf(i);
   const prog = gl.createProgram();
   gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT_SRC, "vertex shader"));
   gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, src, "planet shader"));
@@ -389,6 +393,7 @@ function glInit() {
     seed: gl.getUniformLocation(prog, "u_seed"),
     feat: gl.getUniformLocation(prog, "u_feat"),
     size: gl.getUniformLocation(prog, "u_size"),
+    vh: gl.getUniformLocation(prog, "u_vh"),
     palette: gl.getUniformLocation(prog, "u_palette"),
   };
   glULen = wasm.gl_uniforms_len();
@@ -411,6 +416,7 @@ function renderGL(a, ang) {
   gl.uniform1ui(glLoc.seed, seed >>> 0);
   gl.uniform1ui(glLoc.feat, a.feat >>> 0);
   gl.uniform1i(glLoc.size, NATIVE);
+  gl.uniform1i(glLoc.vh, NATIVE);          // hero framing: viewport == tile
   gl.uniform1i(glLoc.palette, a.palette);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
   gl.finish();

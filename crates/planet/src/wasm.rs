@@ -119,22 +119,32 @@ pub extern "C" fn feat_all() -> u32 {
 
 // --- WebGL2 path -----------------------------------------------------------
 //
-// The GPU renders `planet_core::GL_SHADER`; these three exports are everything
-// the JS needs to drive it. The shader travels inside the module rather than as
-// a sibling file, so the single-file artifact keeps working and the GLSL cannot
-// go stale against the wasm it was built with.
+// The GPU renders `planet_core::GL_SOURCES`; these exports are everything the JS
+// needs to drive it. The shaders travel inside the module rather than as sibling
+// files, so the single-file artifact keeps working and the GLSL cannot go stale
+// against the wasm it was built with.
 
-/// Pointer to the GLSL ES 3.00 fragment shader in wasm memory, with
-/// [`gl_shader_len`] bytes of UTF-8 after it.
+/// Number of entries [`gl_src_ptr`] addresses.
+///
+/// A complete fragment shader is the two preludes (noise, then dither) followed
+/// by one body, so the JS concatenates `[0, 1, 2]`. Same shape as `solar`'s, so
+/// one harness drives both.
 #[no_mangle]
-pub extern "C" fn gl_shader_ptr() -> *const u8 {
-    planet_core::GL_SHADER.as_ptr()
+pub extern "C" fn gl_src_count() -> u32 {
+    planet_core::GL_SOURCES.len() as u32
 }
 
-/// Length of the shader source in bytes.
+/// Pointer to GLSL source `i` in wasm memory, with [`gl_src_len`] bytes of UTF-8
+/// after it. Out of range yields null.
 #[no_mangle]
-pub extern "C" fn gl_shader_len() -> u32 {
-    planet_core::GL_SHADER.len() as u32
+pub extern "C" fn gl_src_ptr(i: u32) -> *const u8 {
+    planet_core::GL_SOURCES.get(i as usize).map_or(core::ptr::null(), |s| s.as_ptr())
+}
+
+/// Length of GLSL source `i` in bytes.
+#[no_mangle]
+pub extern "C" fn gl_src_len(i: u32) -> u32 {
+    planet_core::GL_SOURCES.get(i as usize).map_or(0, |s| s.len() as u32)
 }
 
 /// Number of `f32`s [`gl_uniforms`] writes — the buffer JS must allocate.

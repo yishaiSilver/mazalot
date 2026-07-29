@@ -79,26 +79,53 @@ in step: a rect that under-reports by a pixel leaves an unshaded seam only
 visible at the zoom levels nobody screenshots, which is what `scene-core`'s
 million-read sweep is there to catch.
 
-**The GLSL port is the one sanctioned second shader.** `planet-core/src/shader.glsl`
-re-implements the pixel loop for WebGL2. It earns the exception by keeping the
-duplication to the shading: `gl_uniforms()` computes the `PType` row, the seeded
-constants, the moons and the whole `Lod` octave budget in Rust and ships them as
-one float array, so `TYPES` is *transported*, not copied — a new planet type
-still means one row. Two consequences:
+**The GLSL ports are the sanctioned second shaders.** Four `.glsl` files
+re-implement pixel loops for WebGL2 — `noise-core/src/noise.glsl` (the prelude
+every one of them is concatenated after, carrying `#version` and the lattice
+kernels), plus `planet-core`'s, `background-core`'s and `sun-core`'s bodies.
+`dither-core/src/dither.glsl` rides along in the prelude. They earn the exception
+by keeping the duplication to the shading: each crate's `gl_uniforms()` computes
+its tables, seeded constants and octave budgets in Rust and ships them as one
+float array, so `TYPES`/`SUNS`/`STAR_LAYERS` are *transported*, not copied — a
+new planet type still means one row. Two consequences:
 
 - The `U_*` slot indices in the GLSL and the `GL_U_*` constants in Rust are a
   wire format. `glsl_slot_indices_match_the_rust` parses the `#define`s and pins
   them, because a slot off by one paints a planet with somebody else's colours
   rather than failing.
 - `scripts/verify-gl.mjs` is to the GL path what `out/` is to the native one.
-  Run it after touching either shader. Expect a small residue and read the right
-  column: pixels differing by **more than one quantization level** are the signal
-  (0.00% today); pixels differing by exactly one are ANGLE rounding a `sin`
-  differently and landing across a `quant` threshold.
+  Run it after touching any shader (`--demo all`). Expect a residue and read the
+  right column: pixels differing by **more than one quantization level** are the
+  signal (0.00% today); pixels differing by exactly one are ANGLE rounding a
+  `sin` differently and landing across a `quant` threshold. `solar`'s raw differ
+  rate is 17–30% and that is *fine*: it is the nebula, which the GPU evaluates
+  per pixel where the CPU bakes per cell. At a zoom where the clouds fade the
+  backdrop is byte-exact, which is how you know.
 
 The GL path deliberately ignores `F_BAKED_*` and runs the live shader — the bakes
 buy CPU time at the price of frozen weather and ~7.5 MB of sphere maps per worker
 instance, and a GPU wants neither.
+
+**A GPU scene is a draw list, not pixels.** `solar::gl_bodies` emits one record
+per body — the destination rect from `dest_rect`, then that shader's uniform
+block — sorted back-to-front, and the JS draws a quad each with alpha blending.
+That *is* what `blit` was doing by hand. Two things to keep in step:
+
+- The fragment shader maps its destination pixel back through the **same
+  expression** `blit` uses (`int((dd + 0.5) / scale)`), which is what keeps
+  `planet_pixel`/`sun_pixel` and the detail caps meaningful with no second render
+  target. Change one, change both.
+- The GPU has no `BackdropCache`, no `SunCache` and no `visible_tile_rect` — all
+  three are caches for work a rasterizer does not mind repeating, and dropping
+  them is most of the win. Do not port them back without a measurement.
+
+**The `gl` cargo feature is load-bearing, not tidiness.** Each core crate's
+`mod gl` is `#[cfg(any(feature = "gl", test))]`, and the demo crates switch it on
+only through
+`[target.'cfg(target_arch = "wasm32")'.dependencies]` (plus `[dev-dependencies]`,
+so `cargo test` still covers it — resolver 2 keeps those out of `cargo build`).
+The reason is the codegen gotcha below: the native generators must not compile
+this code at all, or `out/` moves.
 
 **One backdrop, likewise.** Every scene paints through `background-core`:
 `paint_backdrop` (ground + optional nebula) then `paint_stars`. A new scene crate

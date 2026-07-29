@@ -1,20 +1,18 @@
-#version 300 es
 // planet.glsl — the WebGL2 (GLSL ES 3.00) port of `render_frame`'s pixel loop.
 //
-// `#version` is first because some drivers reject a comment above it, even
-// though the spec permits one.
+// Concatenated after `noise_core::GL_PRELUDE` + `dither_core::GL_PRELUDE`, which
+// carry the `#version` line, the precision qualifiers and the lattice kernels;
+// this file must not repeat them.
 //
-// This file is a SECOND implementation of the shader in lib.rs, which the
-// "one planet renderer" rule otherwise forbids. It earns the exception by
-// keeping the duplication down to the pixel loop and nothing else:
+// This is a SECOND implementation of the shader in lib.rs, which the "one planet
+// renderer" rule otherwise forbids. It earns the exception by keeping the
+// duplication down to the pixel loop and nothing else:
 //
 //   • Every constant it reads — the `PType` row, the colour ramp, the seed
 //     offsets, the vortex centres, the moon orbits, the per-frame trig, the
-//     `Lod` octave counts — is computed by `gl_uniforms()` in lib.rs and handed
+//     `Lod` octave counts — is computed by `gl_uniforms()` in gl.rs and handed
 //     over in `U[]`. The type table is not duplicated, only transported.
-//   • `hash3` and `value_noise` are u32 integer math with no transcendentals, so
-//     they port EXACTLY: same constants, same wrapping multiplies, same shifts.
-//     The lattice is bit-identical to the Rust, not a lookalike.
+//   • The noise underneath is `hash3`, which is exact across the two languages.
 //
 // What is genuinely re-written here is the shading: ~200 lines of ramps, mixes
 // and smoothsteps. `scripts/verify-gl.mjs` renders both paths in headless
@@ -24,15 +22,16 @@
 // CPU afford the weather; a GPU evaluates the fBm directly, so the GL path shows
 // the unfrozen picture and needs none of the bake's memory.
 //
-// Coordinates: gl_FragCoord is bottom-up, the frame is top-down, so row `iy` is
-// `u_size - 1 - int(gl_FragCoord.y)`. Light basis is +x right, +y up, +z toward
-// the viewer, exactly as in lib.rs.
-
-precision highp float;
-precision highp int;
+// TWO FRAMINGS, exactly as in lib.rs. `U_SPRITE` picks:
+//   • hero  — the planet fills a `u_size` square over a starfield, opaque.
+//   • tile  — `render_tile`'s cut-out: transparent off the disc, lit from any
+//     direction, and placed on screen through the same mapping `scene_core`'s
+//     `blit` uses, so a scene composites it with the rasterizer instead.
+//
+// Light basis is +x right, +y up, +z toward the viewer, as in lib.rs.
 
 // ---------------------------------------------------------------------------
-// The uniform block. Slot names MUST match `GL_U_*` in lib.rs — that pairing is
+// The uniform block. Slot names MUST match `GL_U_*` in gl.rs — that pairing is
 // the whole wire format.
 // ---------------------------------------------------------------------------
 #define U_BASE        0
@@ -82,6 +81,10 @@ precision highp int;
 #define U_OCT       101   // 15 day counts, then the same 15 capped for night
 #define U_PAL_LEN   131
 #define U_PAL       132   // up to 5 x rgb
+#define U_SPRITE    147   // 0 hero framing, 1 scene tile
+#define U_TILE_X0   148   // `blit`'s destination rect origin, screen px
+#define U_TILE_Y0   149
+#define U_TILE_INV  150   // 1 / scale
 
 // Octave slots, indexed off U_OCT (+15 for the night-capped copy).
 #define O_SPOT_EDGE    0
@@ -107,15 +110,14 @@ const uint F_RIM          = 4u;
 const uint F_STARFIELD    = 8u;
 const uint F_NIGHT_LOD    = 16u;
 
-const float PI  = 3.14159265358979323846;
-const float TAU = 6.28318530717958647692;
 const float RING_SQUASH = 0.38;
 const float SPEC_FLOOR  = 1.0 / 1024.0;
 
-uniform float U[152];
+uniform float U[160];
 uniform uint  u_seed;
 uniform uint  u_feat;
-uniform int   u_size;
+uniform int   u_size;      // tile / frame edge in px
+uniform int   u_vh;        // viewport height, for the y flip (== u_size for hero)
 uniform int   u_palette;
 
 out vec4 fragColor;
@@ -127,110 +129,6 @@ bool g_night = false;
 vec3 uv3(int i) { return vec3(U[i], U[i + 1], U[i + 2]); }
 int  oct(int slot) { return int(U[U_OCT + slot + (g_night ? 15 : 0)]); }
 
-// ---------------------------------------------------------------------------
-// noise-core, transliterated. The integer path is exact; see the header.
-// ---------------------------------------------------------------------------
-
-const uint KX = 0x8da6b343u;
-const uint KY = 0xd8163841u;
-const uint KZ = 0xcb1ab31fu;
-
-uint avalanche(uint h) {
-  h ^= h >> 16; h *= 0x7feb352du;
-  h ^= h >> 15; h *= 0x846ca68bu;
-  h ^= h >> 16;
-  return h;
-}
-
-// `u32::MAX as f32` rounds to 2^32 in Rust and the literal rounds the same way
-// here, so the scale factor is the same float. Divide rather than multiply by a
-// reciprocal — that is what the Rust does.
-float unitOf(uint h) { return float(avalanche(h)) / 4294967295.0; }
-
-float hash3(int x, int y, int z) {
-  return unitOf(uint(x) * KX ^ uint(y) * KY ^ uint(z) * KZ);
-}
-
-float smoother(float t) { return t * t * t * (t * (t * 6.0 - 15.0) + 10.0); }
-
-// `a + (b - a) * t`, NOT GLSL's `mix` (which is `a*(1-t) + b*t`) — the shading
-// downstream lands on 22 quantization levels and the two round differently.
-float lerpf(float a, float b, float t) { return a + (b - a) * t; }
-vec3  lerp3(vec3 a, vec3 b, float t) { return vec3(lerpf(a.x, b.x, t), lerpf(a.y, b.y, t), lerpf(a.z, b.z, t)); }
-
-// Reversed edges (e0 > e1) are used all over the shader and are undefined for
-// GLSL's `smoothstep`, so this is noise-core's version, which handles them.
-float sstep(float e0, float e1, float x) {
-  float t = clamp((x - e0) / (e1 - e0), 0.0, 1.0);
-  return t * t * (3.0 - 2.0 * t);
-}
-
-float contrastf(float h, float k) { return clamp((h - 0.5) * k + 0.5, 0.0, 1.0); }
-
-float valueNoise(float x, float y, float z) {
-  float xi = floor(x), yi = floor(y), zi = floor(z);
-  float u = smoother(x - xi), v = smoother(y - yi), w = smoother(z - zi);
-  // The x term is the only one that differs between the two corners of an edge,
-  // so the y/z half of the mix is built once — the same factoring the Rust's
-  // four-lane kernel uses, for the same reason.
-  uint kx0 = uint(int(xi)) * KX, kx1 = uint(int(xi) + 1) * KX;
-  uint ky0 = uint(int(yi)) * KY, ky1 = uint(int(yi) + 1) * KY;
-  uint kz0 = uint(int(zi)) * KZ, kz1 = uint(int(zi) + 1) * KZ;
-  uint a = ky0 ^ kz0, b = ky1 ^ kz0, c = ky0 ^ kz1, d = ky1 ^ kz1;
-  float x00 = lerpf(unitOf(kx0 ^ a), unitOf(kx1 ^ a), u);
-  float x10 = lerpf(unitOf(kx0 ^ b), unitOf(kx1 ^ b), u);
-  float x01 = lerpf(unitOf(kx0 ^ c), unitOf(kx1 ^ c), u);
-  float x11 = lerpf(unitOf(kx0 ^ d), unitOf(kx1 ^ d), u);
-  return lerpf(lerpf(x00, x10, v), lerpf(x01, x11, v), w);
-}
-
-// Bounded trip count: `Lod` never asks for more than 6, and a constant ceiling
-// keeps the loop unrollable on drivers that insist on it.
-float fbm(float x, float y, float z, int octaves) {
-  float sum = 0.0, amp = 0.5, norm = 0.0;
-  for (int i = 0; i < 8; i++) {
-    if (i >= octaves) break;
-    sum += amp * valueNoise(x, y, z);
-    norm += amp;
-    amp *= 0.5;
-    x *= 2.0; y *= 2.0; z *= 2.0;
-  }
-  return sum / norm;
-}
-
-float fbmWarp(float x, float y, float z, int warpOct, int mainOct, float w) {
-  float qx = fbm(x, y, z, warpOct);
-  float qy = fbm(x + 3.1, y + 1.7, z + 5.2, warpOct);
-  float qz = fbm(x + 8.3, y + 2.8, z + 1.1, warpOct);
-  return fbm(x + w * qx, y + w * qy, z + w * qz, mainOct);
-}
-
-// 3D Worley F1. Squared distance throughout, one sqrt at the end — `sqrt` is
-// monotone, so this is the same float the per-cell version would give.
-float worley(float x, float y, float z) {
-  int fx = int(floor(x)), fy = int(floor(y)), fz = int(floor(z));
-  float best = 81.0;
-  for (int dz = -1; dz <= 1; dz++) {
-    for (int dy = -1; dy <= 1; dy++) {
-      for (int dx = -1; dx <= 1; dx++) {
-        int cx = fx + dx, cy = fy + dy, cz = fz + dz;
-        float px = float(cx) + hash3(cx, cy, cz) - x;
-        float py = float(cy) + hash3(cx + 911, cy + 733, cz + 512) - y;
-        float pz = float(cz) + hash3(cx + 271, cy + 619, cz + 188) - z;
-        best = min(best, px * px + py * py + pz * pz);
-      }
-    }
-  }
-  return sqrt(best);
-}
-
-vec3 cycle3(vec3 lo, vec3 mid, vec3 hi, float phase) {
-  float p = (phase - floor(phase)) * 3.0;   // rem_euclid(1.0)
-  if (p < 1.0) return lerp3(lo, mid, p);
-  if (p < 2.0) return lerp3(mid, hi, p - 1.0);
-  return lerp3(hi, lo, p - 2.0);
-}
-
 // The colour ramp is a hard step, exactly as in noise-core: the first stop whose
 // threshold `h` falls under, else the last.
 vec3 rampCol(float h) {
@@ -240,27 +138,6 @@ vec3 rampCol(float h) {
     if (h < U[U_STOPS + i * 4]) return uv3(U_STOPS + i * 4 + 1);
   }
   return uv3(U_STOPS + (n - 1) * 4 + 1);
-}
-
-// ---------------------------------------------------------------------------
-// dither-core
-// ---------------------------------------------------------------------------
-
-const int BAYER[64] = int[64](
-   0, 32,  8, 40,  2, 34, 10, 42, 48, 16, 56, 24, 50, 18, 58, 26,
-  12, 44,  4, 36, 14, 46,  6, 38, 60, 28, 52, 20, 62, 30, 54, 22,
-   3, 35, 11, 43,  1, 33,  9, 41, 51, 19, 59, 27, 49, 17, 57, 25,
-  15, 47,  7, 39, 13, 45,  5, 37, 63, 31, 55, 23, 61, 29, 53, 21);
-
-float bayer(int x, int y) { return (float(BAYER[(y & 7) * 8 + (x & 7)]) + 0.5) / 64.0 - 0.5; }
-
-// `floor(v + 0.5)` rather than GLSL `round()`, whose behaviour at exactly .5 is
-// implementation-defined; Rust's `round` is half-away-from-zero and the values
-// here are clamped to 0 below zero either way.
-vec3 quant(vec3 o, float bx, float levels, float dither) {
-  float d = bx * dither / levels;
-  vec3 v = floor((o + vec3(d)) * levels + 0.5) / levels;
-  return clamp(v, 0.0, 1.0);
 }
 
 vec3 finalize(vec3 o, float bx) {
@@ -420,19 +297,33 @@ vec3 starBg(int ix, int iy) {
 // ---------------------------------------------------------------------------
 
 void main() {
-  int ix = int(gl_FragCoord.x);
-  int iy = u_size - 1 - int(gl_FragCoord.y);
+  bool sprite = U[U_SPRITE] > 0.5;
+  int ix, iy;
+  if (sprite) {
+    // The tile pixel `scene_core::blit` would read for this destination pixel.
+    // Same expression, so a body drawn here is blocky in exactly the places the
+    // CPU compositor makes it blocky — `planet_pixel` and the detail cap keep
+    // working with no second render target.
+    int ddx = int(gl_FragCoord.x) - int(U[U_TILE_X0]);
+    int ddy = (u_vh - 1 - int(gl_FragCoord.y)) - int(U[U_TILE_Y0]);
+    ix = int((float(ddx) + 0.5) * U[U_TILE_INV]);
+    iy = int((float(ddy) + 0.5) * U[U_TILE_INV]);
+    if (ddx < 0 || ddy < 0 || ix >= u_size || iy >= u_size) discard;
+  } else {
+    ix = int(gl_FragCoord.x);
+    iy = u_size - 1 - int(gl_FragCoord.y);
+  }
+
   float rad = U[U_RAD];
   float cx = float(u_size) * 0.5, cy = cx;
-  float nx = (gl_FragCoord.x - cx) / rad;
-  float ny = (cy - (float(u_size) - gl_FragCoord.y)) / rad;
+  float nx = (float(ix) + 0.5 - cx) / rad;
+  float ny = (cy - (float(iy) + 0.5)) / rad;
   float d2 = nx * nx + ny * ny;
 
   float angle = U[U_ANGLE];
   vec3 l = uv3(U_L);
   vec3 o = vec3(0.0);
-  // The hero framing only: `render_tile`'s transparent cut-out has no GL path
-  // yet, so every pixel here is opaque and there is no alpha to track.
+  float a = 1.0;
 
   if (d2 <= 1.0) {
     float nz = sqrt(1.0 - d2);
@@ -506,6 +397,10 @@ void main() {
       float t = 1.0 - nz;
       o = clamp(o + uv3(U_ATMO) * (t * t * t * 0.6), 0.0, 1.0);
     }
+  } else if (sprite) {
+    // Off the disc a tile is empty — the scene shows through.
+    o = vec3(0.0);
+    a = 0.0;
   } else {
     o = (u_feat & F_STARFIELD) != 0u ? starBg(ix, iy) : vec3(0.0);
   }
@@ -519,7 +414,16 @@ void main() {
       float alpha = clamp(0.30 + 0.55 * stripes, 0.0, 1.0);
       if (rn > 0.46 && rn < 0.54) alpha *= 0.12;
       vec3 rc = uv3(U_RING_COL) * (0.55 + 0.45 * stripes);
-      o = lerp3(o, rc, alpha);
+      if (sprite && d2 > 1.0) {
+        // The ring arc PAST the disc is the only translucent part of a tile.
+        // Hand the scene the ring's own colour with `alpha` as its coverage and
+        // let the blend do the mixing — lerping toward the empty tile here would
+        // darken the ring by a second factor of `alpha` once composited.
+        o = rc;
+        a = alpha;
+      } else {
+        o = lerp3(o, rc, alpha);
+      }
     }
   }
 
@@ -545,11 +449,10 @@ void main() {
       float t = fbm(lnx * 3.0 + ms * 9.0, lny * 3.0, ms * 5.0, 2);
       vec3 base = lerp3(vec3(0.30, 0.29, 0.33), vec3(0.60, 0.59, 0.62), sstep(0.4, 0.6, t));
       o = base * msh;
+      a = 1.0;
     }
   }
 
-  vec3 px = finalize(o, bayer(ix, iy));
-  // The Rust truncates onto the 0..255 scale rather than rounding, and the
-  // canvas rounds on the way in — so floor here, and the byte matches exactly.
-  fragColor = vec4(floor(clamp(px, 0.0, 1.0) * 255.0) / 255.0, 1.0);
+  if (sprite && a <= 0.0) discard;   // nothing to blend, and it saves the blend
+  fragColor = vec4(toByte(finalize(o, bayer(ix, iy))), sprite ? floor(clamp(a, 0.0, 1.0) * 255.0) / 255.0 : 1.0);
 }

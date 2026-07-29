@@ -560,16 +560,19 @@ fn paint_background(
         pan_scale: parallax,
         far_fade: far_amt,
     };
-    // Salt the star hash with the seed, so each system gets its own constellations.
-    // Mixed into the hash's third axis rather than added to the cell coordinates:
-    // offsetting the grid would give every system the SAME sky panned sideways,
-    // which is the trap the nebula's plane offset used to fall into. The 977
-    // stride clears the three layer salts, so one system's near layer can never
-    // come out as the next system's far one.
-    let sky_salt = (seed as i32).wrapping_mul(977);
+    // Salt the star hash with the seed, so each system gets its own
+    // constellations. See `gl::sky_salt` for why it is mixed into the hash's
+    // third axis rather than added to the cell coordinates.
+    let salt0 = seeded_sky_salt(seed);
     paint_stars(out, w, h, &sky, bgx, bgy, move |cx, cy, salt| {
-        hash3(cx, cy, sky_salt.wrapping_add(17 + salt))
+        hash3(cx, cy, salt0.wrapping_add(17 + salt))
     });
+}
+
+/// The star-grid salt for a system. One definition, shared with the GPU path
+/// (`gl::sky_salt` re-exports it) — two would mean two skies.
+fn seeded_sky_salt(seed: u32) -> i32 {
+    (seed as i32).wrapping_mul(977)
 }
 
 /// Dot in a planet's orbit path as a faint dashed ellipse around the sun.
@@ -890,6 +893,20 @@ pub fn planet_nearest_center(sys: &System, w: u32, h: u32, cam: &Camera, t: f32)
     }
     best
 }
+
+/// The scene's WebGL2 frame packer.
+///
+/// **Browser-only, and gated so that it is** — see the same note on
+/// `planet_core`'s `mod gl`. Another caller of `Planet::at` / `to_screen` /
+/// `dest_rect` in this crate's LTO unit is enough to re-price their inlining and
+/// move `out/`.
+#[cfg(any(target_arch = "wasm32", test))]
+mod gl;
+#[cfg(any(target_arch = "wasm32", test))]
+pub use gl::{
+    gl_backdrop, gl_bodies, gl_orbit_points, sky_salt, GL_BODY_HEADER, GL_BODY_STRIDE,
+    GL_KIND_PLANET, GL_KIND_STAR, GL_MAX_BODIES,
+};
 
 // Browser (wasm) C-ABI glue — excluded from native builds. See wasm.rs.
 #[cfg(target_arch = "wasm32")]
