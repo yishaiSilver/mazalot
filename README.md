@@ -810,6 +810,41 @@ its destination pixel back through the *same* expression `blit` uses, so a body
 is blocky in the places `planet_pixel` and the detail cap make it blocky, with no
 second render target.
 
+**The HUD says what it is running on.** Under WebGL2 the perf readout adds the
+adapter name, the draw counts, and — where the browser allows it — the real GPU
+time per frame:
+
+```
+36 fps · 1.1 ms render
+submit 1.1 ms (GPU runs async)
+backdrop: no cache needed
+GPU Apple M2 · gpu 2.31 ms · 14% of a 60 fps slot
+draw 5 bodies · 2410 stars · 436 orbit
+```
+
+Three things there are deliberate. `render` is relabelled **submit** because the
+draw calls return long before the GPU has finished them, so timing them and
+calling it CPU load would flatter the path. The GPU time comes from
+`EXT_disjoint_timer_query_webgl2`, read a few frames late so asking never stalls
+the pipeline — Chrome exposes it, Firefox removed it and Safari never shipped it,
+so its absence is normal and says so. And a **software rasterizer is called out
+in amber**: `gl.RENDERER` is masked to something generic by every modern browser,
+so the real name needs `WEBGL_debug_renderer_info`, and a browser that has
+quietly fallen back to SwiftShader or llvmpipe is running this path with none of
+its advantages — which is the single most useful thing the HUD can tell you when
+the GPU renderer is somehow *slower* than the CPU one.
+
+The timer is sanity-checked against the frame interval before it is believed: a
+frame cannot spend more GPU time than the wall clock between frames, so a reading
+far past that is the driver misbehaving. SwiftShader here reports ~750 ms against
+50 ms frames, which is how the check came to exist. It matters beyond the
+display, because auto-detail paces off that number and an inflated one would peg
+the detail cap to the floor.
+
+There is no WebGL API for GPU *utilization* or VRAM — browsers do not expose
+either, and none of the fingerprinting-adjacent tricks are worth it. GPU
+milliseconds against the vsync slot is the honest version of the same question.
+
 **What this repo cannot tell you: whether it is faster.** This container has no
 `/dev/dri`, so the only WebGL2 available is ANGLE over SwiftShader — a *software*
 rasterizer. It proves the shader is right and says nothing about GPU throughput;

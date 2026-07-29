@@ -43,13 +43,22 @@
   .hint b { color: #aeb4cd; font-weight: 600; }
 
   /* Perf readout — live frame/CPU signal. Click (or press P) to cycle detail. */
-  .perf { position: fixed; top: 64px; right: 20px; z-index: 6; pointer-events: auto;
+  /* Above the dock (z-index 6): the readout is a few narrow lines and the dock
+     is tall enough to reach up under them. Click it, or press P, to collapse. */
+  .perf { position: fixed; top: 64px; right: 20px; z-index: 7; pointer-events: auto;
     font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     color: #9aa0bb; background: rgba(14,15,24,.74); border: 1px solid rgba(255,255,255,.07);
     border-radius: 9px; padding: 6px 9px; backdrop-filter: blur(6px); cursor: pointer;
-    min-width: 140px; text-shadow: none; }
+    min-width: 140px; max-width: min(300px, 40vw); text-shadow: none; }
+  /* A driver's adapter string can be 80 characters of parenthesised detail, and
+     an unwrapped one drags the whole panel across the viewport. Clip it to one
+     line — the full text is on the element's `title`. */
+  .perf .clip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .perf b { color: #eef1f8; font-weight: 600; font-variant-numeric: tabular-nums; }
   .perf .lbl { color: #6b7290; }
+  /* A software rasterizer means the page is drawing on the CPU after all, which
+     is the one GPU fact worth shouting about. */
+  .perf .warn { color: #f4b74a; }
   .perf .bar { height: 4px; border-radius: 3px; margin-top: 6px; background: rgba(255,255,255,.10); overflow: hidden; }
   .perf .bar i { display: block; height: 100%; width: 0; background: #57d38c; transition: width .15s linear, background .3s; }
   .perf.min .detail { display: none; }
@@ -131,10 +140,13 @@
   <div><b id="pfFps">–</b> fps <span class="lbl">·</span> <b id="pfRender">–</b> ms <span class="lbl">render</span></div>
   <div class="detail">
     <div class="lbl" id="pfFrame">frame – ms</div>
-    <div class="lbl" id="pfLoad">CPU – % of 60 fps</div>
+    <div class="lbl clip" id="pfLoad">CPU – % of 60 fps</div>
     <div class="lbl" id="pfRes">– × –</div>
     <div id="pfBg" class="lbl">bg –</div>
     <div id="pfAuto" class="lbl">detail –</div>
+    <div id="pfGpu" class="lbl clip"></div>
+    <div id="pfDraw" class="lbl clip"></div>
+    <div id="pfGpuMs" class="lbl clip"></div>
     <div class="bar"><i id="pfBar"></i></div>
   </div>
 </div>
@@ -201,6 +213,9 @@ const PLANET_NAMES = ["desert","barren","moon","iron","obsidian","lava","molten 
 const SUN_NAMES = ["yellow dwarf","orange dwarf","red giant","white star","blue giant"];
 
 const $ = id => document.getElementById(id);
+// The adapter name comes from a graphics driver, so it goes through this before
+// it ever reaches innerHTML.
+const esc = t => String(t).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const canvas = $("stage");
 const ctx = canvas.getContext("2d", { alpha: false });
 ctx.imageSmoothingEnabled = false;
@@ -381,6 +396,75 @@ let gl = null, renderer = "wasm";
 let progBg, progStar, progPlanet, progOrbit, ptVBO, ptVAO;
 let glBgPtr, glPtPtr, glBodyPtr, bgLen, bodyStride, bodyHeader, maxBodies;
 let orbCap, starCap, ptStride, glFeat;
+let gpu = null;                      // adapter description, once a context exists
+let drawn = { bodies: 0, orbit: 0, stars: 0 };
+
+// --- GPU timing -------------------------------------------------------------
+// There is no WebGL API for GPU *utilization* or VRAM — browsers do not expose
+// either. What there is, where the browser allows it, is
+// `EXT_disjoint_timer_query_webgl2`: elapsed GPU nanoseconds around a set of
+// draws. That plus the vsync slot is a real utilization figure, and it is the
+// one number the CPU-side timer cannot give, because the draw calls return long
+// before the GPU has finished them.
+//
+// Chrome exposes it; Firefox removed it and Safari never shipped it, so treat
+// its absence as normal rather than an error.
+//
+// Results are read a few frames late, on purpose: asking for one the frame it
+// was issued stalls the CPU until the GPU drains, which is the very thing this
+// path exists to avoid. A ring of query objects keeps that pipelined.
+let tqExt = null, tqFree = [], tqBusy = [], emaGpu = 0, gpuSeen = false;
+let tqDrops = 0, tqPolls = 0;
+const TQ_MAX = 4;
+
+/// Is the GPU timer telling the truth?
+///
+/// A frame cannot spend more GPU time than the wall clock between frames, give
+/// or take a little pipelining — so a reading far past the observed interval is
+/// the driver's timer misbehaving, not a slow GPU. SwiftShader here reports
+/// ~750 ms against 50 ms frames, which is how this check came to exist.
+///
+/// It matters for more than the display: auto-detail paces off this number, and
+/// an inflated one would slam the detail cap to the floor and stay there.
+function gpuTimeTrustworthy() {
+  if (!gpuSeen) return false;
+  const iv = 1000 / Math.max(emaFps, 1);
+  return emaGpu <= iv * 1.5 + 2.0;
+}
+
+function tqBegin() {
+  if (!tqExt || tqBusy.length >= TQ_MAX) return null;
+  const q = tqFree.pop() || gl.createQuery();
+  gl.beginQuery(tqExt.TIME_ELAPSED_EXT, q);
+  return q;
+}
+
+function tqEnd(q) {
+  if (!q) return;
+  gl.endQuery(tqExt.TIME_ELAPSED_EXT);
+  tqBusy.push(q);
+}
+
+function tqPoll() {
+  if (!tqExt || !tqBusy.length) return;
+  const q = tqBusy[0];
+  if (!gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE)) return;
+  tqBusy.shift();
+  tqPolls++;
+  // A "disjoint" means the GPU was interrupted mid-query — a clock change, a
+  // context switch, a mode set. The elapsed time is then meaningless, so drop
+  // it rather than average garbage in. A driver that reports disjoint on EVERY
+  // query (some software rasterizers do) never yields a number, so the count is
+  // kept and the HUD says so rather than showing "waiting" for ever.
+  if (gl.getParameter(tqExt.GPU_DISJOINT_EXT)) {
+    tqDrops++;
+  } else {
+    const ms = gl.getQueryParameter(q, gl.QUERY_RESULT) / 1e6;
+    emaGpu = gpuSeen ? emaGpu + (ms - emaGpu) * 0.1 : ms;
+    gpuSeen = true;
+  }
+  tqFree.push(q);
+}
 
 function glCompile(type, src, what) {
   const sh = gl.createShader(type);
@@ -408,6 +492,31 @@ function glLink(vs, fs, what, unis) {
 function glSrc(i) {
   return new TextDecoder().decode(
     new Uint8Array(wasm.memory.buffer, wasm.gl_src_ptr(i), wasm.gl_src_len(i)));
+}
+
+/// What the WebGL2 context is actually running on.
+///
+/// `gl.RENDERER` is masked to something generic ("WebKit WebGL") by every modern
+/// browser, so the real name needs `WEBGL_debug_renderer_info` — which Firefox
+/// withholds under `privacy.resistFingerprinting` and some Safari versions do
+/// not ship. Hence the fallback chain and the "hidden" wording rather than a
+/// promise.
+///
+/// The `soft` flag is the fact worth surfacing: SwiftShader, llvmpipe and
+/// friends are CPU rasterizers, so a browser that has quietly fallen back to one
+/// is running this path with none of its advantages, and a slow frame there says
+/// nothing about the shaders.
+function describeGPU(gl) {
+  const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+  const get = p => { try { return gl.getParameter(p); } catch { return null; } };
+  const name = (dbg && get(dbg.UNMASKED_RENDERER_WEBGL)) || get(gl.RENDERER) || "unknown";
+  const vendor = (dbg && get(dbg.UNMASKED_VENDOR_WEBGL)) || get(gl.VENDOR) || "";
+  return {
+    name: String(name),
+    vendor: String(vendor),
+    soft: /swiftshader|llvmpipe|softpipe|software|basic render|microsoft basic/i.test(`${name} ${vendor}`),
+    masked: !dbg,
+  };
 }
 
 function glInit() {
@@ -439,6 +548,8 @@ function glInit() {
   glBodyPtr = wasm.alloc(maxBodies * bodyStride * 4);
 
   glFeat = wasm.gl_feat();
+  gpu = describeGPU(gl);
+  tqExt = gl.getExtension("EXT_disjoint_timer_query_webgl2");
   ptVAO = gl.createVertexArray();
   ptVBO = gl.createBuffer();
   gl.bindVertexArray(ptVAO);
@@ -457,6 +568,7 @@ function renderGLScene(w, h, cam, zoomArg, bgPanX, bgPanY, tOrbit, tSpin, tSun) 
   // The drawing buffer is the RENDER resolution; CSS stretches it to the display
   // as crisp square pixels, which is what the 2D path was using drawImage for.
   if (glc.width !== w || glc.height !== h) { glc.width = w; glc.height = h; }
+  const tq = tqBegin();
   gl.viewport(0, 0, w, h);
   gl.disable(gl.BLEND);
 
@@ -525,6 +637,9 @@ function renderGLScene(w, h, cam, zoomArg, bgPanX, bgPanY, tOrbit, tSpin, tSun) 
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
   }
+  drawn = { bodies: n, orbit: nOrb, stars: nStar };
+  tqEnd(tq);
+  tqPoll();   // reads a query from a few frames ago, so it never stalls
   // Deliberately no `finish()`. It would make the render timer below honest at
   // the cost of stalling the CPU on the GPU every frame, and the whole point of
   // this path is that the two run independently. The timer therefore reports
@@ -767,10 +882,66 @@ function updatePerf(now, renderMs, frameMs) {
   $("pfFps").textContent = emaFps.toFixed(0);
   $("pfRender").textContent = emaRender.toFixed(1);
   $("pfFrame").textContent = `frame ${emaFrame.toFixed(1)} ms`;
-  $("pfLoad").textContent = `CPU ${load.toFixed(0)}% of 60 fps`;
   $("pfRes").textContent = `${curW}×${curH} · ${(px / 1000).toFixed(0)}k px`;
-  $("pfBg").textContent = bgRedrewInWindow ? "backdrop redraw" : "backdrop cached ✓";
-  if (autoDetail && emaRender > 0.01) {
+  // Two of these read differently on the GPU. `render` there is SUBMISSION cost
+  // — the draw finishes after the call returns — so reporting it as a share of a
+  // CPU frame budget would flatter it; and there is no backdrop cache to hit,
+  // because the fullscreen triangle replaced it.
+  const isGL = renderer === "gl";
+  const gpuTrust = isGL && gpuTimeTrustworthy();
+  $("pfLoad").textContent = isGL
+    ? `submit ${emaRender.toFixed(1)} ms (GPU runs async)`
+    : `CPU ${load.toFixed(0)}% of 60 fps`;
+  $("pfBg").textContent = isGL
+    ? "backdrop: no cache needed"
+    : (bgRedrewInWindow ? "backdrop redraw" : "backdrop cached ✓");
+  if (isGL && gpu) {
+    // The masked case is common and benign (Firefox with resistFingerprinting,
+    // some Safari builds) — say "hidden" rather than pretending to know.
+    const label = gpu.masked ? `${gpu.name} (name hidden)` : gpu.name;
+    $("pfGpu").innerHTML = gpu.soft
+      ? `<span class="warn">⚠ software rasterizer — ${esc(gpu.name)}</span>`
+      : `GPU ${esc(label)}`;
+    $("pfGpu").title = `${gpu.vendor} — ${gpu.name}`;
+    $("pfDraw").textContent =
+      `draw ${drawn.bodies} bodies · ${drawn.stars} stars · ${drawn.orbit} orbit`;
+    // The real number, where the browser allows it: not how long the calls took
+    // to issue, but how long the GPU spent on them.
+    $("pfGpuMs").textContent = !tqExt
+      ? "gpu time: not exposed by this browser"
+      : gpuTimeTrustworthy()
+        ? `gpu ${emaGpu.toFixed(2)} ms · ${(emaGpu / FRAME_BUDGET * 100).toFixed(0)}% of a 60 fps slot`
+        : gpuSeen
+          ? `gpu timer implausible (${emaGpu.toFixed(0)} ms vs a ${(1000 / Math.max(emaFps, 1)).toFixed(0)} ms frame)`
+          : tqDrops > 8
+            ? `gpu time: driver reports every query disjoint (${tqDrops} dropped)`
+            : `gpu time: waiting…`;
+  } else {
+    $("pfGpu").textContent = "";
+    $("pfDraw").textContent = "";
+    $("pfGpuMs").textContent = "";
+  }
+  if (autoDetail && isGL) {
+    // Never off the render timer here: submission cost says nothing about how
+    // long the GPU took. With a timer query there is a real measurement to aim
+    // at, and the same square-law step the CPU path uses applies; without one,
+    // fall back to the FRAME INTERVAL with a dead band around the vsync slot, so
+    // it does not sawtooth while comfortably hitting 60.
+    const was = effDetail;
+    if (gpuTrust && emaGpu > 0.01) {
+      const ratio = AUTO_BUDGET / emaGpu;
+      if (ratio < 0.9 || ratio > 1.35) {
+        const target = effDetail * (1 + 0.7 * (Math.sqrt(ratio) - 1));
+        effDetail = Math.max(AUTO_FLOOR, Math.min(vPdetail, Math.round(target / 8) * 8));
+      }
+    } else {
+      const iv = 1000 / Math.max(emaFps, 1);
+      if (iv > 19.0) effDetail = Math.max(AUTO_FLOOR, Math.round(effDetail * 0.85 / 8) * 8);
+      else if (iv < 17.2) effDetail = Math.min(vPdetail, effDetail + 8);
+    }
+    if (effDetail !== was) applyView();
+    $("pfAuto").textContent = `detail ${effDetail}${effDetail < vPdetail ? " (auto)" : ""}`;
+  } else if (autoDetail && emaRender > 0.01) {
     const was = effDetail;
     // A tile costs ~r^2, so the cap that hits the budget is the current one
     // scaled by sqrt(budget / measured) — one step instead of a slow walk.

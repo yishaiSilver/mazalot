@@ -351,6 +351,7 @@ void main() {
 
 const glc = document.createElement("canvas");
 let gl = null, glProg = null, glLoc = null, glU = null, glUPtr = 0, glULen = 0;
+let gpu = null;                      // adapter description, once a context exists
 let renderer = "wasm";
 
 function compile(type, src, what) {
@@ -365,6 +366,31 @@ function compile(type, src, what) {
 
 // Returns null (with the reason on `glnote`) when WebGL2 is unavailable, which
 // is a normal outcome — the demo stays on the wasm path.
+/// What the WebGL2 context is actually running on.
+///
+/// `gl.RENDERER` is masked to something generic ("WebKit WebGL") by every modern
+/// browser, so the real name needs `WEBGL_debug_renderer_info` — which Firefox
+/// withholds under `privacy.resistFingerprinting` and some Safari versions do
+/// not ship. Hence the fallback chain and the "hidden" wording rather than a
+/// promise.
+///
+/// The `soft` flag is the fact worth surfacing: SwiftShader, llvmpipe and
+/// friends are CPU rasterizers, so a browser that has quietly fallen back to one
+/// is running this path with none of its advantages, and a slow frame there says
+/// nothing about the shaders.
+function describeGPU(gl) {
+  const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+  const get = p => { try { return gl.getParameter(p); } catch { return null; } };
+  const name = (dbg && get(dbg.UNMASKED_RENDERER_WEBGL)) || get(gl.RENDERER) || "unknown";
+  const vendor = (dbg && get(dbg.UNMASKED_VENDOR_WEBGL)) || get(gl.VENDOR) || "";
+  return {
+    name: String(name),
+    vendor: String(vendor),
+    soft: /swiftshader|llvmpipe|softpipe|software|basic render|microsoft basic/i.test(`${name} ${vendor}`),
+    masked: !dbg,
+  };
+}
+
 function glInit() {
   if (gl) return gl;
   // `preserveDrawingBuffer` so the stage can `drawImage` this canvas after the
@@ -396,6 +422,7 @@ function glInit() {
     vh: gl.getUniformLocation(prog, "u_vh"),
     palette: gl.getUniformLocation(prog, "u_palette"),
   };
+  gpu = describeGPU(gl);
   glULen = wasm.gl_uniforms_len();
   glUPtr = wasm.alloc(glULen * 4);
   glU = new Float32Array(glULen);
@@ -560,9 +587,19 @@ function syncRendererUI() {
   const isGL = renderer === "gl";
   for (const f of FEATURES) if (f.cpu) f.el.classList.toggle("off", isGL);
   $("poolctl").classList.toggle("off", isGL);
-  $("glnote").textContent = isGL
-    ? "Live shader on the GPU — no sphere-map bakes, so the weather is unfrozen and nothing is cached per worker."
-    : "";
+  if (!isGL) { $("glnote").textContent = ""; return; }
+  const live = "Live shader on the GPU — no sphere-map bakes, so the weather is unfrozen and nothing is cached per worker.";
+  // The adapter name comes from a graphics driver, so it never reaches innerHTML
+  // unescaped. A software rasterizer is the one fact worth shouting about: the
+  // page is drawing on the CPU after all, and a slow frame says nothing about
+  // the shaders.
+  const esc = t => String(t).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const label = gpu.masked ? `${gpu.name} (name hidden)` : gpu.name;
+  $("glnote").innerHTML = gpu.soft
+    ? `<span style="color:#f4b74a">⚠ software rasterizer — ${esc(gpu.name)}.</span> ` +
+      `This browser has no GPU acceleration, so these timings measure the CPU.`
+    : `${esc(live)}<br><span style="color:#8790ad">GPU ${esc(label)}</span>`;
+  $("glnote").title = `${gpu.vendor} — ${gpu.name}`;
 }
 
 // Time one configuration: warm up, then take the best of a few runs, which is
