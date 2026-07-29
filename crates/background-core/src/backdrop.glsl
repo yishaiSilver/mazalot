@@ -1,4 +1,4 @@
-// backdrop.glsl — the GPU twin of `paint_backdrop` + `paint_stars`.
+// backdrop.glsl — the GPU twin of `paint_backdrop`.
 //
 // Concatenated after `noise_core::GL_PRELUDE` + `dither_core::GL_PRELUDE`.
 //
@@ -8,23 +8,20 @@
 // GPU it is one fullscreen triangle and the whole cache disappears with it —
 // there is nothing to memcpy, memmove, or key.
 //
-// Two structural differences from the CPU path, both because a fragment shader
-// is per-pixel where the Rust is per-cell and per-star:
+// **Ground and nebula only** — the stars are point sprites, not fragments. A
+// gather (each pixel asking which of nine cells per layer could have lit it) is
+// what a fragment shader would have to do, and it measured as HALF the frame:
+// 27 hashes per pixel against the scatter's roughly one per 50. `visit_stars`
+// feeds `gl_star_points` instead, and the GPU draws what the CPU walk found.
 //
-//   • **The cloud sprite is gone.** `BackdropCache` bakes an fBm field once per
-//     8x8 cell and scrolls it; here each pixel finds its own cell directly.
-//     `floor((scroll + i) / cell)` is the same world cell the Rust's
-//     `org + (i + sub) / cell` split arrives at, so the clouds land in the same
-//     places — the split only existed so a sprite could be slid.
-//   • **Stars are gathered, not scattered.** `paint_stars` walks lit cells and
-//     plots one pixel each; a fragment cannot do that, so it walks the 3x3 cells
-//     that could possibly have placed a star on THIS pixel. Same hash, same
-//     jitter, same `floor` — the pixel lights up under exactly the condition the
-//     scatter would have lit it.
-//
-// The star hash is solar's convention (`hash3(cx, cy, salt + 17 + layer)`); a
-// scene that mixes its seed in differently needs its own body here, which is
-// what `paint_stars` takes a closure for on the CPU side.
+// One structural difference from `paint_backdrop` remains. **The cloud sprite is
+// gone**: `BackdropCache` bakes an fBm field once per 8x8 cell and scrolls it,
+// where each pixel here finds its own cell directly.
+// `floor((scroll + i) / cell)` is the same world cell the Rust's
+// `org + (i + sub) / cell` split arrives at, so the clouds land in the same
+// places — the split only existed so a sprite could be slid. It does mean 64x
+// the noise evaluations for the same per-cell value, which is the next thing to
+// port if the backdrop is ever the bottleneck.
 
 // ---------------------------------------------------------------------------
 // Uniform block — slot names MUST match `GL_B_*` in gl.rs.
@@ -44,26 +41,11 @@
 #define B_ZB         14
 #define B_TINT_A     15   // vec3
 #define B_TINT_B     18   // vec3
-#define B_NLAYERS    21
-#define B_NTINTS     22
-#define B_LAYER      24   // 4 x (ox, oy, spacing, thr, brightness, faint, amt, salt)
-#define B_TINTS      56   // 8 x (cutoff, r, g, b)
 
-uniform float B[96];
-uniform int   u_skySalt;
+uniform float B[24];
 uniform int   u_vh;      // viewport height, for the top-down row index
 
 out vec4 fragColor;
-
-/// Star colour: `noise_core::ramp` over the scene's tint stops.
-vec3 starTint(float h) {
-  int n = int(B[B_NTINTS]);
-  for (int i = 0; i < 8; i++) {
-    if (i >= n) break;
-    if (h < B[B_TINTS + i * 4]) return vec3(B[B_TINTS + i * 4 + 1], B[B_TINTS + i * 4 + 2], B[B_TINTS + i * 4 + 3]);
-  }
-  return vec3(B[B_TINTS + (n - 1) * 4 + 1], B[B_TINTS + (n - 1) * 4 + 2], B[B_TINTS + (n - 1) * 4 + 3]);
-}
 
 /// The nebula's contribution at screen pixel `(ix, iy)`, already scaled by the
 /// zoom fade. Zero when the clouds are off or this cell came out empty.
@@ -87,43 +69,6 @@ vec3 nebulaAt(int ix, int iy) {
   return col * (dens * B[B_STRENGTH] * B[B_NEB_AMT]);
 }
 
-/// Everything the parallax layers add at this pixel.
-///
-/// Gathered rather than scattered: for each layer, the cells that could have
-/// placed their star here span one grid step in each direction, so a 3x3 sweep
-/// about `floor((px + ox) / spacing)` is exhaustive.
-vec3 starsAt(int ix, int iy) {
-  vec3 add = vec3(0.0);
-  int nl = int(B[B_NLAYERS]);
-  for (int li = 0; li < 4; li++) {
-    if (li >= nl) break;
-    int b = B_LAYER + li * 8;
-    float ox = B[b], oy = B[b + 1], spacing = B[b + 2], thr = B[b + 3];
-    float brightness = B[b + 4], faint = B[b + 5], amt = B[b + 6];
-    int salt = int(B[b + 7]);
-    if (amt <= 0.02 || thr >= 0.9999) continue;    // faded out, or density ~0
-    int c0x = int(floor((float(ix) + ox) / spacing));
-    int c0y = int(floor((float(iy) + oy) / spacing));
-    for (int dy = -1; dy <= 1; dy++) {
-      for (int dx = -1; dx <= 1; dx++) {
-        int cx = c0x + dx, cy = c0y + dy;
-        float hh = hash3(cx, cy, u_skySalt + 17 + salt);
-        if (hh <= thr) continue;
-        float jx = fract(hh * 137.0);
-        float jy = fract(hh * 71.3 + 0.37);
-        int px = int(floor((float(cx) + jx) * spacing - ox));
-        int py = int(floor((float(cy) + jy) * spacing - oy));
-        if (px != ix || py != iy) continue;
-        // How far this cell cleared the threshold sets its brightness.
-        float t = (hh - thr) / (1.0 - thr);
-        float s = brightness * (faint + (1.0 - faint) * t) * amt;
-        add += s * starTint(fract(hh * 313.0));
-      }
-    }
-  }
-  return add;
-}
-
 void main() {
   int ix = int(gl_FragCoord.x);
   int iy = u_vh - 1 - int(gl_FragCoord.y);
@@ -138,8 +83,7 @@ void main() {
     float d = bayer(ix + int(B[B_PHASE_X]), iy + int(B[B_PHASE_Y])) * B[B_NEB_DITHER];
     col += max(nebulaAt(ix, iy) + vec3(d), 0.0);
   }
-  // The ground is written as bytes before the stars are added over it, so round
-  // here too or a star sits on a background the CPU never had.
-  col = toByte(clamp(col, 0.0, 1.0));
-  fragColor = vec4(toByte(clamp(col + starsAt(ix, iy), 0.0, 1.0)), 1.0);
+  // Rounded to bytes here because the CPU writes the ground out as bytes before
+  // `paint_stars` adds over it, and the star points blend onto this.
+  fragColor = vec4(toByte(clamp(col, 0.0, 1.0)), 1.0);
 }

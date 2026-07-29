@@ -119,6 +119,15 @@ That *is* what `blit` was doing by hand. Two things to keep in step:
   three are caches for work a rasterizer does not mind repeating, and dropping
   them is most of the win. Do not port them back without a measurement.
 
+**Scatter, don't gather.** `paint_stars` walks lit cells and plots one pixel
+each. The first backdrop shader inverted that — every pixel testing nine cells in
+each of three layers, 27 hashes per pixel against roughly one per fifty — and it
+was three quarters of the fragment cost (216.6 ms/frame, vs 50.0 with the stars
+as point sprites). `visit_stars` is now the one walk, feeding `paint_stars` and
+`gl_star_points` alike. Before writing a gather into any shader, check whether
+the vertex path will do. The nebula is the same shape of problem at 64x rather
+than 1000x, and is the next candidate if the backdrop ever bites.
+
 **The `gl` cargo feature is load-bearing, not tidiness.** Each core crate's
 `mod gl` is `#[cfg(any(feature = "gl", test))]`, and the demo crates switch it on
 only through

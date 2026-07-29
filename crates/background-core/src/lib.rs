@@ -119,6 +119,27 @@ pub fn paint_stars<F>(out: &mut [u8], w: u32, h: u32, sky: &Starfield, bgx: f32,
 where
     F: Fn(i32, i32, i32) -> f32,
 {
+    visit_stars(sky, w, h, bgx, bgy, hash, |px, py, s, col| {
+        let idx = ((py as u32 * w + px as u32) * 4) as usize;
+        out[idx] = (clamp01(out[idx] as f32 / 255.0 + s * col[0]) * 255.0) as u8;
+        out[idx + 1] = (clamp01(out[idx + 1] as f32 / 255.0 + s * col[1]) * 255.0) as u8;
+        out[idx + 2] = (clamp01(out[idx + 2] as f32 / 255.0 + s * col[2]) * 255.0) as u8;
+    });
+}
+
+/// Walk the lit cells of every layer and hand each visible star to `emit` as
+/// `(px, py, brightness, colour)` — screen px, already clipped to the viewport.
+///
+/// The scatter is the whole reason a starfield is cheap: cost tracks stars on
+/// screen, not viewport area. [`paint_stars`] plots them into a buffer; the GPU
+/// path emits point sprites from the same walk. It must stay ONE walk — a
+/// gather (each pixel asking which cells could have lit it) has to test nine
+/// cells per layer per pixel, which measured as half the GPU frame.
+pub fn visit_stars<F, E>(sky: &Starfield, w: u32, h: u32, bgx: f32, bgy: f32, hash: F, mut emit: E)
+where
+    F: Fn(i32, i32, i32) -> f32,
+    E: FnMut(i32, i32, f32, Rgb),
+{
     let d = sky.density.max(0.0);
     let (wi, hi) = (w as i32, h as i32);
 
@@ -152,11 +173,7 @@ where
                 // How far this cell cleared the threshold sets its brightness.
                 let t = (hh - thr) / (1.0 - thr);
                 let s = layer.brightness * (layer.faint + (1.0 - layer.faint) * t) * amt;
-                let col = ramp(sky.tints, (hh * 313.0).fract());
-                let idx = ((py as u32 * w + px as u32) * 4) as usize;
-                out[idx] = (clamp01(out[idx] as f32 / 255.0 + s * col[0]) * 255.0) as u8;
-                out[idx + 1] = (clamp01(out[idx + 1] as f32 / 255.0 + s * col[1]) * 255.0) as u8;
-                out[idx + 2] = (clamp01(out[idx + 2] as f32 / 255.0 + s * col[2]) * 255.0) as u8;
+                emit(px, py, s, ramp(sky.tints, (hh * 313.0).fract()));
             }
         }
     }
@@ -576,7 +593,7 @@ pub fn paint_backdrop(
 #[cfg(any(feature = "gl", test))]
 mod gl;
 #[cfg(any(feature = "gl", test))]
-pub use gl::{gl_uniforms, GL_SHADER, GL_SOURCES, GL_UNIFORMS_LEN};
+pub use gl::{gl_star_points, gl_uniforms, GL_POINT_STRIDE, GL_SHADER, GL_SOURCES, GL_UNIFORMS_LEN};
 
 #[cfg(test)]
 mod tests {

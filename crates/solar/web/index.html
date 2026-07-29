@@ -19,6 +19,15 @@
        "pixel size" slider reads as chunky pixel-art. */
     image-rendering: pixelated; image-rendering: crisp-edges; }
   #stage.drag { cursor: grabbing; }
+  /* The WebGL2 canvas is displayed directly, stacked over the 2D one. Copying it
+     across with drawImage would be a full-frame GPU->CPU->GPU round trip every
+     frame — the very plumbing the GPU path exists to delete, and it pinned the
+     demo to a fraction of its rate. `pointer-events: none` lets every drag,
+     pinch and tap keep landing on #stage underneath, so the interaction code
+     needs no idea which renderer is running. */
+  #glstage { position: fixed; inset: 0; width: 100%; height: 100%; display: none;
+    pointer-events: none; z-index: 1;
+    image-rendering: pixelated; image-rendering: crisp-edges; }
 
   .hud { position: fixed; pointer-events: none; z-index: 5;
     text-shadow: 0 1px 3px rgba(0,0,0,.9); }
@@ -104,6 +113,7 @@
 </head>
 <body>
 <canvas id="stage"></canvas>
+<canvas id="glstage"></canvas>
 
 <div class="hud topleft">
   <h1>Procedural Solar System</h1>
@@ -336,29 +346,41 @@ void main() {
   gl_Position = vec4(p.x / u_view.x * 2.0 - 1.0, 1.0 - p.y / u_view.y * 2.0, 0.0, 1.0);
 }`;
 
-// One orbit dot. Positions come up from Rust already in screen px, so Kepler's
-// equation stays in `Planet::plane_point` and is not restated here.
+// One dot — an orbit sample or a background star. Both come up from Rust already
+// in screen px with their colour, so Kepler's equation stays in
+// `Planet::plane_point` and the star walk stays in `visit_stars`; neither is
+// restated here, and one buffer holds both.
+//
+// The stars are points rather than a fragment-shader gather on purpose: gathering
+// means every pixel testing nine cells per layer, which measured as HALF the GPU
+// frame against roughly one hash per fifty pixels here.
 const VS_POINT = `#version 300 es
-layout(location = 0) in vec2 a_pos;   // pinned: the VAO enables attribute 0
+layout(location = 0) in vec2 a_pos;   // pinned: the VAO enables attributes 0 and 1
+layout(location = 1) in vec3 a_col;
 uniform vec2 u_view;
 uniform float u_size;
+out vec3 v_col;
 void main() {
+  v_col = a_col;
   gl_PointSize = u_size;
   gl_Position = vec4(a_pos.x / u_view.x * 2.0 - 1.0, 1.0 - a_pos.y / u_view.y * 2.0, 0.0, 1.0);
 }`;
 
-// `paint_orbit` adds a faint blue-grey and clamps at (90, 96, 120). Plain
-// additive blending saturates at 1.0 instead, which differs only where dots
-// overlap over an already-bright pixel — the navy ground is nowhere near it.
+// Additive, matching `paint_orbit` and `paint_stars`. Both clamp in the Rust —
+// orbit dots at (90, 96, 120), stars at white — where a blend saturates at 1.0
+// instead. That differs only where dots overlap on an already-bright pixel, and
+// the navy ground is nowhere near either cap.
 const FS_POINT = `#version 300 es
 precision highp float;
+in vec3 v_col;
 out vec4 fragColor;
-void main() { fragColor = vec4(26.0 / 255.0, 30.0 / 255.0, 40.0 / 255.0, 1.0); }`;
+void main() { fragColor = vec4(v_col, 1.0); }`;
 
-const glc = document.createElement("canvas");
+const glc = $("glstage");
 let gl = null, renderer = "wasm";
-let progBg, progStar, progPlanet, progOrbit, orbitVBO, orbitVAO;
-let glBgPtr, glOrbPtr, glBodyPtr, bgLen, bodyStride, bodyHeader, maxBodies, orbCap, glFeat;
+let progBg, progStar, progPlanet, progOrbit, ptVBO, ptVAO;
+let glBgPtr, glPtPtr, glBodyPtr, bgLen, bodyStride, bodyHeader, maxBodies;
+let orbCap, starCap, ptStride, glFeat;
 
 function glCompile(type, src, what) {
   const sh = gl.createShader(type);
@@ -396,7 +418,7 @@ function glInit() {
   });
   if (!gl) return null;
   const pre = glSrc(0) + glSrc(1);
-  progBg = glLink(VS_FULL, pre + glSrc(2), "backdrop", ["B", "u_skySalt", "u_vh"]);
+  progBg = glLink(VS_FULL, pre + glSrc(2), "backdrop", ["B", "u_vh"]);
   progStar = glLink(VS_QUAD, pre + glSrc(3), "star", ["S", "u_size", "u_vh", "u_rect", "u_view"]);
   progPlanet = glLink(VS_QUAD, pre + glSrc(4), "planet",
     ["U", "u_seed", "u_feat", "u_size", "u_vh", "u_palette", "u_rect", "u_view"]);
@@ -406,18 +428,25 @@ function glInit() {
   bodyStride = wasm.gl_body_stride();
   bodyHeader = wasm.gl_body_header();
   maxBodies = wasm.gl_max_bodies();
-  orbCap = 16 * 220;                        // the planet cap x `paint_orbit`'s steps
+  ptStride = wasm.gl_point_stride();
+  // Orbits: the planet cap x `paint_orbit`'s steps. Stars: generous enough for a
+  // big viewport at high density — `gl_star_points` truncates rather than
+  // overruns, and reports the count back. Both live in one buffer, back to back.
+  orbCap = 16 * 220;
+  starCap = 24000;
   glBgPtr = wasm.alloc(bgLen * 4);
-  glOrbPtr = wasm.alloc(orbCap * 2 * 4);
+  glPtPtr = wasm.alloc((orbCap + starCap) * ptStride * 4);
   glBodyPtr = wasm.alloc(maxBodies * bodyStride * 4);
 
   glFeat = wasm.gl_feat();
-  orbitVAO = gl.createVertexArray();
-  orbitVBO = gl.createBuffer();
-  gl.bindVertexArray(orbitVAO);
-  gl.bindBuffer(gl.ARRAY_BUFFER, orbitVBO);
+  ptVAO = gl.createVertexArray();
+  ptVBO = gl.createBuffer();
+  gl.bindVertexArray(ptVAO);
+  gl.bindBuffer(gl.ARRAY_BUFFER, ptVBO);
   gl.enableVertexAttribArray(0);
-  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, ptStride * 4, 0);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, ptStride * 4, 8);
   gl.bindVertexArray(null);
   return gl;
 }
@@ -425,6 +454,8 @@ function glInit() {
 /// One GPU frame. `finish()` before returning, so the caller's clock measures
 /// the draw rather than the time it took to queue it.
 function renderGLScene(w, h, cam, zoomArg, bgPanX, bgPanY, tOrbit, tSpin, tSun) {
+  // The drawing buffer is the RENDER resolution; CSS stretches it to the display
+  // as crisp square pixels, which is what the 2D path was using drawImage for.
   if (glc.width !== w || glc.height !== h) { glc.width = w; glc.height = h; }
   gl.viewport(0, 0, w, h);
   gl.disable(gl.BLEND);
@@ -432,25 +463,35 @@ function renderGLScene(w, h, cam, zoomArg, bgPanX, bgPanY, tOrbit, tSpin, tSun) 
   // 1 — backdrop. This is the pass the worker pool never reached: full-frame,
   // serial on the CPU, and re-painted every frame whenever the camera follows a
   // body. Here it is one triangle.
-  const salt = wasm.gl_backdrop(sys, glBgPtr, cam.x, cam.y, zoomArg, bgPanX, bgPanY);
+  wasm.gl_backdrop(sys, glBgPtr, cam.x, cam.y, zoomArg, bgPanX, bgPanY);
   gl.useProgram(progBg);
   gl.uniform1fv(progBg.loc.B, new Float32Array(wasm.memory.buffer, glBgPtr, bgLen));
-  gl.uniform1i(progBg.loc.u_skySalt, salt);
   gl.uniform1i(progBg.loc.u_vh, h);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-  // 2 — the dashed orbit paths, as point sprites over an additive blend.
-  const nPts = wasm.gl_orbit_points(sys, glOrbPtr, orbCap, w, h, cam.x, cam.y, zoomArg);
-  if (nPts > 0) {
+  // 2 — the dashed orbit paths and the parallax stars, as point sprites over an
+  // additive blend. Both come from Rust in one buffer, back to back, and differ
+  // only in point size, so it is one upload and two draw calls.
+  const nOrb = wasm.gl_orbit_points(sys, glPtPtr, orbCap, w, h, cam.x, cam.y, zoomArg);
+  const starPtr = glPtPtr + nOrb * ptStride * 4;
+  const nStar = wasm.gl_star_points(sys, starPtr, starCap, w, h, cam.x, cam.y, zoomArg, bgPanX, bgPanY);
+  if (nOrb + nStar > 0) {
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE);
-    gl.bindVertexArray(orbitVAO);
-    gl.bindBuffer(gl.ARRAY_BUFFER, orbitVBO);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(wasm.memory.buffer, glOrbPtr, nPts * 2), gl.DYNAMIC_DRAW);
+    gl.bindVertexArray(ptVAO);
+    gl.bindBuffer(gl.ARRAY_BUFFER, ptVBO);
+    gl.bufferData(gl.ARRAY_BUFFER,
+      new Float32Array(wasm.memory.buffer, glPtPtr, (nOrb + nStar) * ptStride), gl.DYNAMIC_DRAW);
     gl.useProgram(progOrbit);
     gl.uniform2f(progOrbit.loc.u_view, w, h);
-    gl.uniform1f(progOrbit.loc.u_size, wasm.gl_orbit_width(sys));
-    gl.drawArrays(gl.POINTS, 0, nPts);
+    if (nOrb > 0) {
+      gl.uniform1f(progOrbit.loc.u_size, wasm.gl_orbit_width(sys));
+      gl.drawArrays(gl.POINTS, 0, nOrb);
+    }
+    if (nStar > 0) {
+      gl.uniform1f(progOrbit.loc.u_size, 1.0);   // a star is one pixel
+      gl.drawArrays(gl.POINTS, nOrb, nStar);
+    }
     gl.bindVertexArray(null);
   }
 
@@ -484,7 +525,10 @@ function renderGLScene(w, h, cam, zoomArg, bgPanX, bgPanY, tOrbit, tSpin, tSun) 
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
   }
-  gl.finish();
+  // Deliberately no `finish()`. It would make the render timer below honest at
+  // the cost of stalling the CPU on the GPU every frame, and the whole point of
+  // this path is that the two run independently. The timer therefore reports
+  // submission cost; the fps counter is what measures the GPU.
 }
 
 /// Grey out what the GPU path does not have: the worker pool splits a CPU frame
@@ -492,10 +536,11 @@ function renderGLScene(w, h, cam, zoomArg, bgPanX, bgPanY, tOrbit, tSpin, tSun) 
 /// does not read.
 function syncRendererUI() {
   const isGL = renderer === "gl";
+  glc.style.display = isGL ? "block" : "none";
   $("poolctl").classList.toggle("dim", isGL);
   $("frozctl").classList.toggle("dim", isGL);
   $("glnote").textContent = isGL
-    ? "Whole scene on the GPU — no backdrop cache, no tile blits, and nothing read back."
+    ? "Whole scene on the GPU — no backdrop cache, no tile blits, and no copy back: this canvas IS the render target."
     : "";
 }
 
@@ -651,7 +696,6 @@ async function frame(now) {
     curW = w; curH = h;
     off.width = w; off.height = h;
     imgData = octx.createImageData(w, h);
-    if (gl) { glc.width = w; glc.height = h; }
   }
   curZoom = zoomArg;
   // Does this frame reuse the cached backdrop? Mirror the Rust bg cache key: if
@@ -692,8 +736,12 @@ async function frame(now) {
   // Both paths end with the same crisp upscale onto the display canvas, so the
   // timer above is the render and nothing else. The GPU path has nothing to put
   // back: it drew straight into `glc`.
-  if (renderer !== "gl") octx.putImageData(imgData, 0, 0);
-  ctx.drawImage(renderer === "gl" ? glc : off, 0, 0, w, h, 0, 0, canvas.width, canvas.height);
+  if (renderer === "gl") {
+    // Already on screen — the GL canvas IS the display surface. Nothing to copy.
+  } else {
+    octx.putImageData(imgData, 0, 0);
+    ctx.drawImage(off, 0, 0, w, h, 0, 0, canvas.width, canvas.height);
+  }
 
   // HUD: what's under the crosshair (viewport centre)?
   const near = follow >= 0 ? follow : wasm.nearest_center(sys, w, h, cam.x, cam.y, zoomArg, tOrbit);

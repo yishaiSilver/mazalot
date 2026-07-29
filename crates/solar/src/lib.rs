@@ -904,8 +904,8 @@ pub fn planet_nearest_center(sys: &System, w: u32, h: u32, cam: &Camera, t: f32)
 mod gl;
 #[cfg(any(target_arch = "wasm32", test))]
 pub use gl::{
-    gl_backdrop, gl_bodies, gl_orbit_points, sky_salt, GL_BODY_HEADER, GL_BODY_STRIDE,
-    GL_KIND_PLANET, GL_KIND_STAR, GL_MAX_BODIES,
+    gl_backdrop, gl_bodies, gl_orbit_points, gl_star_points, sky_salt, GL_BODY_HEADER,
+    GL_BODY_STRIDE, GL_KIND_PLANET, GL_KIND_STAR, GL_MAX_BODIES,
 };
 
 // Browser (wasm) C-ABI glue — excluded from native builds. See wasm.rs.

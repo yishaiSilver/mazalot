@@ -53,22 +53,38 @@ pub fn sky_salt(seed: u32) -> i32 {
     seeded_sky_salt(seed)
 }
 
-/// Fill `out` with the backdrop shader's uniforms for this frame, and return the
-/// star-grid salt that goes alongside them as `u_skySalt`.
-///
-/// The zoom fades are the same two `smoothstep`s `paint_background` applies.
-pub fn gl_backdrop(sys: &System, cam: &Camera, bgx: f32, bgy: f32, out: &mut [f32]) -> i32 {
-    let z = cam.zoom;
-    let sky = Starfield {
+/// This frame's starfield, with the zoom fades `paint_background` applies.
+fn sky_of(sys: &System, zoom: f32) -> Starfield<'static> {
+    Starfield {
         layers: STAR_LAYERS,
         tints: STAR_TINTS,
         density: sys.star_density,
         pan_scale: sys.star_parallax,
-        far_fade: 1.0 - smoothstep(3.0, 9.0, z),
-    };
-    let neb_amt = 1.0 - smoothstep(2.5, 7.0, z);
-    background_core::gl_uniforms(&BACKDROP, &sky, sys.seed, bgx, bgy, sys.star_parallax, neb_amt, out);
-    sky_salt(sys.seed)
+        far_fade: 1.0 - smoothstep(3.0, 9.0, zoom),
+    }
+}
+
+/// Fill `out` with the backdrop shader's uniforms — ground and nebula. The stars
+/// are a separate pass ([`gl_star_points`]).
+pub fn gl_backdrop(sys: &System, cam: &Camera, bgx: f32, bgy: f32, out: &mut [f32]) {
+    let neb_amt = 1.0 - smoothstep(2.5, 7.0, cam.zoom);
+    background_core::gl_uniforms(&BACKDROP, sys.seed, bgx, bgy, sys.star_parallax, neb_amt, out);
+}
+
+/// Write the visible stars as point sprites; returns how many.
+///
+/// Scattered from the same walk `paint_stars` uses, salted the same way. The
+/// alternative — having the fragment shader gather, i.e. ask at every pixel
+/// which of nine cells per layer might have lit it — measured as HALF the GPU
+/// frame on a full-screen backdrop, for 27 hashes per pixel against roughly one
+/// per fifty here.
+pub fn gl_star_points(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: f32, out: &mut [f32]) -> usize {
+    let salt0 = sky_salt(sys.seed);
+    background_core::gl_star_points(
+        &sky_of(sys, cam.zoom), w, h, bgx, bgy,
+        move |cx, cy, salt| hash3(cx, cy, salt0.wrapping_add(17 + salt)),
+        out,
+    )
 }
 
 /// Screen-space `(x, y)` for every dot of every dashed orbit path, written into
@@ -81,9 +97,13 @@ pub fn gl_backdrop(sys: &System, cam: &Camera, bgx: f32, bgy: f32, out: &mut [f3
 /// pixels the CPU path was moving.
 ///
 /// The coordinates are the pixel *centres* the CPU stamps at, so a point sprite
-/// of `orbit_width` px lands on the same pixels.
+/// of `orbit_width` px lands on the same pixels. Same `(x, y, r, g, b)` layout as
+/// [`gl_star_points`], so one vertex buffer and one program serve both.
 pub fn gl_orbit_points(sys: &System, w: u32, h: u32, cam: &Camera, out: &mut [f32]) -> usize {
+    // `paint_orbit`'s faint additive blue-grey.
+    const DOT: [f32; 3] = [26.0 / 255.0, 30.0 / 255.0, 40.0 / 255.0];
     let steps = 220;
+    let stride = background_core::GL_POINT_STRIDE;
     let mut n = 0;
     for p in &sys.planets {
         let e = p.ecc(sys.ecc);
@@ -91,7 +111,7 @@ pub fn gl_orbit_points(sys: &System, w: u32, h: u32, cam: &Camera, out: &mut [f3
             if (k / 3) % 2 == 0 {
                 continue; // dashed: skip every few samples
             }
-            if (n + 1) * 2 > out.len() {
+            if (n + 1) * stride > out.len() {
                 return n;
             }
             let ea = TAU * k as f32 / steps as f32;
@@ -100,8 +120,9 @@ pub fn gl_orbit_points(sys: &System, w: u32, h: u32, cam: &Camera, out: &mut [f3
             let wy = y1 * ORBIT_FLATTEN * p.tilt * sys.spacing;
             let (sx, sy) = to_screen(wx, wy, cam, w, h);
             // `sx as i32` in the Rust, then the stamp is centred on that pixel.
-            out[n * 2] = (sx as i32) as f32 + 0.5;
-            out[n * 2 + 1] = (sy as i32) as f32 + 0.5;
+            out[n * stride] = (sx as i32) as f32 + 0.5;
+            out[n * stride + 1] = (sy as i32) as f32 + 0.5;
+            out[n * stride + 2..n * stride + 5].copy_from_slice(&DOT);
             n += 1;
         }
     }
@@ -278,7 +299,8 @@ mod tests {
         let sys = System::generate(21);
         let (w, h) = (300u32, 180u32);
         let cam = Camera { x: 12.0, y: -4.0, zoom: 0.8 };
-        let mut pts = vec![0.0; 16 * 220 * 2];
+        let st = background_core::GL_POINT_STRIDE;
+        let mut pts = vec![0.0; 16 * 220 * st];
         let n = gl_orbit_points(&sys, w, h, &cam, &mut pts);
         // 220 samples through the `(k / 3) % 2` dash. Counted rather than
         // halved: 220 is not a whole number of dash periods, so the last group
@@ -295,8 +317,8 @@ mod tests {
             }
             let (x1, y1) = p.plane_point(TAU * step as f32 / 220.0, e);
             let (sx, sy) = to_screen(x1 * sys.spacing, y1 * ORBIT_FLATTEN * p.tilt * sys.spacing, &cam, w, h);
-            assert_eq!(pts[k * 2], (sx as i32) as f32 + 0.5, "dot {k} x");
-            assert_eq!(pts[k * 2 + 1], (sy as i32) as f32 + 0.5, "dot {k} y");
+            assert_eq!(pts[k * st], (sx as i32) as f32 + 0.5, "dot {k} x");
+            assert_eq!(pts[k * st + 1], (sy as i32) as f32 + 0.5, "dot {k} y");
             k += 1;
         }
     }

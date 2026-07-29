@@ -822,15 +822,41 @@ node scripts/verify-gl.mjs --demo all --types all
 node scripts/verify-gl.mjs --demo solar --size 240
 ```
 
-**The one lever left, and it is the CPU's own trick.** The nebula is the only
-place where the GPU does *more* work than the CPU: `BackdropCache` bakes one fBm
-sample per 8x8 cell and scrolls the sprite, so a pan repaints a sliver; the
-fragment shader recomputes that same per-cell value at every pixel, which is 64x
-the noise evaluations. It is cheap enough not to matter at these sizes, but if
-the backdrop turns out to be the GPU's bottleneck on real hardware, the fix is to
-port the sprite rather than to thin the shader: render the cell field into a
-low-res texture, scroll it with a blit, repaint only the exposed strip, and let
-hardware sampling do the rest. That is the same idea, one level down.
+### Scatter, don't gather
+
+The first version of the backdrop shader drew the stars in the fragment shader:
+each pixel asked which of the nine surrounding cells, in each of three parallax
+layers, might have placed a star on it. That is the only way a *fragment* can ask
+the question, and it is 27 hashes per pixel across the whole screen — against
+`paint_stars`, which walks the lit cells and plots one pixel each, roughly one
+hash per fifty pixels. **A thousand times the work for the same picture.**
+
+It was three quarters of the fragment cost. Under SwiftShader (a software
+rasterizer, so these are CPU numbers — but the ratio is fragment ALU either way),
+800x500, fit view:
+
+| | ms/frame | fps |
+|---|---:|---:|
+| stars gathered in the fragment shader | 216.6 | 4.6 |
+| **stars scattered as point sprites** | **50.0** | **20.0** |
+
+With the stars as points, switching the starfield off entirely now changes the
+frame by *nothing measurable* — which is the check that says the cost really
+moved rather than merely shrank.
+
+The fix reuses what the orbit paths already did: `visit_stars` is the one cell
+walk, `paint_stars` plots pixels from it, `gl_star_points` emits vertices from
+it, both into the same `(x, y, r, g, b)` buffer under an additive blend. The
+lesson generalizes past this repo — **when porting a scatter to a shader, look
+for the vertex path before you write the gather.**
+
+The nebula is the same shape of problem, still unfixed: `BackdropCache` bakes one
+fBm sample per 8x8 cell and scrolls the sprite, where the fragment shader
+recomputes that per-cell value at every pixel — 64x the noise evaluations. Far
+milder than the stars' 1000x, and not the bottleneck now. If it becomes one, the
+fix is again to port the sprite rather than thin the shader: bake the cell field
+into a low-res texture, scroll it, repaint only the exposed strip, and let
+hardware sampling do the rest. Same idea, one level down.
 
 ## Adding a planet type
 

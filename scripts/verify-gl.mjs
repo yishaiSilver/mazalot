@@ -213,19 +213,21 @@ void main() {
   gl_Position = vec4(p.x / u_view.x * 2.0 - 1.0, 1.0 - p.y / u_view.y * 2.0, 0.0, 1.0);
 }`;
     const VS_POINT = `#version 300 es
-layout(location = 0) in vec2 a_pos; uniform vec2 u_view; uniform float u_size;
+layout(location = 0) in vec2 a_pos; layout(location = 1) in vec3 a_col;
+uniform vec2 u_view; uniform float u_size; out vec3 v_col;
 void main() {
+  v_col = a_col;
   gl_PointSize = u_size;
   gl_Position = vec4(a_pos.x / u_view.x * 2.0 - 1.0, 1.0 - a_pos.y / u_view.y * 2.0, 0.0, 1.0);
 }`;
     const FS_POINT = `#version 300 es
-precision highp float; out vec4 fragColor;
-void main() { fragColor = vec4(26.0 / 255.0, 30.0 / 255.0, 40.0 / 255.0, 1.0); }`;
+precision highp float; in vec3 v_col; out vec4 fragColor;
+void main() { fragColor = vec4(v_col, 1.0); }`;
 
     let progBg, progStar, progPlanet, progOrbit;
     try {
       const pre = srcOf(wasm, 0) + srcOf(wasm, 1);
-      progBg = mkProgram(gl, VS_FULL, pre + srcOf(wasm, 2), "backdrop", ["B", "u_skySalt", "u_vh"]);
+      progBg = mkProgram(gl, VS_FULL, pre + srcOf(wasm, 2), "backdrop", ["B", "u_vh"]);
       progStar = mkProgram(gl, VS_QUAD, pre + srcOf(wasm, 3), "star",
         ["S", "u_size", "u_vh", "u_rect", "u_view"]);
       progPlanet = mkProgram(gl, VS_QUAD, pre + srcOf(wasm, 4), "planet",
@@ -235,12 +237,13 @@ void main() { fragColor = vec4(26.0 / 255.0, 30.0 / 255.0, 40.0 / 255.0, 1.0); }
 
     const bgLen = wasm.gl_backdrop_len();
     const stride = wasm.gl_body_stride(), header = wasm.gl_body_header();
-    const maxB = wasm.gl_max_bodies(), orbCap = 16 * 220;
+    const maxB = wasm.gl_max_bodies(), orbCap = 16 * 220, starCap = 24000;
+    const ptStride = wasm.gl_point_stride();
     const glFeat = wasm.gl_feat();
     const n = W * H * 4;
     const bufPtr = wasm.alloc(n);
     const bgPtr = wasm.alloc(bgLen * 4);
-    const orbPtr = wasm.alloc(orbCap * 2 * 4);
+    const ptPtr = wasm.alloc((orbCap + starCap) * ptStride * 4);
     const bodyPtr = wasm.alloc(maxB * stride * 4);
     const raw = new Uint8Array(n), flipped = new Uint8Array(n);
 
@@ -248,30 +251,33 @@ void main() { fragColor = vec4(26.0 / 255.0, 30.0 / 255.0, 40.0 / 255.0, 1.0); }
     gl.bindVertexArray(vao);
     gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
     gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, ptStride * 4, 0);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 3, gl.FLOAT, false, ptStride * 4, 8);
     gl.bindVertexArray(null);
 
     // Mirrors `renderGLScene` in crates/solar/web/index.html.
     function drawScene(sys, cx, cy, zoom, bgx, bgy, tO, tS, tU) {
       gl.viewport(0, 0, W, H);
       gl.disable(gl.BLEND);
-      const salt = wasm.gl_backdrop(sys, bgPtr, cx, cy, zoom, bgx, bgy);
+      wasm.gl_backdrop(sys, bgPtr, cx, cy, zoom, bgx, bgy);
       gl.useProgram(progBg);
       gl.uniform1fv(progBg.loc.B, new Float32Array(wasm.memory.buffer, bgPtr, bgLen));
-      gl.uniform1i(progBg.loc.u_skySalt, salt);
       gl.uniform1i(progBg.loc.u_vh, H);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-      const np = wasm.gl_orbit_points(sys, orbPtr, orbCap, W, H, cx, cy, zoom);
-      if (np > 0) {
+      const nOrb = wasm.gl_orbit_points(sys, ptPtr, orbCap, W, H, cx, cy, zoom);
+      const nStar = wasm.gl_star_points(sys, ptPtr + nOrb * ptStride * 4, starCap, W, H, cx, cy, zoom, bgx, bgy);
+      if (nOrb + nStar > 0) {
         gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
         gl.bindVertexArray(vao);
         gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
-        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(wasm.memory.buffer, orbPtr, np * 2), gl.DYNAMIC_DRAW);
+        gl.bufferData(gl.ARRAY_BUFFER,
+          new Float32Array(wasm.memory.buffer, ptPtr, (nOrb + nStar) * ptStride), gl.DYNAMIC_DRAW);
         gl.useProgram(progOrbit);
         gl.uniform2f(progOrbit.loc.u_view, W, H);
-        gl.uniform1f(progOrbit.loc.u_size, wasm.gl_orbit_width(sys));
-        gl.drawArrays(gl.POINTS, 0, np);
+        if (nOrb > 0) { gl.uniform1f(progOrbit.loc.u_size, wasm.gl_orbit_width(sys)); gl.drawArrays(gl.POINTS, 0, nOrb); }
+        if (nStar > 0) { gl.uniform1f(progOrbit.loc.u_size, 1.0); gl.drawArrays(gl.POINTS, nOrb, nStar); }
         gl.bindVertexArray(null);
       }
 

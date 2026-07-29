@@ -268,21 +268,29 @@ pub extern "C" fn gl_backdrop_len() -> u32 {
     background_core::GL_UNIFORMS_LEN as u32
 }
 
-/// Fill `out` with the backdrop shader's uniforms and return the star-grid salt
-/// that goes with them as `u_skySalt`.
+/// Fill `out` with the backdrop shader's uniforms — ground and nebula. The stars
+/// are a separate pass; see [`gl_star_points`].
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn gl_backdrop(
     sys: *const System, out: *mut f32,
     cam_x: f32, cam_y: f32, zoom: f32, bgx: f32, bgy: f32,
-) -> i32 {
+) {
     let sys = unsafe { &*sys };
     let dst = unsafe { slice::from_raw_parts_mut(out, background_core::GL_UNIFORMS_LEN) };
     crate::gl_backdrop(sys, &Camera { x: cam_x, y: cam_y, zoom }, bgx, bgy, dst)
 }
 
-/// Write the dashed orbit paths as screen-space `(x, y)` pairs into `out`
-/// (`cap` pairs of capacity); returns how many points were written.
+/// Floats per point sprite, shared by the orbit dots and the stars:
+/// `(x, y, r, g, b)`, the colour already scaled so an additive blend adds
+/// exactly what the CPU adds.
+#[no_mangle]
+pub extern "C" fn gl_point_stride() -> u32 {
+    background_core::GL_POINT_STRIDE as u32
+}
+
+/// Write the dashed orbit paths as point sprites into `out` (`cap` points of
+/// capacity); returns how many were written.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn gl_orbit_points(
@@ -290,8 +298,22 @@ pub extern "C" fn gl_orbit_points(
     w: u32, h: u32, cam_x: f32, cam_y: f32, zoom: f32,
 ) -> u32 {
     let sys = unsafe { &*sys };
-    let dst = unsafe { slice::from_raw_parts_mut(out, (cap * 2) as usize) };
+    let dst = unsafe { slice::from_raw_parts_mut(out, cap as usize * background_core::GL_POINT_STRIDE) };
     crate::gl_orbit_points(sys, w, h, &Camera { x: cam_x, y: cam_y, zoom }, dst) as u32
+}
+
+/// Write the visible stars as point sprites into `out` (`cap` points of
+/// capacity); returns how many were written. Same layout as the orbit dots, so
+/// one vertex buffer serves both.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gl_star_points(
+    sys: *const System, out: *mut f32, cap: u32,
+    w: u32, h: u32, cam_x: f32, cam_y: f32, zoom: f32, bgx: f32, bgy: f32,
+) -> u32 {
+    let sys = unsafe { &*sys };
+    let dst = unsafe { slice::from_raw_parts_mut(out, cap as usize * background_core::GL_POINT_STRIDE) };
+    crate::gl_star_points(sys, w, h, &Camera { x: cam_x, y: cam_y, zoom }, bgx, bgy, dst) as u32
 }
 
 /// Write the back-to-front body draw list into `out`
