@@ -70,7 +70,23 @@ pub extern "C" fn system_set_view(
     );
 }
 
-/// Set the dashed orbit-path line thickness in pixels (clamped to 1..=6).
+/// Set the dashed orbit-path line thickness in pixels (clamped to 1..=6)./// Traffic density: 0 empties the shipping lanes, 1 is ~2.5 vessels per planet,
+/// higher makes the system busier. The ship pool is fixed, so turning this down
+/// and back up never re-rolls the vessels already on screen.
+#[no_mangle]
+pub extern "C" fn system_set_traffic(sys: *mut System, x: f32) {
+    let sys = unsafe { &mut *sys };
+    sys.set_traffic(x);
+}
+
+/// How many vessels are actually flying right now.
+#[no_mangle]
+pub extern "C" fn system_ship_count(sys: *const System) -> u32 {
+    let sys = unsafe { &*sys };
+    sys.ship_count() as u32
+}
+
+
 #[no_mangle]
 pub extern "C" fn system_set_orbit_width(sys: *mut System, px: f32) {
     let sys = unsafe { &mut *sys };

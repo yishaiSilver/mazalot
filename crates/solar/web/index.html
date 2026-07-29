@@ -150,6 +150,9 @@
     <div class="ctl"><label>Planet rotation <b id="protV">1.0×</b></label><input type="range" id="prot" min="0" max="4" step="0.1" value="1" /></div>
     <div class="ctl"><label>Star rotation <b id="srotV">1.0×</b></label><input type="range" id="srot" min="0" max="4" step="0.1" value="1" /></div>
 
+    <div class="grp">Traffic</div>
+    <div class="ctl"><label>Ships <b id="trafV">1.00×</b></label><input type="range" id="traf" min="0" max="3" step="0.05" value="1" /></div>
+
     <div class="grp">Pixelation</div>
     <div class="ctl"><label>Scene <b id="pixV">1×</b></label><input type="range" id="pix" min="1" max="8" step="1" value="1" /></div>
     <div class="ctl"><label>Planets <b id="ppixV">1×</b></label><input type="range" id="ppix" min="1" max="6" step="1" value="1" /></div>
@@ -218,6 +221,7 @@ let perfPrev = performance.now(), perfDrawn = 0, bgSig = "", bgRedrewInWindow = 
 let vSpacing = 1, vPsize = 1, vSsize = 1, vPpix = 1, vSpix = 1, vPdetail = 160, vSdetail = 110, vStarDen = 0.5, vStarPar = 1;
 let vOrbitW = 1; // dashed orbit-path line thickness in px
 let vEcc = 1;    // eccentricity multiplier (0 = circular, 1 = as generated)
+let vTraffic = 1; // interplanetary traffic density (0 = empty lanes)
 let planetCount = 6, countAuto = true;
 
 // Per-frame pixel-budget cap (perf): a phone renders far fewer pixels than a
@@ -279,7 +283,10 @@ function buildSystem() {
   // stored thickness — keeps the chosen look across seed/planet-count changes.
   if (sys) wasm.system_set_orbit_width(sys, vOrbitW);
   if (sys) wasm.system_set_eccentricity(sys, vEcc);
-  $("sysinfo").textContent = `${SUN_NAMES[sunKind] ?? "star"} · ${nPlanets} planets · seed ${seed}`;
+  if (sys) wasm.system_set_traffic(sys, vTraffic);
+  const nShips = sys ? wasm.system_ship_count(sys) : 0;
+  $("sysinfo").textContent =
+    `${SUN_NAMES[sunKind] ?? "star"} · ${nPlanets} planets · ${nShips} ships · seed ${seed}`;
 }
 
 // A new seed: rebuild and re-frame the whole system.
@@ -499,6 +506,19 @@ $("orbw").addEventListener("input", () => {
   vOrbitW = parseInt($("orbw").value) || 1;
   $("orbwV").textContent = vOrbitW + "px";
   if (sys) wasm.system_set_orbit_width(sys, vOrbitW);
+});
+
+// Traffic density: how many vessels are flying the lanes between the worlds.
+// The ship pool is fixed per system, so sliding this down and back up never
+// re-rolls the ships you were already watching.
+$("traf").addEventListener("input", () => {
+  vTraffic = parseFloat($("traf").value);
+  $("trafV").textContent = vTraffic.toFixed(2) + "×";
+  if (sys) {
+    wasm.system_set_traffic(sys, vTraffic);
+    $("sysinfo").textContent =
+      `${SUN_NAMES[sunKind] ?? "star"} · ${nPlanets} planets · ${wasm.system_ship_count(sys)} ships · seed ${seed}`;
+  }
 });
 
 // Eccentricity multiplier: 0 = circular, 1 = as generated, up to 2 = exaggerated.

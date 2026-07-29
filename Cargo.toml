@@ -4,7 +4,7 @@
 #
 #   crates/planet    — procedural planets (bins: planet, bench) + wasm
 #   crates/star      — procedural stars/suns (bin: sun) + wasm
-#   crates/solar     — draggable solar systems w/ eccentric orbits (bin: solar) + wasm
+#   crates/solar     — draggable solar systems w/ eccentric orbits + traffic (bin: solar) + wasm
 #   crates/bird      — alien/earth-bird creatures (bins: alien, bird) + wasm
 #   crates/character — paper-doll character compositor (native only)
 #   crates/moon      — planets with depth-sorted orbiting moons (bin: moon) + wasm

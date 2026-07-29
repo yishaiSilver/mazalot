@@ -7,6 +7,7 @@ const { instance } = await WebAssembly.instantiate(bytes, {});
 const {
   memory, alloc, render, system_new, system_free, planet_count, planet_kind_at,
   sun_kind_of, system_extent, nearest_center, planet_pos,
+  system_set_traffic, system_ship_count,
 } = instance.exports;
 
 const W = 320, H = 200, len = W * H * 4;
@@ -66,6 +67,28 @@ const p2 = new Float32Array(memory.buffer, pp, 2);
 const hit = nearest_center(sys, W, H, p2[0], p2[1], zoom, 3.0);
 console.log(`nearest_center when aimed at planet ${target}: ${hit}`);
 if (hit !== target) throw new Error(`expected to be viewing planet ${target}, got ${hit}`);
+
+// Interplanetary traffic: ships must scale with the knob, and turning them on
+// must actually put pixels on screen that weren't there with empty lanes.
+const shipsDefault = system_ship_count(sys);
+console.log(`ships flying at traffic=1: ${shipsDefault}`);
+if (shipsDefault < 2) throw new Error("no traffic in a multi-planet system");
+system_set_traffic(sys, 0);
+if (system_ship_count(sys) !== 0) throw new Error("traffic=0 left ships flying");
+const bufEmpty = alloc(len);
+render(sys, bufEmpty, W, H, 0, 0, zoom, 3.0);
+const pxEmpty = new Uint8Array(memory.buffer, bufEmpty, len).slice();
+system_set_traffic(sys, 2);
+const busy = system_ship_count(sys);
+if (busy <= shipsDefault) throw new Error("traffic=2 did not add ships");
+const bufBusy = alloc(len);
+render(sys, bufBusy, W, H, 0, 0, zoom, 3.0);
+const pxBusy = new Uint8Array(memory.buffer, bufBusy, len);
+let shipPx = 0;
+for (let i = 0; i < len; i++) if (pxEmpty[i] !== pxBusy[i]) shipPx++;
+console.log(`ships at traffic=2: ${busy}, bytes changed by traffic: ${shipPx}`);
+if (shipPx < 200) throw new Error("traffic drew (almost) nothing");
+system_set_traffic(sys, 1);
 
 system_free(sys);
 system_free(sysB);

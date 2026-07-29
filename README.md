@@ -120,6 +120,22 @@ system view needs). The new work is the layer on top:
   still camera — the common "watch it orbit" view — the whole background is a
   `memcpy` and only the bodies re-render. This is why the fit view runs at ~110
   fps native while orbiting (see Performance).
+- **Interplanetary traffic** — vessels shuttle between the worlds, and like
+  everything else here they are **stateless in `t`**: which leg a ship is flying
+  and how far along it is both fall out of the clock, so there is no simulation
+  to step, scrubbing time works, and the traffic is deterministic in the seed.
+  Position interpolates between the two planets sampled at the *current* time,
+  so a ship visibly departs one world and arrives at another even though both
+  keep orbiting; a perpendicular bow turns the straight chord into a course.
+  Progress follows a smoothstep, which hands us the right physics for free —
+  velocity peaks at midpoint, so |acceleration| peaks at both ends and vanishes
+  in between. Thrust tracks that, and past the midpoint the ship **flips and
+  burns retrograde** to arrive. Ships depth-sort into the same list as the
+  bodies, so one crossing the far side passes behind the star; they get a
+  minimum on-screen size (metres against millions of kilometres would otherwise
+  be invisible) and a detail cap like every other body. A **Traffic** slider
+  sets the density; the ship pool is fixed per system, so turning it down and
+  back up never re-rolls the vessels you were watching.
 - **Click to follow** — click a planet and the camera locks on and tracks it
   around its orbit; drag anywhere to release.
 
@@ -128,7 +144,12 @@ a small RGBA tile and alpha-blend it in, depth-sorted. Bodies are small, so the
 whole scene stays cheap enough to render live *while you drag*.
 
 **Add a planet archetype** = add a row to `PKINDS`; **add a star** = add a row to
-`SUNS` — both in `crates/solar/src/lib.rs`.
+`SUNS`; **add a traffic hull** = add a row to `HULLS` — all in
+`crates/solar/src/lib.rs`. Those traffic hulls are deliberately *not* the
+64-class rasterizer in `crates/ship`: the "type" crates share no code, and at
+five-to-ninety pixels a five-stop half-width profile plus a drive plume is all
+that survives the resolution — the same relationship `solar`'s compact planet
+and star tiles have to the full `planet` and `star` crates.
 
 ## The spaceship system
 
@@ -259,6 +280,8 @@ manual overrides:
   orbits, 1 = as generated, up to 2 = exaggerated ellipses).
 - **Motion** — orbit speed, and separate **planet** and **star rotation** speeds
   (three independent clocks; each accumulates so changing a speed never jumps).
+- **Traffic** — how many vessels fly the lanes between the worlds (0 empties
+  the system, 1 is ~2.5 ships per planet).
 - **Pixelation** — scene / planet / sun pixel size, plus per-body **detail caps**
   (planets and sun separately): the "lower bound of pixelation" — how far you can
   zoom before a body stops resolving finer and just enlarges its blocks. Lower

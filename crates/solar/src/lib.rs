@@ -25,7 +25,7 @@
 //! "bake-or-stay-small" guidance in the workspace README.
 
 use std::cell::RefCell;
-use std::f32::consts::TAU;
+use std::f32::consts::{PI, TAU};
 
 // ===========================================================================
 // Noise + math primitives (this crate's own copy — shared with nobody)
@@ -417,6 +417,12 @@ pub struct System {
     // Eccentricity multiplier (scales every planet's generated `e`; 0 = force
     // perfect circles, 1 = as generated, higher = exaggerate the ellipses).
     pub ecc: f32,
+    // A fixed pool of vessels shuttling between the worlds. `traffic` only
+    // decides how many of them fly, so turning it down never re-rolls the ships
+    // you were already watching.
+    pub ships: Vec<Ship>,
+    // Traffic density multiplier (0 = empty system, 1 = ~2.5 ships per planet).
+    pub traffic: f32,
     // Cached backdrop (background + orbit paths) + the key it was rendered for,
     // reused by `render_system_cached` while the camera/view is unchanged.
     bg_cache: Vec<u8>,
@@ -546,11 +552,30 @@ impl System {
             orbit += radius + rng.range(58.0, 96.0) + i as f32 * 8.0;
         }
 
+        // Interplanetary traffic. A route needs somewhere to go, so a
+        // single-planet system stays empty.
+        let mut ships = Vec::new();
+        if count >= 2 {
+            for i in 0..SHIP_POOL {
+                let kind = (rng.f() * HULLS.len() as f32) as usize % HULLS.len();
+                ships.push(Ship {
+                    kind,
+                    seed: seed.wrapping_mul(0x9E37_79B9).wrapping_add(i * 7919 + 13),
+                    period: rng.range(26.0, 70.0),
+                    cruise: rng.range(0.55, 0.85),
+                    phase: rng.f(),
+                    arc: rng.range(-1.0, 1.0) * 90.0,
+                    park: rng.range(0.0, TAU),
+                    len: HULLS[kind].len * rng.range(0.8, 1.3),
+                });
+            }
+        }
+
         System {
             seed, sun_kind, sun_radius, planets,
             spacing: 1.0, planet_size: 1.0, sun_size: 1.0, planet_pixel: 1.0, sun_pixel: 1.0,
             planet_detail: 160.0, sun_detail: 110.0, star_density: 0.5, star_parallax: 1.0,
-            orbit_width: 1.0, ecc: 1.0,
+            orbit_width: 1.0, ecc: 1.0, ships, traffic: 1.0,
             bg_cache: Vec::new(), bg_key: None,
             neb: RefCell::new(BgCache::default()),
             sun_tile: RefCell::new(SunCache::default()),
@@ -595,6 +620,40 @@ impl System {
     /// planet's generated eccentricity, higher exaggerates the ellipses.
     pub fn set_eccentricity(&mut self, scale: f32) {
         self.ecc = scale.clamp(0.0, 2.5);
+    }
+
+    /// Live traffic density: 0 empties the shipping lanes, 1 is ~2.5 vessels
+    /// per planet, higher makes the system busier.
+    pub fn set_traffic(&mut self, x: f32) {
+        self.traffic = x.clamp(0.0, 3.0);
+    }
+
+    /// How many ships are actually flying right now (the pool is fixed; this is
+    /// the slice of it that `traffic` switches on).
+    pub fn ship_count(&self) -> usize {
+        if self.planets.len() < 2 {
+            return 0;
+        }
+        let n = (self.planets.len() as f32 * 2.5 * self.traffic).round().max(0.0);
+        (n as usize).min(self.ships.len())
+    }
+
+    /// World position of ship `i` at time `t` — for a camera that follows a
+    /// vessel between worlds, the same way `planet_world_pos` follows a planet.
+    pub fn ship_world_pos(&self, i: usize, t: f32) -> (f32, f32) {
+        match self.ships.get(i) {
+            Some(sh) => {
+                let st = sh.state(self, t);
+                (st.x, st.y)
+            }
+            None => (0.0, 0.0),
+        }
+    }
+
+    /// Hull type of ship `i` (`"courier"`, `"hauler"`, …) — for a traffic
+    /// readout in the HUD.
+    pub fn ship_hull_name(&self, i: usize) -> &'static str {
+        self.ships.get(i).map(|s| HULLS[s.kind].name).unwrap_or("")
     }
 
     /// The outermost extent (world units) with the current view multipliers —
@@ -850,6 +909,280 @@ fn render_planet_tile(pk: &PKind, seed: u32, spin_a: f32, spin_t: f32, light: [f
             px[idx + 1] = (q[1] * 255.0) as u8;
             px[idx + 2] = (q[2] * 255.0) as u8;
             px[idx + 3] = (clamp01(a) * 255.0) as u8;
+        }
+    }
+    Tile { px, size }
+}
+
+// ===========================================================================
+// Interplanetary traffic
+// ===========================================================================
+
+/// A compact hull archetype for system-scale traffic.
+///
+/// This is deliberately NOT the 60-class part rasterizer in `crates/ship` —
+/// each "type" crate here is self-contained, and at this size (a few pixels to
+/// a few dozen) a five-stop half-width profile plus a drive plume is all that
+/// survives the resolution anyway. Same relationship as `solar`'s own compact
+/// planet and star tiles versus the full `planet` / `star` crates.
+#[derive(Clone, Copy)]
+struct Hull {
+    name: &'static str,
+    /// Half-width profile, nose → stern, as a fraction of `beam`.
+    prof: [f32; 5],
+    /// Max half-width as a fraction of length.
+    beam: f32,
+    /// Outrigger pod pairs (cargo racks / nacelles); 0 = a clean hull.
+    pods: u32,
+    /// Wing half-span beyond the hull, as a fraction of length (0 = none).
+    wing: f32,
+    plate: Rgb,
+    glow: Rgb,
+    /// Nominal length in world units (a planet's radius is ~9–34).
+    len: f32,
+}
+
+/// Six hulls is plenty of variety at traffic scale — the eye reads silhouette
+/// and drive colour, nothing finer.
+/// How many vessels are generated per system. `traffic` selects a prefix of
+/// this pool, so the knob never re-rolls the ships already on screen.
+const SHIP_POOL: u32 = 40;
+/// Ships are metres against a backdrop of millions of kilometres, so they get a
+/// minimum on-screen size — otherwise traffic is invisible at any zoom that
+/// shows more than one planet. The max is the same "detail cap" idea the bodies
+/// use: past it a ship stops resolving finer and just gets blockier.
+const SHIP_MIN_PX: f32 = 5.0;
+const SHIP_MAX_PX: f32 = 96.0;
+
+const HULLS: &[Hull] = &[
+    Hull { name: "courier",   prof: [0.05, 0.55, 0.90, 1.00, 0.55], beam: 0.14, pods: 0, wing: 0.11,
+           plate: [0.78, 0.79, 0.83], glow: [0.62, 0.82, 1.00], len: 5.0 },
+    Hull { name: "shuttle",   prof: [0.35, 0.80, 1.00, 0.94, 0.66], beam: 0.22, pods: 0, wing: 0.19,
+           plate: [0.84, 0.82, 0.76], glow: [0.86, 0.92, 1.00], len: 4.2 },
+    Hull { name: "freighter", prof: [0.20, 0.72, 1.00, 0.90, 0.60], beam: 0.19, pods: 1, wing: 0.0,
+           plate: [0.70, 0.62, 0.42], glow: [1.00, 0.72, 0.30], len: 8.0 },
+    Hull { name: "hauler",    prof: [0.55, 0.92, 1.00, 1.00, 0.80], beam: 0.25, pods: 2, wing: 0.0,
+           plate: [0.62, 0.56, 0.36], glow: [1.00, 0.64, 0.26], len: 11.0 },
+    Hull { name: "liner",     prof: [0.15, 0.66, 1.00, 0.88, 0.55], beam: 0.16, pods: 0, wing: 0.0,
+           plate: [0.88, 0.88, 0.90], glow: [0.90, 0.94, 1.00], len: 9.5 },
+    Hull { name: "cruiser",   prof: [0.10, 0.42, 0.72, 0.95, 1.00], beam: 0.15, pods: 0, wing: 0.14,
+           plate: [0.52, 0.56, 0.62], glow: [0.55, 0.78, 1.00], len: 7.5 },
+];
+
+/// Sample a 5-stop half-width profile at `v` ∈ [0,1] (0 = nose, 1 = stern),
+/// quantized into four welded sections. A smooth taper reads as a lozenge at
+/// this size; discrete steps read as a hull — the same lesson the `ship` crate
+/// learned, and it costs one `floor`.
+fn hull_half(p: &[f32; 5], v: f32) -> f32 {
+    let q = ((clamp01(v) * 4.0).floor() + 0.5) / 4.0;
+    let x = q * 4.0;
+    let i = (x.floor() as usize).min(3);
+    let f = x - i as f32;
+    lerp(p[i], p[i + 1], f * f * (3.0 - 2.0 * f))
+}
+
+/// One vessel shuttling between worlds.
+///
+/// Fully **stateless in `t`**: which leg it is flying and how far along it is
+/// both fall out of the clock, so there is no simulation to step, scrubbing or
+/// re-seeking time works, and the traffic is deterministic in the system seed —
+/// the same discipline the orbits themselves already follow.
+pub struct Ship {
+    kind: usize,
+    seed: u32,
+    /// Whole-cycle period (cruise + dwell) in orbit-clock units.
+    period: f32,
+    /// Fraction of the cycle spent under way; the remainder is docked.
+    cruise: f32,
+    /// Offset into the cycle at `t = 0`.
+    phase: f32,
+    /// Perpendicular bow of the trajectory, in world units — a straight line
+    /// between two moving planets reads as a ruler, a bowed one as a course.
+    arc: f32,
+    /// Where around the destination it parks, in radians.
+    park: f32,
+    /// Length in world units.
+    len: f32,
+}
+
+/// Which planet this ship is at on leg `leg`. Hashing the leg index (rather
+/// than walking a stored itinerary) is what keeps the whole thing stateless.
+fn route(seed: u32, leg: i32, n: usize) -> usize {
+    (hash3(seed as i32, leg, 0x0d15) * n as f32) as usize % n
+}
+
+/// Where a ship is, which way it is pointing, and how hard it is burning.
+struct ShipState {
+    x: f32,
+    y: f32,
+    heading: f32,
+    thrust: f32,
+    depth: f32,
+}
+
+impl Ship {
+    /// Position + orbital depth at `t`, plus the cycle fraction `u`.
+    fn point(&self, sys: &System, t: f32) -> (f32, f32, f32, f32) {
+        let n = sys.planets.len().max(1);
+        let x = t / self.period + self.phase;
+        let leg = x.floor();
+        let u = x - leg;
+        let from = route(self.seed, leg as i32, n);
+        let to = {
+            let r = route(self.seed, leg as i32 + 1, n);
+            if r == from {
+                (from + 1) % n
+            } else {
+                r
+            }
+        };
+        let (ax, ay, ad) = sys.planets[from].at(t, sys.spacing, sys.ecc);
+        let (bx, by, bd) = sys.planets[to].at(t, sys.spacing, sys.ecc);
+        // Under way for the first `cruise` of the cycle, then docked at `to`.
+        // Smoothstep gives the velocity profile we want for free: slow at both
+        // ends, fastest at midpoint — i.e. accelerate, coast, decelerate.
+        let s = if u < self.cruise { let k = u / self.cruise; k * k * (3.0 - 2.0 * k) } else { 1.0 };
+        // Both endpoints are sampled at the CURRENT t, so the ship visibly
+        // departs A and arrives at B even though both keep orbiting.
+        let (mut px, mut py) = (lerp(ax, bx, s), lerp(ay, by, s));
+        let (dx, dy) = (bx - ax, by - ay);
+        let d = (dx * dx + dy * dy).sqrt().max(1e-3);
+        let bow = (PI * s).sin() * self.arc;
+        px += -dy / d * bow;
+        py += dx / d * bow;
+        // Ease into a parking slot just off the destination, so an arrived ship
+        // sits beside its planet instead of inside it.
+        let park_r = sys.planets[to].radius * sys.planet_size * 1.9 + self.len;
+        let k = s * s * s;
+        px += self.park.cos() * park_r * k;
+        py += self.park.sin() * park_r * ORBIT_FLATTEN * k;
+        (px, py, lerp(ad, bd, s), u)
+    }
+
+    fn state(&self, sys: &System, t: f32) -> ShipState {
+        let (x, y, depth, u) = self.point(sys, t);
+        let dt = self.period * 0.003;
+        let (x2, y2, _, _) = self.point(sys, t + dt);
+        let mut heading = (y2 - y).atan2(x2 - x);
+        let mut thrust = 0.0;
+        if u < self.cruise {
+            // Thrust tracks |acceleration|, which for a smoothstep position is
+            // greatest at both ends and zero at midpoint — so the ship boosts
+            // out, coasts, then FLIPS and burns retrograde to arrive. The flip
+            // is the whole reason to do it this way: it reads instantly.
+            let a = 1.0 - 2.0 * (u / self.cruise);
+            thrust = a.abs().max(0.14);
+            if a < 0.0 {
+                heading += PI;
+            }
+        }
+        ShipState { x, y, heading, thrust, depth }
+    }
+}
+
+/// Render one ship into a small tile, already rotated to `heading` (the blitter
+/// only scales, so the rotation is baked in at sample time — the same trick the
+/// planet tiles use for axial spin).
+fn render_ship_tile(h: &Hull, seed: u32, heading: f32, thrust: f32, len_px: f32, light: [f32; 3], t: f32) -> Tile {
+    let plume_len = 0.35 + 1.15 * thrust; // in hull lengths
+    let half = len_px * (0.5 + plume_len) + 2.0;
+    let size = (half * 2.0).ceil().max(6.0) as u32;
+    let c = size as f32 * 0.5;
+    let mut px = vec![0u8; (size * size * 4) as usize];
+    let (ca, sa) = (heading.cos(), heading.sin());
+    let inv = 1.0 / len_px.max(1e-3);
+    let tint = hash3(seed as i32, 3, 11) * 0.16 - 0.08;
+    let plate = [
+        clamp01(h.plate[0] + tint),
+        clamp01(h.plate[1] + tint * 0.5),
+        clamp01(h.plate[2] - tint * 0.5),
+    ];
+
+    for y in 0..size {
+        for x in 0..size {
+            let (dx, dy) = (x as f32 + 0.5 - c, y as f32 + 0.5 - c);
+            // Ship-local, in hull-length units: +lx is FORWARD (toward the nose),
+            // +ly is to starboard.
+            let lx = (dx * ca + dy * sa) * inv;
+            let ly = (-dx * sa + dy * ca) * inv;
+            let v = 0.5 - lx; // 0 at the nose, 1 at the stern
+            let mut col = [0.0f32; 3];
+            let mut a = 0.0f32;
+
+            // --- hull ---------------------------------------------------
+            if (0.0..=1.0).contains(&v) {
+                let hw = hull_half(&h.prof, v) * h.beam;
+                // Outrigger pods and wings widen the silhouette; testing them
+                // as part of the same lateral bound keeps this one branch.
+                let pod = h.pods > 0 && (0.34..0.78).contains(&v);
+                // A clear gap between hull and pod, so the rack reads as a
+                // separate module rather than a bulge.
+                let pod_in = h.beam * 1.45;
+                let pod_out = pod_in + h.beam * 0.95;
+                let wing = if h.wing > 0.0 && (0.52..0.80).contains(&v) {
+                    h.wing * (1.0 - ((v - 0.52) / 0.28))
+                } else {
+                    0.0
+                };
+                let inside = ly.abs() <= hw
+                    || (pod && (pod_in..=pod_out).contains(&ly.abs()))
+                    || (wing > 0.0 && ly.abs() <= hw + wing);
+                if inside {
+                    let over = ly.abs() > hw;
+                    let n_lat = if over { 0.30 * ly.signum() } else { 0.72 * (ly / hw.max(1e-4)) };
+                    let nz = (1.0 - n_lat * n_lat).max(0.05).sqrt();
+                    // Slope along the hull, so the nose and stern shade too.
+                    let e = 0.02;
+                    let dw = (hull_half(&h.prof, v + e) - hull_half(&h.prof, v - e)) * h.beam / (2.0 * e);
+                    // Rotate the local normal into screen space (y down, to
+                    // match the light vector the caller hands us).
+                    let (al, la) = (-dw * 0.5, n_lat);
+                    let n = [al * ca - la * sa, al * sa + la * ca, nz];
+                    let m = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-4);
+                    let n = [n[0] / m, n[1] / m, n[2] / m];
+                    let ndl = (n[0] * light[0] + n[1] * light[1] + n[2] * light[2]).max(0.0);
+                    let mut base = if over { mix(plate, [0.24, 0.25, 0.29], 0.45) } else { plate };
+                    // A lighter prow cap — the same "which end is forward" cue
+                    // the ship crate uses, and it survives even at 6 px.
+                    if v < 0.18 {
+                        base = mix(base, [0.94, 0.95, 0.98], 0.45);
+                    }
+                    let mut k = 0.22 + 0.98 * ndl;
+                    // Darken the last sliver of the flank — a ship parked in
+                    // front of a lit planet needs its own outline.
+                    if !over && ly.abs() > hw * 0.82 {
+                        k *= 0.55;
+                    }
+                    col = [base[0] * k, base[1] * k, base[2] * k];
+                    a = 1.0;
+                }
+            }
+
+            // --- drive plume (additive, aft of the stern) ----------------
+            if thrust > 0.01 && lx < -0.5 {
+                let d = -(lx + 0.5);
+                if d < plume_len {
+                    let s = d / plume_len;
+                    let flare = h.beam * 0.7 * (0.9 + 1.9 * s);
+                    let q = ly / flare;
+                    if q.abs() < 1.0 {
+                        let radial = (1.0 - q * q).max(0.0);
+                        let flick = 0.75 + 0.45 * fbm(lx * 14.0, ly * 14.0 - t * 9.0, seed as f32 * 0.01, 2);
+                        let i = radial * radial * (1.0 - s).powf(1.4) * flick * thrust * 1.5;
+                        col = [col[0] + h.glow[0] * i, col[1] + h.glow[1] * i, col[2] + h.glow[2] * i];
+                        a = a.max(clamp01(i * 1.7));
+                    }
+                }
+            }
+
+            if a > 0.004 {
+                let q = quant(col, bayer(x, y));
+                let o = ((y * size + x) * 4) as usize;
+                px[o] = (clamp01(q[0]) * 255.0) as u8;
+                px[o + 1] = (clamp01(q[1]) * 255.0) as u8;
+                px[o + 2] = (clamp01(q[2]) * 255.0) as u8;
+                px[o + 3] = (clamp01(a) * 255.0) as u8;
+            }
         }
     }
     Tile { px, size }
@@ -1239,6 +1572,11 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
         let (_, _, depth) = p.at(t_orbit, sys.spacing, sys.ecc);
         order.push((depth, i as i32));
     }
+    // Ships sort into the same list (encoded as -2-i), so one crossing the far
+    // side of the system passes behind the star like anything else out there.
+    for i in 0..sys.ship_count() {
+        order.push((sys.ships[i].state(sys, t_orbit).depth, -2 - i as i32));
+    }
     order.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let (suncx, suncy) = to_screen(0.0, 0.0, cam, w, h);
@@ -1263,7 +1601,24 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
 
     for idx in 0..order.len() {
         let which = order[idx].1;
-        if which < 0 {
+        if which <= -2 {
+            // A ship under way between two worlds.
+            let sh = &sys.ships[(-2 - which) as usize];
+            let st = sh.state(sys, t_orbit);
+            let (sx, sy) = to_screen(st.x, st.y, cam, w, h);
+            let len_px = (sh.len * cam.zoom).clamp(SHIP_MIN_PX, SHIP_MAX_PX);
+            if offscreen(sx, sy, len_px, 2.4) {
+                continue;
+            }
+            // Lit from the star, exactly like the planets — in screen space
+            // with y DOWN, which is the convention `render_ship_tile` wants.
+            let (dx, dy) = (suncx - sx, suncy - sy);
+            let lz = (dx * dx + dy * dy).sqrt().max(1e-3) * 0.55;
+            let m = (dx * dx + dy * dy + lz * lz).sqrt().max(1e-3);
+            let light = [dx / m, dy / m, lz / m];
+            let tile = render_ship_tile(&HULLS[sh.kind], sh.seed, st.heading, st.thrust, len_px, light, t_orbit);
+            blit(out, w, h, &tile, sx, sy, 1.0);
+        } else if which < 0 {
             // The star. Per-body pixelation: render the tile smaller by
             // `sun_pixel`, then `blit` upsizes it by the same factor, so it
             // stays the same on-screen size but turns blockier.
