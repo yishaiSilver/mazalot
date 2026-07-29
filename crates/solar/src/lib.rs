@@ -659,9 +659,22 @@ pub fn render_system_cached(sys: &mut System, w: u32, h: u32, cam: &Camera, bgx:
 /// bodies over it. Paired with [`render_bodies_band`] to split a scene across a
 /// worker pool — the backdrop is a small share of a zoomed-in frame, so it stays
 /// on one thread and only the bodies fan out.
-pub fn render_backdrop(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: f32, out: &mut [u8]) {
-    assert!(out.len() >= (w * h * 4) as usize);
+/// Uses the same cache [`render_system_cached`] does, and that is not optional:
+/// the backdrop is FULL-FRAME work that the worker split does not touch, so
+/// repainting it every frame makes turning the pool on a net loss. It did,
+/// until this took `&mut`.
+pub fn render_backdrop(sys: &mut System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: f32, out: &mut [u8]) {
+    let len = (w * h * 4) as usize;
+    assert!(out.len() >= len);
+    let key = bg_key(sys, w, h, cam, bgx, bgy);
+    if sys.bg_key == Some(key) && sys.bg_cache.len() == len {
+        out[..len].copy_from_slice(&sys.bg_cache);
+        return;
+    }
     draw_bg_orbits(sys, w, h, cam, bgx, bgy, out);
+    sys.bg_cache.clear();
+    sys.bg_cache.extend_from_slice(&out[..len]);
+    sys.bg_key = Some(key);
 }
 
 /// The bodies alone, for rows `y0..y1`, drawn OVER whatever is already in `out`.
@@ -926,7 +939,7 @@ mod band_tests {
         const H: u32 = 140;
         let n = (W * H * 4) as usize;
         for seed in [7u32, 21] {
-            let sys = System::generate(seed);
+            let mut sys = System::generate(seed);
             // Zoomed onto a body — the case the split exists for — and a fit view.
             let (bx, by) = planet_world_pos(&sys, sys.planets.len() / 2, 0.13);
             for cam in [Camera { x: bx, y: by, zoom: 9.0 }, Camera { x: 0.0, y: 0.0, zoom: 0.7 }] {
@@ -935,7 +948,7 @@ mod band_tests {
 
                 for bands in [2u32, 3, 5] {
                     let mut out = vec![0u8; n];
-                    render_backdrop(&sys, W, H, &cam, 3.0, 0.0, &mut out);
+                    render_backdrop(&mut sys, W, H, &cam, 3.0, 0.0, &mut out);
                     let step = H.div_ceil(bands);
                     for b in 0..bands {
                         let (y0, y1) = (b * step, ((b + 1) * step).min(H));

@@ -180,10 +180,10 @@ pub extern "C" fn system_set_frozen_clouds(sys: *mut System, on: u32) {
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn render_backdrop(
-    sys: *const System, buf: *mut u8, w: u32, h: u32,
+    sys: *mut System, buf: *mut u8, w: u32, h: u32,
     cam_x: f32, cam_y: f32, zoom: f32, bgx: f32, bgy: f32,
 ) {
-    let sys = unsafe { &*sys };
+    let sys = unsafe { &mut *sys };
     let out = unsafe { wasm_abi::out_rgba(buf, w, h) };
     crate::render_backdrop(sys, w, h, &Camera { x: cam_x, y: cam_y, zoom }, bgx, bgy, out);
 }
