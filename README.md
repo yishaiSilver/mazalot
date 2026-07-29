@@ -120,17 +120,29 @@ system view needs). The new work is the layer on top:
   still camera — the common "watch it orbit" view — the whole background is a
   `memcpy` and only the bodies re-render. This is why the fit view runs at ~110
   fps native while orbiting (see Performance).
-- **Interplanetary traffic** — vessels shuttle between the worlds, and like
-  everything else here they are **stateless in `t`**: which leg a ship is flying
-  and how far along it is both fall out of the clock, so there is no simulation
-  to step, scrubbing time works, and the traffic is deterministic in the seed.
-  Position interpolates between the two planets sampled at the *current* time,
-  so a ship visibly departs one world and arrives at another even though both
-  keep orbiting; a perpendicular bow turns the straight chord into a course.
-  Progress follows a smoothstep, which hands us the right physics for free —
-  velocity peaks at midpoint, so |acceleration| peaks at both ends and vanishes
-  in between. Thrust tracks that, and past the midpoint the ship **flips and
-  burns retrograde** to arrive. Ships depth-sort into the same list as the
+- **Interplanetary traffic** — vessels run down whatever they need to reach.
+  These ships obey **no orbital mechanics at all**: they point at a target and
+  burn. A leg freezes its cast-off point at the moment the ship let go and
+  interpolates toward the destination sampled at the *current* time, which
+  traces a **pursuit curve** for free — the path bends over the leg, and bends
+  harder for a fast target. The star counts as a target (about one leg in `5n`),
+  so the odd sundiver goes by.
+
+  Two traps, both of which make the paths read as orbits rather than dashes:
+  sampling *both* endpoints at the current time welds the ship to its origin
+  planet's orbital velocity for the first half of the trip; and letting a leg
+  run long next to the target's year means the target sweeps most of its ellipse
+  mid-flight and the ship just follows it round. Transits are a handful of time
+  units against a planetary year of ~40.
+
+  Like everything else here the whole thing is **stateless in `t`** — which leg
+  a ship is flying and how far along it is both fall out of the clock, with the
+  itinerary hashed from the leg index rather than stored — so there is no
+  simulation to step, scrubbing time works, and the traffic is deterministic in
+  the seed. Progress follows a smoothstep, which hands over the right physics
+  for free: velocity peaks at midpoint, so |acceleration| peaks at both ends and
+  vanishes between. Thrust tracks that, and past the midpoint the ship **flips
+  and burns retrograde** to arrive. Ships depth-sort into the same list as the
   bodies, so one crossing the far side passes behind the star; they get a
   minimum on-screen size (metres against millions of kilometres would otherwise
   be invisible) and a detail cap like every other body. A **Traffic** slider

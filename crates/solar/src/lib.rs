@@ -558,13 +558,20 @@ impl System {
         if count >= 2 {
             for i in 0..SHIP_POOL {
                 let kind = (rng.f() * HULLS.len() as f32) as usize % HULLS.len();
+                // A chase has to be SHORT next to the target's orbit. A planet's
+                // year here is ~40 time units; at the old 15-60 unit legs the
+                // target swept most of its ellipse mid-flight and the ship
+                // simply followed it round, so every path read as an orbit
+                // rather than a dash. A few units of burn fixes that outright.
+                let cruise_t = rng.range(4.0, 10.0);
+                let dwell_t = rng.range(7.0, 30.0);
                 ships.push(Ship {
                     kind,
                     seed: seed.wrapping_mul(0x9E37_79B9).wrapping_add(i * 7919 + 13),
-                    period: rng.range(26.0, 70.0),
-                    cruise: rng.range(0.55, 0.85),
+                    period: cruise_t + dwell_t,
+                    cruise: cruise_t / (cruise_t + dwell_t),
                     phase: rng.f(),
-                    arc: rng.range(-1.0, 1.0) * 90.0,
+                    arc: rng.range(-1.0, 1.0) * 38.0,
                     park: rng.range(0.0, TAU),
                     len: HULLS[kind].len * rng.range(0.8, 1.3),
                 });
@@ -648,6 +655,20 @@ impl System {
             }
             None => (0.0, 0.0),
         }
+    }
+
+    /// Whether ship `i` is under way at `t` (as opposed to parked alongside
+    /// whatever it last ran down).
+    pub fn ship_under_way(&self, i: usize, t: f32) -> bool {
+        match self.ships.get(i) {
+            Some(sh) => sh.state(self, t).thrust > 0.0,
+            None => false,
+        }
+    }
+
+    /// How many vessels are under way right now, the rest being parked.
+    pub fn ships_under_way(&self, t: f32) -> usize {
+        (0..self.ship_count()).filter(|&i| self.ship_under_way(i, t)).count()
     }
 
     /// Hull type of ship `i` (`"courier"`, `"hauler"`, …) — for a traffic
@@ -1005,10 +1026,38 @@ pub struct Ship {
     len: f32,
 }
 
-/// Which planet this ship is at on leg `leg`. Hashing the leg index (rather
-/// than walking a stored itinerary) is what keeps the whole thing stateless.
-fn route(seed: u32, leg: i32, n: usize) -> usize {
-    (hash3(seed as i32, leg, 0x0d15) * n as f32) as usize % n
+/// Somewhere a ship might be headed. These vessels don't fly transfer orbits —
+/// they point at whatever they need to reach and burn — so a destination is
+/// just a moving point to run down, and the star is as valid a target as any
+/// world.
+#[derive(Clone, Copy, PartialEq)]
+enum Target {
+    Star,
+    Planet(usize),
+}
+
+/// Where this ship is headed on leg `leg`. Hashing the leg index (rather than
+/// walking a stored itinerary) is what keeps the whole thing stateless. The
+/// star wins roughly one leg in `5n`, so a sundiver is a rare sight.
+fn route(seed: u32, leg: i32, n: usize) -> Target {
+    let k = (hash3(seed as i32, leg, 0x0d15) * (n as f32 * 5.0)) as usize;
+    if k == 0 {
+        Target::Star
+    } else {
+        Target::Planet(k % n)
+    }
+}
+
+/// A target's position, orbital depth, and the radius a ship parks at.
+fn target_at(sys: &System, tg: Target, t: f32) -> (f32, f32, f32, f32) {
+    match tg {
+        Target::Star => (0.0, 0.0, 0.0, sys.sun_radius * sys.sun_size * 1.45),
+        Target::Planet(i) => {
+            let p = &sys.planets[i];
+            let (x, y, d) = p.at(t, sys.spacing, sys.ecc);
+            (x, y, d, p.radius * sys.planet_size * 1.9)
+        }
+    }
 }
 
 /// Where a ship is, which way it is pointing, and how hard it is burning.
@@ -1022,6 +1071,18 @@ struct ShipState {
 
 impl Ship {
     /// Position + orbital depth at `t`, plus the cycle fraction `u`.
+    ///
+    /// **A pursuit, not a transfer orbit.** The origin is FROZEN at the point
+    /// the ship cast off, while the destination is sampled at the *current* `t`
+    /// — so the ship leaves a fixed point in space and runs down a target that
+    /// keeps moving. Interpolating toward a moving endpoint traces a pursuit
+    /// curve for free: the path bends over the leg, and bends harder for a fast
+    /// target, which is exactly what chasing something looks like.
+    ///
+    /// Sampling BOTH endpoints at the current time (the obvious thing) is what
+    /// you must not do — it welds the ship to its origin planet's orbital
+    /// velocity for the first half of the trip, so the whole path gets dragged
+    /// sideways around the star and the ship never looks like it is flying.
     fn point(&self, sys: &System, t: f32) -> (f32, f32, f32, f32) {
         let n = sys.planets.len().max(1);
         let x = t / self.period + self.phase;
@@ -1031,19 +1092,19 @@ impl Ship {
         let to = {
             let r = route(self.seed, leg as i32 + 1, n);
             if r == from {
-                (from + 1) % n
+                Target::Planet((leg as usize + 1) % n)
             } else {
                 r
             }
         };
-        let (ax, ay, ad) = sys.planets[from].at(t, sys.spacing, sys.ecc);
-        let (bx, by, bd) = sys.planets[to].at(t, sys.spacing, sys.ecc);
-        // Under way for the first `cruise` of the cycle, then docked at `to`.
+        // Cast-off point: where the origin was when this leg began, held fixed.
+        let t0 = (leg - self.phase) * self.period;
+        let (ax, ay, ad, _) = target_at(sys, from, t0);
+        let (bx, by, bd, park_r) = target_at(sys, to, t);
+        // Under way for the first `cruise` of the cycle, then parked at `to`.
         // Smoothstep gives the velocity profile we want for free: slow at both
         // ends, fastest at midpoint — i.e. accelerate, coast, decelerate.
         let s = if u < self.cruise { let k = u / self.cruise; k * k * (3.0 - 2.0 * k) } else { 1.0 };
-        // Both endpoints are sampled at the CURRENT t, so the ship visibly
-        // departs A and arrives at B even though both keep orbiting.
         let (mut px, mut py) = (lerp(ax, bx, s), lerp(ay, by, s));
         let (dx, dy) = (bx - ax, by - ay);
         let d = (dx * dx + dy * dy).sqrt().max(1e-3);
@@ -1051,9 +1112,9 @@ impl Ship {
         px += -dy / d * bow;
         py += dx / d * bow;
         // Ease into a parking slot just off the destination, so an arrived ship
-        // sits beside its planet instead of inside it.
-        let park_r = sys.planets[to].radius * sys.planet_size * 1.9 + self.len;
+        // sits beside its target instead of inside it.
         let k = s * s * s;
+        let park_r = park_r + self.len;
         px += self.park.cos() * park_r * k;
         py += self.park.sin() * park_r * ORBIT_FLATTEN * k;
         (px, py, lerp(ad, bd, s), u)

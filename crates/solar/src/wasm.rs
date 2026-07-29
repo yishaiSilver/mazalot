@@ -79,6 +79,14 @@ pub extern "C" fn system_set_traffic(sys: *mut System, x: f32) {
     sys.set_traffic(x);
 }
 
+/// How many vessels are under way at `t`; the rest are parked alongside
+/// whatever they last ran down.
+#[no_mangle]
+pub extern "C" fn system_ships_under_way(sys: *const System, t: f32) -> u32 {
+    let sys = unsafe { &*sys };
+    sys.ships_under_way(t) as u32
+}
+
 /// How many vessels are actually flying right now.
 #[no_mangle]
 pub extern "C" fn system_ship_count(sys: *const System) -> u32 {

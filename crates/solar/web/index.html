@@ -284,9 +284,7 @@ function buildSystem() {
   if (sys) wasm.system_set_orbit_width(sys, vOrbitW);
   if (sys) wasm.system_set_eccentricity(sys, vEcc);
   if (sys) wasm.system_set_traffic(sys, vTraffic);
-  const nShips = sys ? wasm.system_ship_count(sys) : 0;
-  $("sysinfo").textContent =
-    `${SUN_NAMES[sunKind] ?? "star"} · ${nPlanets} planets · ${nShips} ships · seed ${seed}`;
+  sysInfo();
 }
 
 // A new seed: rebuild and re-frame the whole system.
@@ -349,6 +347,10 @@ function frame(now) {
   const v = $("viewing");
   const kind = near >= 0 ? (PLANET_NAMES[planetKinds[near]] ?? "planet") : (SUN_NAMES[sunKind] ?? "the star");
   v.firstChild.textContent = (follow >= 0 ? "◎ following " : "") + kind + " ";
+
+  // Ships depart and dock as the clock runs; refresh the count a few times a
+  // second rather than writing to the DOM on every frame.
+  if (now - lastInfo > 400) { lastInfo = now; sysInfo(); }
 
   updatePerf(now, renderMs, performance.now() - frameStart);
   requestAnimationFrame(frame);
@@ -508,6 +510,18 @@ $("orbw").addEventListener("input", () => {
   if (sys) wasm.system_set_orbit_width(sys, vOrbitW);
 });
 
+// The one place the system readout is composed. `under way` ticks as ships
+// depart and dock, so the frame loop refreshes it a few times a second rather
+// than writing to the DOM every frame.
+let lastInfo = 0;
+function sysInfo() {
+  if (!sys) return;
+  const n = wasm.system_ship_count(sys);
+  const flying = n ? wasm.system_ships_under_way(sys, tOrbit) : 0;
+  $("sysinfo").textContent =
+    `${SUN_NAMES[sunKind] ?? "star"} · ${nPlanets} planets · ${n} ships, ${flying} under way · seed ${seed}`;
+}
+
 // Traffic density: how many vessels are flying the lanes between the worlds.
 // The ship pool is fixed per system, so sliding this down and back up never
 // re-rolls the ships you were already watching.
@@ -516,8 +530,7 @@ $("traf").addEventListener("input", () => {
   $("trafV").textContent = vTraffic.toFixed(2) + "×";
   if (sys) {
     wasm.system_set_traffic(sys, vTraffic);
-    $("sysinfo").textContent =
-      `${SUN_NAMES[sunKind] ?? "star"} · ${nPlanets} planets · ${wasm.system_ship_count(sys)} ships · seed ${seed}`;
+    sysInfo();
   }
 });
 
