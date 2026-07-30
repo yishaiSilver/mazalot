@@ -116,3 +116,100 @@ pub extern "C" fn render_features(
 pub extern "C" fn feat_all() -> u32 {
     planet_core::F_ALL
 }
+
+// --- WebGL2 path -----------------------------------------------------------
+//
+// The GPU renders `planet_core::GL_SOURCES`; these exports are everything the JS
+// needs to drive it. The shaders travel inside the module rather than as sibling
+// files, so the single-file artifact keeps working and the GLSL cannot go stale
+// against the wasm it was built with.
+
+/// Number of entries [`gl_src_ptr`] addresses.
+///
+/// A complete fragment shader is the two preludes (noise, then dither) followed
+/// by one body, so the JS concatenates `[0, 1, 2]`. Same shape as `solar`'s, so
+/// one harness drives both.
+#[no_mangle]
+pub extern "C" fn gl_src_count() -> u32 {
+    planet_core::GL_SOURCES.len() as u32
+}
+
+/// Pointer to GLSL source `i` in wasm memory, with [`gl_src_len`] bytes of UTF-8
+/// after it. Out of range yields null.
+#[no_mangle]
+pub extern "C" fn gl_src_ptr(i: u32) -> *const u8 {
+    planet_core::GL_SOURCES.get(i as usize).map_or(core::ptr::null(), |s| s.as_ptr())
+}
+
+/// Length of GLSL source `i` in bytes.
+#[no_mangle]
+pub extern "C" fn gl_src_len(i: u32) -> u32 {
+    planet_core::GL_SOURCES.get(i as usize).map_or(0, |s| s.len() as u32)
+}
+
+/// Number of `f32`s [`gl_uniforms`] writes — the buffer JS must allocate.
+#[no_mangle]
+pub extern "C" fn gl_uniforms_len() -> u32 {
+    planet_core::GL_UNIFORMS_LEN as u32
+}
+
+/// Fill `out_ptr` with one frame's uniforms for the WebGL2 shader. Same
+/// arguments as `render_features`, minus the pixel buffer: the type row, the
+/// seeded constants and the octave budget all come from the same Rust that the
+/// CPU path uses, so the GPU renders the type table rather than a copy of it.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gl_uniforms(
+    out_ptr: *mut f32,
+    size: u32,
+    type_idx: u32,
+    seed: u32,
+    angle: f32,
+    params_ptr: *const f32,
+    palette: u32,
+    dither: f32,
+    moons: u32,
+    features: u32,
+) {
+    let out = unsafe { slice::from_raw_parts_mut(out_ptr, planet_core::GL_UNIFORMS_LEN) };
+    let params = unsafe { slice::from_raw_parts(params_ptr, crate::NUM_PARAMS) };
+    planet_core::gl_uniforms(
+        size, type_idx as usize, seed, angle, params, dither, moons, features, palette, out,
+    );
+}
+
+/// Number of planet types (for the JS "random type" picker).
+#[no_mangle]
+pub extern "C" fn type_count() -> u32 {
+    crate::type_count() as u32
+}
+
+/// Render only rows `y0..y1` of the frame — the entry point a worker pool uses
+/// to split one frame across several instances.
+///
+/// `ptr` is a WHOLE frame's worth of pixels; rows outside the band are left
+/// untouched, so each worker owns its own buffer and the caller copies the band
+/// back at its real offset. Concatenating the bands reproduces `render_features`
+/// exactly (pinned by `render_band_matches_whole`).
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn render_band(
+    ptr: *mut u8,
+    size: u32,
+    type_idx: u32,
+    seed: u32,
+    angle: f32,
+    params_ptr: *const f32,
+    palette: u32,
+    dither: f32,
+    moons: u32,
+    features: u32,
+    y0: u32,
+    y1: u32,
+) {
+    let out = unsafe { slice::from_raw_parts_mut(ptr, (size * size * 4) as usize) };
+    let params = unsafe { slice::from_raw_parts(params_ptr, crate::NUM_PARAMS) };
+    planet_core::render_rgba_band(
+        size, type_idx as usize, seed, angle, params, palette, dither, moons, features, y0, y1, out,
+    );
+}

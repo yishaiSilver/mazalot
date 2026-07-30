@@ -14,6 +14,12 @@
 mod lanes;
 use lanes::{F32x4, U32x4};
 
+/// The GLSL ES 3.00 transliteration of everything below, plus the `#version`
+/// line and the precision qualifiers. Every fragment shader in the workspace is
+/// this concatenated with `dither_core::GL_PRELUDE` and its own body, so the
+/// lattice kernels have one definition per language rather than one per shader.
+pub const GL_PRELUDE: &str = include_str!("noise.glsl");
+
 // ---------------------------------------------------------------------------
 // Noise: 3D value-noise fBm + 3D Worley (cellular) for craters.
 // ---------------------------------------------------------------------------
@@ -148,11 +154,17 @@ pub fn fbm(mut x: f32, mut y: f32, mut z: f32, octaves: u32) -> f32 {
 /// Domain-warped fBm (Inigo Quilez): `fbm(p + w·fbm(p'))`. The inner noise
 /// distorts the domain of the outer, turning plain bands/clouds into curling,
 /// marbled, fluid-looking structure. One warp level = 4 fbm calls.
-pub fn fbm_warp(x: f32, y: f32, z: f32, octaves: u32, w: f32) -> f32 {
-    let qx = fbm(x, y, z, octaves);
-    let qy = fbm(x + 3.1, y + 1.7, z + 5.2, octaves);
-    let qz = fbm(x + 8.3, y + 2.8, z + 1.1, octaves);
-    fbm(x + w * qx, y + w * qy, z + w * qz, octaves)
+///
+/// The warp field takes its own octave count because it only *displaces* the
+/// sample point: its `k`-th octave moves it `w · 0.5^k`, under 2% of a lattice
+/// cell by the fourth — nothing the warped field can resolve. Two warp octaves
+/// against four main costs 10 octave evaluations where a uniform four costs 16.
+/// `warp_oct == main_oct` is the undifferentiated original.
+pub fn fbm_warp(x: f32, y: f32, z: f32, warp_oct: u32, main_oct: u32, w: f32) -> f32 {
+    let qx = fbm(x, y, z, warp_oct);
+    let qy = fbm(x + 3.1, y + 1.7, z + 5.2, warp_oct);
+    let qz = fbm(x + 8.3, y + 2.8, z + 1.1, warp_oct);
+    fbm(x + w * qx, y + w * qy, z + w * qz, main_oct)
 }
 
 /// The 3×3×3 neighbourhood [`worley`] searches, padded from 27 to 28 entries so
@@ -179,6 +191,13 @@ const CELLS: [[i32; 3]; 28] = {
 };
 
 /// 3D Worley F1: distance to nearest hashed feature point. ~[0, 1.0].
+///
+/// All 28 cells, unconditionally. There *was* an exact early-out here — a cell's
+/// box distance lower-bounds the distance to its point, so a cell already farther
+/// than the best so far can be skipped — and it provably skipped 19.4 of the 27.
+/// Four-lane hashing made it a 3x LOSS: the branch, the running bound and the
+/// scalar tail cost more than the 84 hashes they saved, because the hashes are
+/// now four at a time and branchless. Do not put it back without measuring.
 pub fn worley(x: f32, y: f32, z: f32) -> f32 {
     let (fx, fy, fz) = (x.floor() as i32, y.floor() as i32, z.floor() as i32);
     let (vx, vy, vz) = (F32x4::splat(x), F32x4::splat(y), F32x4::splat(z));

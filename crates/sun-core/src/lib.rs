@@ -278,6 +278,17 @@ pub fn render_star_tile_into(
 
 // ---------------------------------------------------------------------------
 
+/// The star tile's GLSL and the uniforms that drive it.
+///
+/// **Browser-only, and gated so that it is** — see the same note on
+/// `planet_core`'s `mod gl`. Another caller of `seed_offsets`/`star_tile_size`
+/// in this crate's LTO unit is enough to re-price their inlining and move
+/// `out/`.
+#[cfg(any(feature = "gl", test))]
+mod gl;
+#[cfg(any(feature = "gl", test))]
+pub use gl::{gl_uniforms, GL_SHADER, GL_SOURCES, GL_UNIFORMS_LEN};
+
 #[cfg(test)]
 mod tests {
     use super::*;

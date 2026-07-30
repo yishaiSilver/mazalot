@@ -1143,6 +1143,24 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// WebGL2 port
+// ---------------------------------------------------------------------------
+
+/// The uniform block and the GLSL source the browser's GPU path needs.
+///
+/// **Browser-only, and gated so that it is.** Compiling it into the native build
+/// changed nothing about what the CPU renderer computes — and still moved
+/// `out/moon_*.png` by up to 4/255 across 5% of its pixels, because another
+/// caller of `Lod::oct`/`moon_ring`/`seed_offsets` in the same LTO unit is
+/// enough to re-price their inlining and re-contract a multiply-add. The
+/// generators have no GPU, so the honest fix is for them not to carry it.
+#[cfg(any(feature = "gl", test))]
+mod gl;
+#[cfg(any(feature = "gl", test))]
+pub use gl::{gl_tile_uniforms, gl_uniforms, GL_SHADER, GL_SOURCES, GL_UNIFORMS_LEN};
+
 #[cfg(test)]
 mod band_tests {
     use super::*;

@@ -57,6 +57,31 @@
   .crt.on { opacity: 1; }
   .chk { justify-content: flex-start !important; gap: 8px; cursor: pointer; color: #cfd4e6 !important; }
   .chk input { accent-color: #8fb7ff; }
+  .note { font-size: 11px; line-height: 1.45; color: #6b7290; margin-top: 6px; }
+  .ctl.off, .feats label.off { opacity: .38; pointer-events: none; }
+
+  /* Feature cost lab */
+  .lab { margin-top: 14px; }
+  .feats { display: grid; grid-template-columns: 1fr 1fr; gap: 2px 10px; margin-bottom: 10px; }
+  .feats label { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: #9aa0bb; cursor: pointer; }
+  .feats input { accent-color: #f4b74a; cursor: pointer; }
+  .feats label.opt { color: #7f86a3; font-style: italic; }
+  .labhead { display: flex; justify-content: space-between; align-items: baseline; }
+  .live { font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; color: #9aa0bb;
+          font-variant-numeric: tabular-nums; }
+  .live b { color: #eef1f8; }
+  table.costs { width: 100%; border-collapse: collapse; margin-top: 10px;
+                font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+                font-variant-numeric: tabular-nums; }
+  table.costs th { text-align: right; font-weight: 600; color: #565d78; font-size: 10px;
+                   letter-spacing: .08em; text-transform: uppercase; padding-bottom: 4px; }
+  table.costs th:first-child, table.costs td:first-child { text-align: left; }
+  table.costs td { text-align: right; padding: 2px 0; color: #9aa0bb; border-top: 1px solid rgba(255,255,255,.05); }
+  table.costs td.n { color: #eef1f8; }
+  table.costs tr.opt td { color: #57d38c; }
+  table.costs .barw { width: 34%; padding-left: 8px; }
+  table.costs .barw i { display: block; height: 6px; border-radius: 2px 3px 3px 2px; background: #f4b74a; }
+  table.costs tr.opt .barw i { background: #57d38c; }
 </style>
 </head>
 <body>
@@ -79,6 +104,14 @@
       <div class="rowflex"><input type="number" id="seed" min="0" value="1" /><button class="mini" id="rndseed" title="random seed">🎲</button></div>
     </div>
     <div class="ctl"><label>Resolution <b id="resV">64</b></label><input type="range" id="res" min="40" max="240" step="8" value="64" /></div>
+    <div class="ctl"><label>Renderer</label>
+      <select id="renderer">
+        <option value="wasm">WebAssembly (CPU)</option>
+        <option value="gl">WebGL2 (GPU)</option>
+      </select>
+      <div class="note" id="glnote"></div>
+    </div>
+    <div class="ctl" id="poolctl"><label>Render workers <b id="poolV">—</b></label><input type="range" id="pool" min="0" max="16" step="1" value="8" /></div>
     <div class="ctl"><label>Spin speed <b id="spnV">0.012</b></label><input type="range" id="spn" min="0" max="0.05" step="0.002" value="0.012" /></div>
 
     <div class="grp">Look</div>
@@ -97,6 +130,17 @@
     <div id="sliders"></div>
 
     <button class="mini reset" id="reset">↺ reset params to type defaults</button>
+
+    <div class="grp">Feature cost lab</div>
+    <div class="lab">
+      <div class="labhead">
+        <span style="font-size:11px;color:#7f86a3">untick to switch off</span>
+        <span class="live"><b id="labMs">–</b> ms · <b id="labFps">–</b> fps</span>
+      </div>
+      <div class="feats" id="feats"></div>
+      <button class="mini" id="measure" style="width:100%">⏱ measure what each feature costs</button>
+      <div id="costs"></div>
+    </div>
   </div>
 
   <div class="foot">rendered live in <code>planet.wasm</code> — same code as the native generator</div>
@@ -128,6 +172,32 @@ const PARAMS = [
   {             pi:11, label:"Turbulence",    min:0,   max:1.5, step:0.02, fix:2 },
 ];
 
+// Everything that can be switched off, and how. `pi` zeroes a shader parameter
+// (the type's own sliders already gate these on > 0); `bit` clears a flag the
+// wasm reads; `add` sets one the wasm does not have on by default; `style`
+// drives the existing look controls. `opt: true` marks the entries that are
+// OPTIMIZATIONS rather than features — unticking those makes the frame slower,
+// and the table reports them as a saving.
+const FEATURES = [
+  { key: "clouds",   label: "Cloud layer",        pi: 4 },
+  { key: "shadow",   label: "└ cloud shadow",     bit: 1 },
+  { key: "storm",    label: "└ storm-cell swirl", pi: 9 },
+  { key: "aurora",   label: "Aurora",             pi: 8 },
+  { key: "specular", label: "Specular + shimmer", pi: 2 },
+  { key: "spot",     label: "Great spot",         pi: 6 },
+  { key: "lightning",label: "Lightning",          pi: 7 },
+  { key: "caps",     label: "Ice caps",           pi: 5 },
+  { key: "atmo",     label: "Atmosphere rim",     bit: 2 },
+  { key: "rim",      label: "Dark limb rim",      bit: 4 },
+  { key: "stars",    label: "Starfield",          bit: 8 },
+  { key: "moons",    label: "Orbiting moons",     style: "moons" },
+  { key: "dither",   label: "Ordered dither",     style: "dither" },
+  { key: "night",    label: "Night-side thinning", add: 16, opt: true },
+  { key: "warp",     label: "Cheap warp inner",    bit: 32, opt: true },
+];
+const on = new Set(FEATURES.map(f => f.key));   // everything on to begin with
+let FEAT_ALL = 63;
+
 const $ = id => document.getElementById(id);
 const stage = $("stage");
 const sctx = stage.getContext("2d");
@@ -136,6 +206,242 @@ const off = document.createElement("canvas");
 const octx = off.getContext("2d");
 
 let wasm, bufPtr, bufLen, imgData, paramsPtr, NUM;
+
+// --- worker pool ------------------------------------------------------------
+// A wasm INSTANCE is single-threaded, but nothing says one instance. Each worker
+// holds its own instance and shades a horizontal band of the same frame; bands
+// are bit-identical to the same rows of a whole frame (`render_band_matches_whole`
+// pins that in Rust), so stitching them is exact rather than approximate.
+//
+// Transferable ArrayBuffers, NOT SharedArrayBuffer — shared memory needs COOP/COEP
+// headers, which a static host like GitHub Pages cannot set. This needs neither.
+const POOL_SRC = `
+let w = null, buf = 0, pp = 0, NUM = 0, SZ = 0;
+onmessage = async (e) => {
+  const m = e.data;
+  if (m.cmd === "init") {
+    w = (await WebAssembly.instantiate(m.bytes, {})).instance.exports;
+    NUM = w.num_params();
+    pp = w.alloc(NUM * 4);
+    postMessage({ ready: 1 });
+  } else if (m.cmd === "size") {
+    if (buf) w.dealloc(buf, SZ * SZ * 4);
+    SZ = m.size; buf = w.alloc(SZ * SZ * 4);
+    postMessage({ ready: 1 });
+  } else if (m.cmd === "band") {
+    new Float32Array(w.memory.buffer, pp, NUM).set(m.params);
+    w.render_band(buf, SZ, m.type, m.seed, m.angle, pp, m.palette, m.dither, m.moons, m.feat, m.y0, m.y1);
+    // Only the band travels back, and it moves rather than copies.
+    const bytes = new Uint8Array(w.memory.buffer, buf + m.y0 * SZ * 4, (m.y1 - m.y0) * SZ * 4).slice();
+    postMessage({ y0: m.y0, bytes }, [bytes.buffer]);
+  }
+};`;
+
+const pool = { workers: [], size: 0 };
+// Leave the main thread and the browser's own threads room: on a 4-core box a
+// pool of 4 measured WORSE than 2 (4.57 ms main-thread, 1.70 at 2, 2.21 at 4),
+// while a 16-thread laptop's sweep put the knee at 8. `cores - 2` fits both.
+let poolWant = Math.max(1, Math.min(8, (navigator.hardwareConcurrency || 4) - 2));
+let wasmBytes = null;
+
+// Resizes are SERIALIZED and they settle whatever is in flight. A terminated
+// worker never fires `onmessage`, so a frame awaiting one would hang forever
+// and — because `inFlight` gates re-entry — every later frame would return
+// early. That is a freeze, and dragging the slider used to cause it.
+let resizeChain = Promise.resolve();
+function queueResize(n) {
+  resizeChain = resizeChain.then(() => poolResize(n), () => poolResize(n));
+  return resizeChain;
+}
+
+async function poolResize(n) {
+  n = Math.max(0, Math.min(32, n | 0));
+  for (const w of pool.workers) {
+    // Reject before terminating, so anything awaiting this worker unwinds.
+    for (const e of w.__pending || []) e.rej(new Error("pool resized"));
+    w.__pending = [];
+    w.terminate();
+  }
+  pool.workers = [];
+  if (n === 0 || !wasmBytes) { pool.size = 0; return; }
+  const url = URL.createObjectURL(new Blob([POOL_SRC], { type: "text/javascript" }));
+  const ws = Array.from({ length: n }, () => new Worker(url));
+  URL.revokeObjectURL(url);
+  await Promise.all(ws.map(w => new Promise((res, rej) => {
+    w.onerror = () => rej(new Error("worker failed — a CSP may forbid blob: workers"));
+    w.onmessage = () => res();
+    w.postMessage({ cmd: "init", bytes: wasmBytes });
+  })));
+  pool.workers = ws;
+  pool.size = n;
+}
+
+const askWorker = (w, msg, xfer) => new Promise((res, rej) => {
+  const entry = { res, rej };
+  (w.__pending ||= []).push(entry);
+  w.onmessage = e => {
+    w.__pending = (w.__pending || []).filter(x => x !== entry);
+    res(e.data);
+  };
+  w.postMessage(msg, xfer || []);
+});
+
+/// Split `NATIVE` rows across the pool and stitch the bands into `imgData`.
+/// Bands are sized by area, not by row count: the disc is widest in the middle,
+/// so equal row counts would leave the edge workers idle. Weighting by the
+/// chord's length evens the shading out.
+async function renderPooled(a) {
+  // Sized PER WORKER, not pool-wide. A pool-wide flag races a resize: the
+  // frame in flight sets it after `poolResize` cleared it, and the workers
+  // that replaced the old ones are then never told the size — they allocate
+  // nothing, return empty bands, and the picture stops updating while the
+  // frame timer keeps reporting. That is what the freeze actually was.
+  const stale = pool.workers.filter(w => w.__native !== NATIVE);
+  if (stale.length) {
+    await Promise.all(stale.map(w =>
+      askWorker(w, { cmd: "size", size: NATIVE }).then(() => { w.__native = NATIVE; })));
+  }
+  const n = pool.workers.length;
+  const cuts = [0];
+  // Cumulative half-chord area, inverted to place n equal-work cuts.
+  const area = y => { const t = 2 * y / NATIVE - 1; return Math.asin(Math.max(-1, Math.min(1, t))) + t * Math.sqrt(Math.max(0, 1 - t * t)); };
+  const total = area(NATIVE) - area(0);
+  for (let k = 1; k < n; k++) {
+    const want = area(0) + total * k / n;
+    let lo = cuts[k - 1], hi = NATIVE;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (area(mid) < want) lo = mid + 1; else hi = mid; }
+    cuts.push(Math.max(cuts[k - 1], lo));
+  }
+  cuts.push(NATIVE);
+  const jobs = [];
+  for (let k = 0; k < n; k++) {
+    const [y0, y1] = [cuts[k], cuts[k + 1]];
+    if (y0 >= y1) continue;
+    jobs.push(askWorker(pool.workers[k], {
+      cmd: "band", type: typeIdx, seed, angle, params: a.params,
+      palette: a.palette, dither: a.dither, moons: a.moons, feat: a.feat, y0, y1,
+    }));
+  }
+  for (const r of await Promise.all(jobs)) imgData.data.set(r.bytes, r.y0 * NATIVE * 4);
+}
+// --- WebGL2 renderer --------------------------------------------------------
+// The same shader, on the GPU. `planet-core` hands over the whole per-frame
+// setup — the type row, the seeded offsets, the moons, the `Lod` octave budget —
+// as one float array, so the type table is transported rather than duplicated;
+// only the shading is re-written, in `crates/planet-core/src/shader.glsl`, which
+// travels inside the wasm module so it cannot go stale against it.
+//
+// Every `F_*` switch reaches both renderers, so the ablation panel prices the
+// same things either way. The port is cheap because `hash3` and `value_noise` are
+// u32 integer math — wrapping multiplies, xors and shifts — so they transliterate
+// into GLSL exactly and the lattice under both pictures is bit-identical.
+const VERT_SRC = `#version 300 es
+void main() {
+  // One oversized triangle — no buffers, no VAO state, three vertices.
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const glc = document.createElement("canvas");
+let gl = null, glProg = null, glLoc = null, glU = null, glUPtr = 0, glULen = 0;
+let gpu = null;                      // adapter description, once a context exists
+let renderer = "wasm";
+
+function compile(type, src, what) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    throw new Error(`${what} failed to compile:\n${gl.getShaderInfoLog(s)}`);
+  }
+  return s;
+}
+
+// Returns null (with the reason on `glnote`) when WebGL2 is unavailable, which
+// is a normal outcome — the demo stays on the wasm path.
+/// What the WebGL2 context is actually running on.
+///
+/// `gl.RENDERER` is masked to something generic ("WebKit WebGL") by every modern
+/// browser, so the real name needs `WEBGL_debug_renderer_info` — which Firefox
+/// withholds under `privacy.resistFingerprinting` and some Safari versions do
+/// not ship. Hence the fallback chain and the "hidden" wording rather than a
+/// promise.
+///
+/// The `soft` flag is the fact worth surfacing: SwiftShader, llvmpipe and
+/// friends are CPU rasterizers, so a browser that has quietly fallen back to one
+/// is running this path with none of its advantages, and a slow frame there says
+/// nothing about the shaders.
+function describeGPU(gl) {
+  const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+  const get = p => { try { return gl.getParameter(p); } catch { return null; } };
+  const name = (dbg && get(dbg.UNMASKED_RENDERER_WEBGL)) || get(gl.RENDERER) || "unknown";
+  const vendor = (dbg && get(dbg.UNMASKED_VENDOR_WEBGL)) || get(gl.VENDOR) || "";
+  return {
+    name: String(name),
+    vendor: String(vendor),
+    soft: /swiftshader|llvmpipe|softpipe|software|basic render|microsoft basic/i.test(`${name} ${vendor}`),
+    masked: !dbg,
+  };
+}
+
+function glInit() {
+  if (gl) return gl;
+  // `preserveDrawingBuffer` so the stage can `drawImage` this canvas after the
+  // draw returns; `desynchronized` because nothing reads back mid-frame.
+  gl = glc.getContext("webgl2", {
+    alpha: false, antialias: false, depth: false, stencil: false,
+    premultipliedAlpha: false, preserveDrawingBuffer: true, desynchronized: true,
+  });
+  if (!gl) { gl = null; return null; }
+  // A complete fragment shader is the two preludes (noise, then dither) from
+  // `noise-core`/`dither-core`, followed by the planet body.
+  const srcOf = i => new TextDecoder().decode(
+    new Uint8Array(wasm.memory.buffer, wasm.gl_src_ptr(i), wasm.gl_src_len(i)));
+  let src = "";
+  for (let i = 0; i < wasm.gl_src_count(); i++) src += srcOf(i);
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT_SRC, "vertex shader"));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, src, "planet shader"));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    throw new Error(`link failed:\n${gl.getProgramInfoLog(prog)}`);
+  }
+  glProg = prog;
+  glLoc = {
+    U: gl.getUniformLocation(prog, "U"),
+    seed: gl.getUniformLocation(prog, "u_seed"),
+    feat: gl.getUniformLocation(prog, "u_feat"),
+    size: gl.getUniformLocation(prog, "u_size"),
+    vh: gl.getUniformLocation(prog, "u_vh"),
+    palette: gl.getUniformLocation(prog, "u_palette"),
+  };
+  gpu = describeGPU(gl);
+  glULen = wasm.gl_uniforms_len();
+  glUPtr = wasm.alloc(glULen * 4);
+  glU = new Float32Array(glULen);
+  return gl;
+}
+
+/// One GPU frame. `finish()` before returning, so the caller's clock measures
+/// the draw rather than the time it took to queue it.
+function renderGL(a, ang) {
+  if (glc.width !== NATIVE) { glc.width = glc.height = NATIVE; }
+  wasm.gl_uniforms(glUPtr, NATIVE, typeIdx, seed, ang, paramsPtr,
+                   a.palette, a.dither, a.moons, a.feat);
+  // Re-read the view each time: an `alloc` that grew the wasm heap detaches it.
+  glU.set(new Float32Array(wasm.memory.buffer, glUPtr, glULen));
+  gl.viewport(0, 0, NATIVE, NATIVE);
+  gl.useProgram(glProg);
+  gl.uniform1fv(glLoc.U, glU);
+  gl.uniform1ui(glLoc.seed, seed >>> 0);
+  gl.uniform1ui(glLoc.feat, a.feat >>> 0);
+  gl.uniform1i(glLoc.size, NATIVE);
+  gl.uniform1i(glLoc.vh, NATIVE);          // hero framing: viewport == tile
+  gl.uniform1i(glLoc.palette, a.palette);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.finish();
+}
+
 let NATIVE = 64, typeIdx = 0, seed = 1, angle = 0, spin = 0.012;
 const sliders = {}; // pi -> { input, val }
 
@@ -181,27 +487,180 @@ function randomize() {
   setType(Math.floor(Math.random() * NAMES.length));
 }
 
-function frame() {
-  angle += spin;
+// Write the params for a given feature set into wasm memory and return the
+// non-param arguments that go with it. One place, so the live frame and the
+// measurement can never disagree about what "off" means.
+function applyFeatures(set) {
   const pv = new Float32Array(wasm.memory.buffer, paramsPtr, NUM);
   for (const p of PARAMS) pv[p.pi] = parseFloat(sliders[p.pi].input.value);
-  const palette = parseInt($("palette").value);
-  const dither = parseFloat($("dth").value);
-  const moons = $("moons").checked ? 1 : 0;
-  wasm.render_styled(bufPtr, NATIVE, typeIdx, seed, angle, paramsPtr, palette, dither, moons);
-  const view = new Uint8Array(wasm.memory.buffer, bufPtr, bufLen);
-  imgData.data.set(view);
-  octx.putImageData(imgData, 0, 0);
+  let feat = FEAT_ALL;
+  let moons = $("moons").checked ? 1 : 0;
+  let dither = parseFloat($("dth").value);
+  for (const f of FEATURES) {
+    if (set.has(f.key)) {
+      // `add` is the mirror of `bit`: a switch the renderer does NOT have on by
+      // default, so ticking it ORs the bit in rather than unticking clearing it.
+      if (f.add !== undefined) feat |= f.add;
+      continue;
+    }
+    if (f.pi !== undefined) pv[f.pi] = 0;
+    if (f.bit !== undefined) feat &= ~f.bit;
+    if (f.style === "moons") moons = 0;
+    if (f.style === "dither") dither = 0;
+  }
+  return { feat, moons, dither, palette: parseInt($("palette").value), params: pv.slice() };
+}
+
+let emaMs = 0;
+let inFlight = false;
+async function frame() {
+  // The pool is async, so a slow frame must not queue another behind it.
+  if (inFlight) return;
+  inFlight = true;
+  angle += spin;
+  const a = applyFeatures(on);
+  const t0 = performance.now();
+  let painted = true;
+  try {
+    if (renderer === "gl") {
+      renderGL(a, angle);
+    } else if (pool.size > 0) {
+      await renderPooled(a);
+    } else {
+      wasm.render_features(bufPtr, NATIVE, typeIdx, seed, angle, paramsPtr, a.palette, a.dither, a.moons, a.feat);
+      imgData.data.set(new Uint8Array(wasm.memory.buffer, bufPtr, bufLen));
+    }
+  } catch (e) {
+    // Resized mid-frame (benign — the next frame uses the new pool), or a
+    // worker died. Either way this frame has no pixels: keep the last one.
+    painted = false;
+    if (!/resized/.test(String(e && e.message))) {
+      $("poolV").textContent = "unavailable";
+      queueResize(0);
+      poolWant = 0;
+    }
+  } finally {
+    inFlight = false;
+  }
+  if (!painted) return;
+  emaMs += (performance.now() - t0 - emaMs) * 0.08;
+  // Both paths end with the same upscale onto the stage, so the timer above is
+  // the shading and nothing else.
+  if (renderer !== "gl") octx.putImageData(imgData, 0, 0);
   sctx.clearRect(0, 0, stage.width, stage.height);
-  sctx.drawImage(off, 0, 0, stage.width, stage.height);
-  requestAnimationFrame(frame);
+  sctx.drawImage(renderer === "gl" ? glc : off, 0, 0, stage.width, stage.height);
+  $("labMs").textContent = emaMs.toFixed(3);
+  $("labFps").textContent = emaMs > 0 ? (1000 / emaMs).toFixed(0) : "–";
+}
+// `frame` is async, so it cannot re-arm itself from inside without the rAF
+// clock and the render getting out of step. Drive it from a plain loop instead.
+function tick() { frame(); requestAnimationFrame(tick); }
+
+// Build the tick-boxes.
+function buildFeats() {
+  const host = $("feats");
+  for (const f of FEATURES) {
+    const lab = document.createElement("label");
+    if (f.opt) lab.className = "opt";
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = true;
+    cb.addEventListener("change", () => { cb.checked ? on.add(f.key) : on.delete(f.key); });
+    lab.appendChild(cb);
+    lab.appendChild(document.createTextNode(f.label));
+    lab.title = f.opt ? "an optimization — unticking it makes the frame slower"
+                      : "a feature — unticking it makes the frame cheaper";
+    host.appendChild(lab);
+    f.el = lab;
+  }
+}
+
+// Grey out what the selected renderer does not have. Every FEATURES bit reaches
+// both renderers — `shader.glsl` reads the same `u_feat` — so the only CPU-only
+// control is the worker pool, which splits a CPU frame into bands.
+function syncRendererUI() {
+  const isGL = renderer === "gl";
+  $("poolctl").classList.toggle("off", isGL);
+  if (!isGL) { $("glnote").textContent = ""; return; }
+  const live = "One shader, evaluated live — the same feature switches, on the GPU.";
+  // The adapter name comes from a graphics driver, so it never reaches innerHTML
+  // unescaped. A software rasterizer is the one fact worth shouting about: the
+  // page is drawing on the CPU after all, and a slow frame says nothing about
+  // the shaders.
+  const esc = t => String(t).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const label = gpu.masked ? `${gpu.name} (name hidden)` : gpu.name;
+  $("glnote").innerHTML = gpu.soft
+    ? `<span style="color:#f4b74a">⚠ software rasterizer — ${esc(gpu.name)}.</span> ` +
+      `This browser has no GPU acceleration, so these timings measure the CPU.`
+    : `${esc(live)}<br><span style="color:#8790ad">GPU ${esc(label)}</span>`;
+  $("glnote").title = `${gpu.vendor} — ${gpu.name}`;
+}
+
+// Time one configuration: warm up, then take the best of a few runs, which is
+// far more stable than a mean when the browser decides to do something else
+// mid-measurement.
+function timeConfig(set, iters) {
+  const a = applyFeatures(set);
+  // Whichever renderer is selected — otherwise switching to WebGL2 would leave
+  // the cost table quietly measuring the CPU.
+  const one = ang => renderer === "gl"
+    ? renderGL(a, ang)
+    : wasm.render_features(bufPtr, NATIVE, typeIdx, seed, ang, paramsPtr, a.palette, a.dither, a.moons, a.feat);
+  for (let i = 0; i < 8; i++) one(i * 0.1);
+  let best = Infinity;
+  for (let r = 0; r < 3; r++) {
+    const t0 = performance.now();
+    for (let i = 0; i < iters; i++) one(i * 0.013);
+    best = Math.min(best, (performance.now() - t0) / iters);
+  }
+  return best;
+}
+
+// Switch each feature off on its own and diff against the full frame. Yields to
+// the event loop between features so the page stays alive and can show progress.
+async function measure() {
+  const btn = $("measure");
+  btn.disabled = true;
+  const iters = NATIVE >= 128 ? 25 : 60;
+  const all = new Set(FEATURES.map(f => f.key));
+  const full = timeConfig(all, iters);
+  const rows = [];
+  const list = FEATURES;
+  for (let i = 0; i < list.length; i++) {
+    const f = list[i];
+    btn.textContent = `measuring… ${i + 1}/${list.length}`;
+    await new Promise(r => requestAnimationFrame(r));
+    const without = new Set(all); without.delete(f.key);
+    // A feature's cost is what vanishes when it goes. An optimization's value is
+    // what comes BACK when it goes, so its sign is flipped for display.
+    const d = timeConfig(without, iters);
+    rows.push({ label: f.label, ms: f.opt ? d - full : full - d, opt: !!f.opt });
+  }
+  rows.sort((x, y) => y.ms - x.ms);
+  const peak = Math.max(...rows.map(r => Math.abs(r.ms)), 1e-6);
+  // A clock too coarse to resolve the batch (some browsers clamp
+  // performance.now(), and a headless run can freeze it outright) would divide
+  // by zero here. Show a dash rather than a column of NaN.
+  const pct = ms => (full > 1e-9 ? `${(100 * ms / full).toFixed(0)}%` : "–");
+  $("costs").innerHTML =
+    `<table class="costs"><thead><tr><th>${NAMES[typeIdx]} @ ${NATIVE}px — full ${full.toFixed(3)} ms` +
+    `</th><th>ms</th><th>%</th><th class="barw"></th></tr></thead><tbody>` +
+    rows.map(r => `<tr class="${r.opt ? "opt" : ""}"><td>${r.label}${r.opt ? " ↑saves" : ""}</td>` +
+      `<td class="n">${r.ms.toFixed(3)}</td><td>${pct(r.ms)}</td>` +
+      `<td class="barw"><i style="width:${Math.max(0, 100 * r.ms / peak).toFixed(0)}%"></i></td></tr>`).join("") +
+    `</tbody></table>`;
+  btn.disabled = false;
+  btn.textContent = "⏱ measure what each feature costs";
 }
 
 async function main() {
   const res = await fetch("./planet.wasm?v=" + Date.now(), { cache: "no-store" });
-  const { instance } = await WebAssembly.instantiate(await res.arrayBuffer(), {});
+  wasmBytes = await res.arrayBuffer();
+  const { instance } = await WebAssembly.instantiate(wasmBytes, {});
   wasm = instance.exports;
 
+  FEAT_ALL = wasm.feat_all();
+  buildFeats();
+  $("measure").addEventListener("click", measure);
   const n = wasm.type_count();
   if (n !== NAMES.length) $("sub").textContent = `warning: wasm has ${n} types, JS lists ${NAMES.length}`;
   NUM = wasm.num_params();
@@ -223,7 +682,42 @@ async function main() {
   $("dth").addEventListener("input", () => $("dthV").textContent = parseFloat($("dth").value).toFixed(2));
   $("crt").addEventListener("change", () => $("crtfx").classList.toggle("on", $("crt").checked));
 
-  requestAnimationFrame(frame);
+  // The pool is worth what the machine's cores are worth; 8 is the knee on a
+  // 16-thread laptop (past it, each worker's slice shrinks faster than the
+  // dispatch grows). 0 renders on the main thread, which is the A/B.
+  $("pool").value = String(poolWant);
+  const poolLabel = () => (pool.size === 0 ? "off (main thread)" : String(pool.size));
+  $("pool").addEventListener("input", () => {
+    const n = parseInt($("pool").value);
+    $("poolV").textContent = n === 0 ? "off (main thread)" : `${n}…`;
+  });
+  $("pool").addEventListener("change", async () => {
+    await queueResize(parseInt($("pool").value));
+    poolWant = pool.size;
+    $("poolV").textContent = poolLabel();
+  });
+  await queueResize(poolWant);
+  $("poolV").textContent = poolLabel();
+
+  // WebGL2 is opt-in: probe it on selection rather than at load, so a machine
+  // without it never pays for a failed context.
+  $("renderer").addEventListener("change", () => {
+    const want = $("renderer").value;
+    if (want === "gl") {
+      try {
+        if (!glInit()) throw new Error("this browser has no WebGL2 context");
+      } catch (e) {
+        $("renderer").value = "wasm";
+        $("glnote").textContent = String(e.message || e);
+        return;
+      }
+    }
+    renderer = want;
+    syncRendererUI();
+  });
+  syncRendererUI();
+
+  requestAnimationFrame(tick);
 }
 main().catch(e => { $("name").textContent = "failed to load wasm"; $("sub").textContent = String(e); });
 </script>

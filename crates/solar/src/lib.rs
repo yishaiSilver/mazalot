@@ -819,6 +819,21 @@ pub fn planet_nearest_center(sys: &System, w: u32, h: u32, cam: &Camera, t: f32)
     }
     best
 }
+
+/// The scene's WebGL2 frame packer.
+///
+/// **Browser-only, and gated so that it is** — see the same note on
+/// `planet_core`'s `mod gl`. Another caller of `Planet::at` / `to_screen` /
+/// `dest_rect` in this crate's LTO unit is enough to re-price their inlining and
+/// move `out/`.
+#[cfg(any(target_arch = "wasm32", test))]
+mod gl;
+#[cfg(any(target_arch = "wasm32", test))]
+pub use gl::{
+    gl_backdrop, gl_bodies, gl_orbit_points, gl_star_points, sky_salt, GL_BODY_HEADER,
+    GL_BODY_STRIDE, GL_KIND_PLANET, GL_KIND_STAR, GL_MAX_BODIES,
+};
+
 // Browser (wasm) C-ABI glue — excluded from native builds. See wasm.rs.
 #[cfg(target_arch = "wasm32")]
 mod wasm;
