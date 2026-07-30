@@ -164,3 +164,13 @@ pub extern "C" fn nearest_center(
     let cam = Camera { x: cam_x, y: cam_y, zoom };
     crate::planet_nearest_center(sys, w, h, &cam, t)
 }
+
+/// Thin every planet's shader past the terminator: 1 caps the octaves and skips
+/// the cloud deck on the night side, 0 shades it at full detail. Worth 8-35% of a
+/// planet tile, and it moves pixels on the dark limb — see
+/// `planet_core::F_NIGHT_LOD`.
+#[no_mangle]
+pub extern "C" fn system_set_night_lod(sys: *mut System, on: u32) {
+    let sys = unsafe { &mut *sys };
+    sys.set_night_lod(on != 0);
+}

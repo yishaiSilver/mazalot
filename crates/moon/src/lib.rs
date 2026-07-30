@@ -173,6 +173,14 @@ pub struct MoonSystem {
     pub parent_spin: f32,   // parent axial-spin turns per unit time
     pub moons: Vec<Moon>,
     pub orbit_width: f32,   // dashed orbit line thickness, px (1..=6)
+    // Thin the parent's shader past the terminator — see
+    // `planet_core::F_NIGHT_LOD`. The parent fills the view here, so its shader
+    // is the whole cost of the demo.
+    //
+    // OFF by default because it MOVES PIXELS: `out/moon.gif` keeps the full-detail
+    // night side and stays byte-identical. The web demo turns it on at
+    // construction, where 8-35% of a frame matters more than the dark limb does.
+    pub night_lod: bool,
 }
 
 impl MoonSystem {
@@ -219,7 +227,7 @@ impl MoonSystem {
             orbit += radius + rng.range(24.0, 40.0) + i as f32 * 6.0;
         }
 
-        MoonSystem { seed, parent_kind, parent_type, parent_radius, parent_spin, moons, orbit_width: 1.0 }
+        MoonSystem { seed, parent_kind, parent_type, parent_radius, parent_spin, moons, orbit_width: 1.0, night_lod: false }
     }
 
     /// Set the dashed orbit-line thickness in pixels, clamped to 1..=6 (1 =
@@ -288,7 +296,15 @@ impl MoonSystem {
                 // One angle turns the surface and advances the weather alike —
                 // that is the planet shader's contract.
                 let spin_a = self.parent_spin * t * TAU;
-                render_parent_tile(&mut tile, self.parent_type, self.seed, spin_a, rad_render, clip);
+                render_parent_tile(
+                    &mut tile,
+                    self.parent_type,
+                    self.seed,
+                    spin_a,
+                    rad_render,
+                    clip,
+                    self.night_lod,
+                );
                 blit(out, w, h, &tile, pcx, pcy, scale);
             } else {
                 let m = &self.moons[which as usize];
@@ -333,6 +349,7 @@ fn quant(o: Rgb, bx: f32) -> Rgb {
 /// wrapper over `planet_core::render_tile_into` — the same call `solar` makes for the
 /// worlds in its orbits, and the same shader the `planet` demo shows head-on;
 /// moon only pins the light to its fixed off-screen sun (`LIGHT_DIR`).
+#[allow(clippy::too_many_arguments)]
 fn render_parent_tile(
     tile: &mut Tile,
     type_idx: usize,
@@ -340,8 +357,12 @@ fn render_parent_tile(
     spin_a: f32,
     rad_px: f32,
     clip: [u32; 4],
+    night_lod: bool,
 ) {
-    planet_core::render_tile_into(tile, type_idx, seed, spin_a, LIGHT_DIR, rad_px, clip);
+    // The parent fills the view here, so its shader is the whole cost of the
+    // demo — see `planet_core::F_NIGHT_LOD`.
+    let feat = planet_core::F_ALL | if night_lod { planet_core::F_NIGHT_LOD } else { 0 };
+    planet_core::render_tile_into(tile, type_idx, seed, spin_a, LIGHT_DIR, rad_px, clip, feat);
 }
 
 /// Moon surface albedo at a rotated surface point (no lighting yet): a grey/tinted

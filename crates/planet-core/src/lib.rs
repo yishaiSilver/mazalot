@@ -51,11 +51,20 @@ use noise_core::{
 struct Lod {
     /// Disc radius in px — how finely this tile can resolve anything.
     rad: f32,
+    /// Hard ceiling on top of what the radius allows. `F_NIGHT_LOD` sets it
+    /// past the terminator, where `shade` bottoms out at the 0.10 ambient floor
+    /// and the 22-level output has ~3 levels left to say anything with.
+    cap: u32,
 }
 
 impl Lod {
     fn for_disc(rad_px: f32) -> Lod {
-        Lod { rad: rad_px.max(1.0) }
+        Lod { rad: rad_px.max(1.0), cap: u32::MAX }
+    }
+
+    /// The same disc with the octave count capped — see [`Lod::cap`].
+    fn capped(self, cap: u32) -> Lod {
+        Lod { cap, ..self }
     }
 
     /// Octaves for a domain warp's three displacement components.
@@ -70,7 +79,58 @@ impl Lod {
             return 1;
         }
         let k = 1 + cells.log2() as u32;
-        k.clamp(1, full)
+        k.clamp(1, full.min(self.cap))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Feature switches
+// ---------------------------------------------------------------------------
+//
+// The per-type sliders already reach most of the shader — `clouds`, `specular`,
+// `spot`, `aurora`, `lightning`, `storm_cells` and `caps` are all gated on
+// `> 0.0`, so zeroing one switches that feature off. These are the pieces a
+// parameter cannot reach: parts of a layer rather than a whole one, framing
+// furniture, and the optimizations. A SET bit means the feature is ON.
+
+/// The cloud deck's self-shadow, independent of the cloud colour above it.
+pub const F_CLOUD_SHADOW: u32 = 1;
+/// The atmosphere rim glow at the limb.
+pub const F_ATMO: u32 = 2;
+/// The crisp 1px dark outline around the disc.
+pub const F_RIM: u32 = 4;
+/// The hashed starfield behind the planet (hero framing only).
+pub const F_STARFIELD: u32 = 8;
+/// OPTIMIZATION: cap the octaves and skip the cloud deck past the terminator,
+/// where `shade` bottoms out at the 0.10 ambient floor and the 22-level output
+/// has about three levels left to say anything with.
+///
+/// NOT in [`F_ALL`]. It used to be, back when the octave budget only reached the
+/// base field — the night side quantized to the same levels either way. Now that
+/// `Lod` also feeds the aurora and the great spot, capping it there moves
+/// pixels, so it sits with the other switches that change the picture.
+pub const F_NIGHT_LOD: u32 = 16;
+/// OPTIMIZATION: run a domain warp's displacement fields at [`Lod::WARP`]
+/// octaves instead of matching the field they bend.
+pub const F_CHEAP_WARP: u32 = 32;
+/// Everything on — what every caller but the demo's ablation panel wants. The
+/// switches that change the picture rather than the pixel budget are outside it,
+/// so `out/` stays byte-identical while the web demos opt in.
+pub const F_ALL: u32 = F_CLOUD_SHADOW | F_ATMO | F_RIM | F_STARFIELD | F_CHEAP_WARP;
+
+/// Octave ceiling past the terminator. Four keeps a terrestrial world's
+/// coastlines; below that the night side loses shape, not just grain.
+const NIGHT_OCT: u32 = 4;
+
+/// Octaves for a domain warp's three displacement fields, given the count the
+/// field they bend is running at. [`F_CHEAP_WARP`] is what the ablation panel
+/// switches off to price the difference.
+#[inline(always)]
+fn warp_oct(feat: u32, main: u32) -> u32 {
+    if feat & F_CHEAP_WARP != 0 {
+        Lod::WARP
+    } else {
+        main
     }
 }
 
@@ -285,6 +345,39 @@ fn seed_offsets(seed: u32) -> [f32; 3] {
     noise_core::seed_offsets(seed, 256.0)
 }
 
+/// The two seeded storm-cell centres, as `(x, z)` in the noise domain — `ofs` is
+/// already folded in. One definition, because the CPU deck and the GL port both
+/// have to swirl the clouds around the same two points.
+fn vortex_centres(seed: u32, ofs: [f32; 3]) -> [(f32, f32); 2] {
+    [0, 1].map(|k: i32| {
+        (
+            (hash3(seed as i32, k * 7 + 1, 3) * 2.0 - 1.0) * 1.6 + ofs[0],
+            (hash3(seed as i32, k * 7 + 2, 3) * 2.0 - 1.0) * 1.6 + ofs[2],
+        )
+    })
+}
+
+/// The frame's orbiting moons as `(mx, my, radius, depth, moon seed)` in disc
+/// radii, plus how many of the two slots are real (0..=2).
+///
+/// They orbit in the margin around the disc and cross in front of / behind it at
+/// the top and bottom of a tilted orbit, which is what `depth`'s sign says.
+fn moon_ring(ct: &PType, seed: u32, angle: f32) -> ([(f32, f32, f32, f32, f32); 2], usize) {
+    let mut moons = [(0.0, 0.0, 0.0, 0.0, 0.0); 2];
+    let count = (hash3(seed as i32, 50, 1) * 2.6) as usize; // 0..2
+    for k in 0..count.min(2) {
+        let ks = k as i32 * 5;
+        let orbit = 1.16 + hash3(seed as i32, ks + 1, 2) * 0.14;
+        let tilt = 0.34 + hash3(seed as i32, ks + 2, 2) * 0.30;
+        let speed = 0.25 + hash3(seed as i32, ks + 3, 2) * 0.4;
+        let phase = hash3(seed as i32, ks + 4, 2) * TAU;
+        let mr = (0.12 + hash3(seed as i32, ks + 5, 2) * 0.09) * ct.radius_scale.max(0.6);
+        let oa = angle * speed + phase;
+        moons[k] = (oa.cos() * orbit, oa.sin() * orbit * tilt, mr, oa.sin(), k as f32 + 1.0);
+    }
+    (moons, count.min(2))
+}
+
 /// A drifting spiral cyclone (great-spot) tint on a banded world, with a calm eye.
 fn great_spot(col: Rgb, sx: f32, sy: f32, sz: f32, angle: f32, intensity: f32, lod: Lod) -> Rgb {
     let spot_lat = 0.28;
@@ -376,42 +469,65 @@ fn lightning_flash(sx: f32, sy: f32, angle: f32) -> (f32, Rgb) {
     (mag, col)
 }
 
-fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32, lod: Lod) -> (Rgb, f32) {
-    let (px, py, pz) = (sx + ofs[0], sy + ofs[1], sz + ofs[2]);
-    let (mut col, mut emis) = match ct.base {
-        Base::Terrestrial => {
-            let raw = fbm(px * ct.freq, py * ct.freq, pz * ct.freq, lod.oct(ct.freq, if ct.ridged { 5 } else { 6 }));
-            let n = if ct.ridged { 1.0 - (2.0 * raw - 1.0).abs() } else { raw };
-            let h = contrast(n, ct.contrast);
-            let mut col = ramp(ct.stops, h);
-            let cap = smoothstep(0.72, 0.9, sy.abs()) * ct.caps;
-            col = mix(col, [0.92, 0.95, 1.0], cap);
-            (col, 0.0)
-        }
+
+/// Base albedo for `Terrestrial` and `Cratered`: a pure function of a direction
+/// on the sphere, with no `angle` term anywhere — which is why these two share
+/// one path while the banded, emissive and cloudy families each advect.
+///
+/// `sy` is the sphere point's y (the ice caps are a latitude band); `px/py/pz`
+/// are the same point with the seed offset added, the domain the noise is in.
+fn static_albedo(ct: &PType, sy: f32, px: f32, py: f32, pz: f32, lod: Lod) -> Rgb {
+    match ct.base {
         Base::Cratered => {
             let m = smoothstep(0.4, 0.6, fbm(px * 1.2, py * 1.2, pz * 1.2, lod.oct(1.2, 5)));
             let base_col = mix(ct.dark, ct.light, m);
             let w = worley(px * ct.freq, py * ct.freq, pz * ct.freq);
             let bowl = smoothstep(0.0, 0.35, w);
             let rim = smoothstep(0.30, 0.42, w) * (1.0 - smoothstep(0.42, 0.60, w));
-            let col = [
+            [
                 clamp01(base_col[0] * (0.55 + 0.45 * bowl) + rim * 0.30),
                 clamp01(base_col[1] * (0.55 + 0.45 * bowl) + rim * 0.30),
                 clamp01(base_col[2] * (0.55 + 0.45 * bowl) + rim * 0.30),
-            ];
-            (col, 0.0)
+            ]
         }
+        // Terrestrial, and the fallback for anything that asks by mistake.
+        _ => {
+            let raw = fbm(px * ct.freq, py * ct.freq, pz * ct.freq, lod.oct(ct.freq, if ct.ridged { 5 } else { 6 }));
+            let n = if ct.ridged { 1.0 - (2.0 * raw - 1.0).abs() } else { raw };
+            let h = contrast(n, ct.contrast);
+            let col = ramp(ct.stops, h);
+            let cap = smoothstep(0.72, 0.9, sy.abs()) * ct.caps;
+            mix(col, [0.92, 0.95, 1.0], cap)
+        }
+    }
+}
+
+fn surface(
+    ct: &PType,
+    sx: f32,
+    sy: f32,
+    sz: f32,
+    ofs: [f32; 3],
+    angle: f32,
+    lod: Lod,
+    feat: u32,
+) -> (Rgb, f32) {
+    let (px, py, pz) = (sx + ofs[0], sy + ofs[1], sz + ofs[2]);
+    let (mut col, mut emis) = match ct.base {
+        // The two families with no `angle` term at all — their albedo is a pure
+        // function of a direction on the sphere.
+        Base::Terrestrial | Base::Cratered => (static_albedo(ct, sy, px, py, pz, lod), 0.0f32),
         Base::Banded => {
             // Zonal jets: adjacent latitude bands drift in opposite directions,
             // continuously — the real gas-giant look, not a uniform wobble.
             let flow = angle * 0.16 * (sy * ct.bands * 0.5).sin();
             // Domain warp makes the band turbulence curl and marble like fluid.
-            let warp = fbm_warp((px + flow) * 1.3, py * 1.3, pz * 1.3, Lod::WARP, lod.oct(1.3, 5), 0.8);
+            let o = lod.oct(1.3, 5);
+            let warp = fbm_warp((px + flow) * 1.3, py * 1.3, pz * 1.3, warp_oct(feat, o), o, 0.8);
             let lat = sy + (warp - 0.5) * ct.turb;
             let band = 0.5 + 0.5 * (lat * ct.bands).sin();
-            let mut col = mix(ct.dark, ct.light, band);
             let fine = fbm((px + flow * 1.4) * 4.0, py * 4.0, pz * 4.0, lod.oct(4.0, 4));
-            col = mix(col, ct.light, smoothstep(0.55, 0.8, fine) * 0.35);
+            let mut col = mix(mix(ct.dark, ct.light, band), ct.light, smoothstep(0.55, 0.8, fine) * 0.35);
             if ct.spot > 0.0 {
                 col = great_spot(col, sx, sy, sz, angle, ct.spot, lod);
             }
@@ -430,9 +546,11 @@ fn surface(ct: &PType, sx: f32, sy: f32, sz: f32, ofs: [f32; 3], angle: f32, lod
         }
         Base::Cloudy => {
             // Storm bands churn: latitude-dependent shear + domain warp for
-            // roiling, fluid-looking cloud cover.
+            // roiling, fluid-looking cloud cover. On a shrouded world this IS
+            // the surface, not a deck over one.
             let flow = (0.5 + 0.3 * (sy * 3.0).cos()) * angle.sin();
-            let t = fbm_warp((px + flow) * 2.0, py * 2.0, pz * 2.0, Lod::WARP, lod.oct(2.0, 5), 0.7);
+            let o = lod.oct(2.0, 5);
+            let t = fbm_warp((px + flow) * 2.0, py * 2.0, pz * 2.0, warp_oct(feat, o), o, 0.7);
             let band = 0.5 + 0.5 * (sy * ct.bands + (t - 0.5) * 6.0 * ct.turb).sin();
             (mix(ct.dark, ct.light, clamp01(band * 0.6 + t * 0.4)), 0.0)
         }
@@ -544,6 +662,12 @@ pub fn render_rgba_styled(
     moons: u32,
     out: &mut [u8],
 ) {
+    render_rgba_features(size, type_idx, seed, angle, p, palette, dither, moons, F_ALL, out)
+}
+
+/// A type row with the caller's parameter overrides applied. One copy, so the
+/// whole-frame and banded entry points cannot disagree about what they render.
+fn ct_with_params(type_idx: usize, p: &[f32]) -> PType {
     let mut ct = TYPES[type_idx % TYPES.len()];
     if p.len() >= NUM_PARAMS {
         ct.contrast = p[0];
@@ -560,7 +684,54 @@ pub fn render_rgba_styled(
         ct.turb = p[11];
         ct.spec_albedo = p[12];
     }
-    let style = Style { palette, dither, moons: moons != 0 };
+    ct
+}
+
+/// [`render_rgba_features`] restricted to rows `y0..y1` of the frame.
+///
+/// The band is written into `out` at its real offset — `out` is a whole frame's
+/// worth of pixels, and the rows outside the band are not touched. Splitting a
+/// frame into N bands across N wasm instances and concatenating the results
+/// reproduces the whole frame exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn render_rgba_band(
+    size: u32,
+    type_idx: usize,
+    seed: u32,
+    angle: f32,
+    p: &[f32],
+    palette: u32,
+    dither: f32,
+    moons: u32,
+    features: u32,
+    y0: u32,
+    y1: u32,
+    out: &mut [u8],
+) {
+    let ct = ct_with_params(type_idx, p);
+    let style = Style { palette, dither, moons: moons != 0, feat: features };
+    render_ct_band(size, &ct, seed, angle, &style, y0, y1, out);
+}
+
+/// [`render_rgba_styled`] with the feature switches exposed. `features` is a
+/// mask of the `F_*` bits; pass [`F_ALL`] for the normal picture. This is what
+/// the demo's ablation panel drives — switching one bit off and timing the
+/// difference is how the per-feature costs in the README were measured.
+#[allow(clippy::too_many_arguments)]
+pub fn render_rgba_features(
+    size: u32,
+    type_idx: usize,
+    seed: u32,
+    angle: f32,
+    p: &[f32],
+    palette: u32,
+    dither: f32,
+    moons: u32,
+    features: u32,
+    out: &mut [u8],
+) {
+    let ct = ct_with_params(type_idx, p);
+    let style = Style { palette, dither, moons: moons != 0, feat: features };
     render_ct(size, &ct, seed, angle, &style, out);
 }
 
@@ -573,10 +744,11 @@ pub struct Style {
     pub palette: u32, // 0 natural, 1 game boy, 2 ice, 3 sunset
     pub dither: f32,  // 0..1 ordered-dither strength
     pub moons: bool,  // draw orbiting moons
+    pub feat: u32,    // feature switches (see `F_*`); `F_ALL` is the normal value
 }
 impl Style {
     pub fn natural() -> Style {
-        Style { palette: 0, dither: 0.7, moons: true }
+        Style { palette: 0, dither: 0.7, moons: true, feat: F_ALL }
     }
 }
 
@@ -640,17 +812,29 @@ fn key_light() -> [f32; 3] {
 
 /// The hero framing: the planet fills a `size`×`size` starfield frame.
 fn render_ct(size: u32, ct: &PType, seed: u32, angle: f32, style: &Style, out: &mut [u8]) {
+    render_ct_band(size, ct, seed, angle, style, 0, size, out)
+}
+
+/// [`render_ct`] restricted to rows `y0..y1`, which is how one frame is split
+/// across several wasm instances.
+///
+/// **Rows outside the band are left untouched**, so a caller hands each worker
+/// its own buffer and stitches the bands back together. Every band is shaded
+/// from the same pure function of pixel position, so the result is bit-identical
+/// to rendering the frame whole — `render_band_matches_whole` pins that.
+fn render_ct_band(size: u32, ct: &PType, seed: u32, angle: f32, style: &Style, y0: u32, y1: u32, out: &mut [u8]) {
     // 0.375 (was 0.42) leaves orbital margin for moons and rings.
     let rad = (size as f32 * 24.0 / 64.0) * ct.radius_scale;
-    let frame = Frame { size, rad, light: key_light(), sprite: false, clip: [0, 0, size, size] };
+    let clip = [0, y0.min(size), size, y1.min(size)];
+    let frame = Frame { size, rad, light: key_light(), sprite: false, clip };
     render_frame(&frame, ct, seed, angle, style, out);
 }
 
 /// The style a scene sprite renders with: natural palette, the house dither, and
 /// no orbiting moons — a scene composites its own bodies, and moons would inflate
 /// every tile by a third to gain a one-pixel speck.
-fn tile_style() -> Style {
-    Style { palette: 0, dither: 0.7, moons: false }
+fn tile_style(feat: u32) -> Style {
+    Style { palette: 0, dither: 0.7, moons: false, feat }
 }
 
 /// Render one planet as a **sprite tile**: the same shader as [`render_rgba`],
@@ -665,7 +849,7 @@ fn tile_style() -> Style {
 pub fn render_tile(type_idx: usize, seed: u32, angle: f32, light: [f32; 3], rad_px: f32) -> Tile {
     let size = tile_size(type_idx, rad_px);
     let mut tile = Tile::default();
-    render_tile_into(&mut tile, type_idx, seed, angle, light, rad_px, [0, 0, size, size]);
+    render_tile_into(&mut tile, type_idx, seed, angle, light, rad_px, [0, 0, size, size], F_ALL);
     tile
 }
 
@@ -692,6 +876,7 @@ pub fn tile_size(type_idx: usize, rad_px: f32) -> u32 {
 /// valid for the placement its clip came from. That is exactly what `blit` reads
 /// back, so a reused buffer cannot leak a previous body into the scene — but do
 /// not hand the tile to anything that reads wider.
+#[allow(clippy::too_many_arguments)]
 pub fn render_tile_into(
     tile: &mut Tile,
     type_idx: usize,
@@ -700,13 +885,14 @@ pub fn render_tile_into(
     light: [f32; 3],
     rad_px: f32,
     clip: [u32; 4],
+    feat: u32,
 ) {
     let ct = &TYPES[type_idx % TYPES.len()];
     let size = tile_size(type_idx, rad_px);
     tile.ensure(size);
     let clip = [clip[0].min(size), clip[1].min(size), clip[2].min(size), clip[3].min(size)];
     let frame = Frame { size, rad: rad_px, light, sprite: true, clip };
-    render_frame(&frame, ct, seed, angle, &tile_style(), &mut tile.px);
+    render_frame(&frame, ct, seed, angle, &tile_style(feat), &mut tile.px);
 }
 
 /// A glint below this cannot survive the 22-level quantization (one level is
@@ -724,36 +910,22 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
     const RING_SQUASH: f32 = 0.38;
 
     // Precompute orbiting moons (mx, my, radius, depth, seed).
-    let mut moons: [(f32, f32, f32, f32, f32); 2] = [(0.0, 0.0, 0.0, 0.0, 0.0); 2];
-    let mut nmoon = 0usize;
-    if style.moons {
-        let count = (hash3(seed as i32, 50, 1) * 2.6) as usize; // 0..2
-        for k in 0..count.min(2) {
-            let ks = k as i32 * 5;
-            // Orbit in the margin around the disc; moons cross in front / behind
-            // at the top and bottom of the tilted orbit.
-            let orbit = 1.16 + hash3(seed as i32, ks + 1, 2) * 0.14;
-            let tilt = 0.34 + hash3(seed as i32, ks + 2, 2) * 0.30;
-            let speed = 0.25 + hash3(seed as i32, ks + 3, 2) * 0.4;
-            let phase = hash3(seed as i32, ks + 4, 2) * TAU;
-            let mr = (0.12 + hash3(seed as i32, ks + 5, 2) * 0.09) * ct.radius_scale.max(0.6);
-            let oa = angle * speed + phase;
-            moons[k] = (oa.cos() * orbit, oa.sin() * orbit * tilt, mr, oa.sin(), k as f32 + 1.0);
-            nmoon += 1;
-        }
-    }
+    let (moons, nmoon) = if style.moons { moon_ring(ct, seed, angle) } else { (Default::default(), 0) };
 
     let lod = Lod::for_disc(rad);
+    // Past the terminator `shade` bottoms out at the 0.10 ambient floor and the
+    // output snaps to 22 levels, roughly 3 of which are reachable — the fine
+    // octaves and the whole cloud deck cannot survive that, so they are not
+    // computed there. Lightning fires at a seeded point anywhere on the disc and
+    // lights the deck when it does, so those types opt out wholesale; aurora is
+    // confined to a polar band, so it opts out by latitude below rather than
+    // excluding every type that merely has one.
+    let night_ok = style.feat & F_NIGHT_LOD != 0 && ct.lightning == 0.0 && ct.base != Base::Emissive;
     // Functions of `angle` and `seed` alone — hoisted out of the pixel loop.
     let (cs, cc) = (angle * 2.0).sin_cos();
     let morph = angle.sin() * 0.6;
     let swirl_phase = (angle * 0.6).sin() * 1.6 * ct.storm_cells;
-    let vortex: [(f32, f32); 2] = [0, 1].map(|k: i32| {
-        (
-            (hash3(seed as i32, k * 7 + 1, 3) * 2.0 - 1.0) * 1.6 + ofs[0],
-            (hash3(seed as i32, k * 7 + 2, 3) * 2.0 - 1.0) * 1.6 + ofs[2],
-        )
-    });
+    let vortex = vortex_centres(seed, ofs);
 
     // A sprite is empty off the disc and off a ringed world's ring ellipse, so a
     // row need only be walked across those. Moons orbit out in the margin, so a
@@ -803,8 +975,19 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                 let sy = ny;
                 let sz = -nx * sina + nz * cosa;
 
-                let (mut col, emis) = surface(ct, sx, sy, sz, ofs, angle, lod);
-                if ct.clouds > 0.0 {
+                let diff = (nx * l[0] + ny * l[1] + nz * l[2]).max(0.0);
+                let night = night_ok && diff <= 0.0 && (ct.aurora == 0.0 || sy.abs() < 0.52);
+                let (mut col, emis) = surface(
+                    ct,
+                    sx,
+                    sy,
+                    sz,
+                    ofs,
+                    angle,
+                    if night { lod.capped(NIGHT_OCT) } else { lod },
+                    style.feat,
+                );
+                if ct.clouds > 0.0 && !night {
                     // Clouds drift over the surface (2x = parallax, loops) and
                     // slowly billow — a periodic morph reveals new cloud structure
                     // so weather forms and dissipates rather than sliding rigidly.
@@ -833,29 +1016,28 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                         }
                     }
 
+                    let n = lod.oct(2.8, 4);
                     let dens = |ox: f32, oz: f32| {
-                        let n = lod.oct(2.8, 4);
                         fbm((cx3 + ox) * 2.8, ny * 2.8 + ofs[1] + morph, (cz3 + oz) * 2.8 + morph, n)
                     };
-                    // Wispy, fractal cloud tops (domain-warped) so they break into
-                    // ragged fronts instead of clumping into round blobs. Shadow
-                    // uses the cheap plain density.
+                    // Wispy, fractal cloud tops (domain-warped) so they break
+                    // into ragged fronts instead of round blobs. Shadow uses the
+                    // cheap plain density.
                     let cloud = fbm_warp(
                         cx3 * 2.8,
                         ny * 2.8 + ofs[1] + morph,
                         cz3 * 2.8 + morph,
-                        Lod::WARP,
-                        lod.oct(2.8, 4),
+                        warp_oct(style.feat, n),
+                        n,
                         0.9,
                     );
-
                     let shadow = smoothstep(0.55, 0.72, dens(l[0] * 0.45, l[2] * 0.45));
-                    let sh = 1.0 - 0.22 * shadow * ct.clouds;
-                    col = [col[0] * sh, col[1] * sh, col[2] * sh];
-
+                    if style.feat & F_CLOUD_SHADOW != 0 {
+                        let sh = 1.0 - 0.22 * shadow * ct.clouds;
+                        col = [col[0] * sh, col[1] * sh, col[2] * sh];
+                    }
                     col = mix(col, [1.0, 1.0, 1.0], smoothstep(0.52, 0.70, cloud) * ct.clouds);
                 }
-                let diff = (nx * l[0] + ny * l[1] + nz * l[2]).max(0.0);
                 let shade = (0.10 + 0.90 * diff).max(emis);
                 o = [col[0] * shade, col[1] * shade, col[2] * shade];
                 if ct.specular > 0.0 {
@@ -880,7 +1062,7 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                         o[2] = clamp01(o[2] + sp);
                     }
                 }
-                if has_atmo {
+                if has_atmo && style.feat & F_ATMO != 0 {
                     // `powf(3.0)` is a full exp/log even for a literal exponent.
                     let rim = (1.0 - nz).powi(3) * 0.6;
                     o[0] = clamp01(o[0] + ct.atmo[0] * rim);
@@ -892,7 +1074,7 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
                 o = [0.0, 0.0, 0.0];
                 a = 0.0;
             } else {
-                let s = star_bg(ix, iy, seed);
+                let s = if style.feat & F_STARFIELD != 0 { star_bg(ix, iy, seed) } else { [0, 0, 0, 255] };
                 o = [s[0] as f32 / 255.0, s[1] as f32 / 255.0, s[2] as f32 / 255.0];
             }
 
@@ -926,7 +1108,7 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
             // Crisp dark rim on the planet disc. Applied BEFORE moons so a front
             // moon crossing the limb passes over the rim instead of being clipped
             // under it.
-            if d2 <= 1.0 {
+            if d2 <= 1.0 && style.feat & F_RIM != 0 {
                 let edge = 1.0 - 1.3 / rad;
                 if d2 > edge * edge {
                     o = [o[0] * 0.26, o[1] * 0.26, o[2] * 0.30];
@@ -958,6 +1140,42 @@ fn render_frame(fr: &Frame, ct: &PType, seed: u32, angle: f32, style: &Style, ou
             out[idx + 1] = (clamp01(px[1]) * 255.0) as u8;
             out[idx + 2] = (clamp01(px[2]) * 255.0) as u8;
             out[idx + 3] = if fr.sprite { (clamp01(a) * 255.0) as u8 } else { 255 };
+        }
+    }
+}
+#[cfg(test)]
+mod band_tests {
+    use super::*;
+
+    /// Splitting a frame across workers is only sound if a band is bit-identical
+    /// to the same rows of the whole frame — every worker shades from the same
+    /// pure function of pixel position, and nothing accumulates across rows.
+    #[test]
+    fn render_band_matches_whole() {
+        const SIZE: u32 = 96;
+        let n = (SIZE * SIZE * 4) as usize;
+        for &t in &[0usize, 7, 8, 10, 20, 24] {
+            let p: Vec<f32> = (0..NUM_PARAMS).map(|i| param(t, i as u32)).collect();
+            let feat = F_ALL | F_NIGHT_LOD;
+            let mut whole = vec![0u8; n];
+            render_rgba_features(SIZE, t, 1, 0.7, &p, 0, 0.7, 1, feat, &mut whole);
+
+            // Uneven bands on purpose: a real pool hands out a remainder.
+            for bands in [2u32, 3, 5, 7] {
+                let mut out = vec![0u8; n];
+                let step = SIZE.div_ceil(bands);
+                for b in 0..bands {
+                    let (y0, y1) = (b * step, ((b + 1) * step).min(SIZE));
+                    if y0 >= y1 {
+                        continue;
+                    }
+                    let mut band = vec![0u8; n];
+                    render_rgba_band(SIZE, t, 1, 0.7, &p, 0, 0.7, 1, feat, y0, y1, &mut band);
+                    let r = (y0 * SIZE * 4) as usize..(y1 * SIZE * 4) as usize;
+                    out[r.clone()].copy_from_slice(&band[r]);
+                }
+                assert_eq!(out, whole, "type {t}, {bands} bands");
+            }
         }
     }
 }

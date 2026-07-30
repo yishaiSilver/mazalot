@@ -110,6 +110,10 @@
     <div class="grp">Orbits</div>
     <div class="ctl"><label>Orbit thickness <b id="orbitWV">1px</b></label><input type="range" id="orbitW" min="1" max="6" step="1" value="1" /></div>
 
+    <div class="grp">Detail</div>
+    <div class="ctl"><label for="nlod">Thin night side <b id="nlodV">on</b></label>
+      <input type="checkbox" id="nlod" checked style="width:auto;accent-color:#f4b74a;cursor:pointer" /></div>
+
     <div class="grp">Pixelation</div>
     <div class="ctl"><label>Scene <b id="pixV">1×</b></label><input type="range" id="pix" min="1" max="8" step="1" value="1" /></div>
 
@@ -202,6 +206,7 @@ function buildSystem() {
   // A fresh system defaults to width 1 — re-apply the chosen thickness so it
   // survives seed / moon-count rebuilds.
   if (sys) wasm.moon_set_orbit_width(sys, vOrbitW);
+  if (sys) wasm.moon_set_night_lod(sys, $("nlod").checked ? 1 : 0);
   nMoons = wasm.moon_count(sys);
   parentKind = wasm.parent_kind_of(sys);
   moonKinds = [];
@@ -339,6 +344,16 @@ $("pix").addEventListener("input", () => { pix = parseInt($("pix").value) || 1; 
 $("orbitW").addEventListener("input", () => {
   vOrbitW = parseInt($("orbitW").value) || 1; $("orbitWV").textContent = vOrbitW + "px";
   if (sys) wasm.moon_set_orbit_width(sys, vOrbitW);
+});
+// Frozen weather: the parent fills the view, so its cloud deck IS the frame.
+// Baking it once and reading it back per pixel is ~2x; off restores the
+// Past the terminator `shade` bottoms out at the ambient floor and ~3 of the 22
+// output levels are reachable, so the fine octaves and the cloud deck are not
+// computed there. Worth 8-35% here, where the parent fills the view.
+$("nlod").addEventListener("change", () => {
+  const on = $("nlod").checked;
+  $("nlodV").textContent = on ? "on" : "off";
+  if (sys) wasm.moon_set_night_lod(sys, on ? 1 : 0);
 });
 window.addEventListener("resize", setupCanvas);
 

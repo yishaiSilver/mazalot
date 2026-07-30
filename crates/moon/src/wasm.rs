@@ -74,3 +74,13 @@ pub extern "C" fn system_extent(sys: *const MoonSystem) -> f32 {
     let sys = unsafe { &*sys };
     sys.extent()
 }
+
+/// Thin the parent's shader past the terminator: 1 caps the octaves and skips
+/// the cloud deck on the night side, 0 shades it at full detail. Worth 8-35% of
+/// a frame where the parent fills the view, and it moves pixels on the dark limb
+/// — see `planet_core::F_NIGHT_LOD`.
+#[no_mangle]
+pub extern "C" fn moon_set_night_lod(sys: *mut MoonSystem, on: u32) {
+    let sys = unsafe { &mut *sys };
+    sys.night_lod = on != 0;
+}

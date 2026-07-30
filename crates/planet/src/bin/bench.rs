@@ -1,5 +1,8 @@
 //! Feature-cost benchmark for the current renderer.
-use planet::{param, render_rgba_styled, type_count, type_name, NUM_PARAMS};
+use planet::{
+    param, render_rgba_features, render_rgba_styled, type_count, type_name, F_ALL, F_NIGHT_LOD,
+    NUM_PARAMS,
+};
 use std::time::Instant;
 
 fn idx(n: &str) -> usize {
@@ -18,6 +21,21 @@ fn bench(size: u32, t: usize, pal: u32, dith: f32, moons: u32, iters: u32) -> f6
     let s = Instant::now();
     for i in 0..iters {
         render_rgba_styled(size, t, 1, i as f32 * 0.01, &p, pal, dith, moons, &mut buf);
+    }
+    s.elapsed().as_nanos() as f64 / iters as f64
+}
+
+/// Same shape as [`bench`], but with an explicit `F_*` mask. Dither and moons
+/// are off so the number is the shader alone.
+fn feat_bench(size: u32, t: usize, feat: u32, iters: u32) -> f64 {
+    let p = defs(t);
+    let mut buf = vec![0u8; (size * size * 4) as usize];
+    for i in 0..8 {
+        render_rgba_features(size, t, 1, i as f32 * 0.1, &p, 0, 0.0, 0, feat, &mut buf);
+    }
+    let s = Instant::now();
+    for i in 0..iters {
+        render_rgba_features(size, t, 1, i as f32 * 0.01, &p, 0, 0.0, 0, feat, &mut buf);
     }
     s.elapsed().as_nanos() as f64 / iters as f64
 }
@@ -57,5 +75,25 @@ fn main() {
         println!("    + moons                        +{:>6.3} ms", (m - base) / 1e6);
         let pl = bench(size, idx("terran"), 1, 0.0, 0, it);
         println!("    + palette (game boy)           +{:>6.3} ms", (pl - base) / 1e6);
+    }
+
+    // Night-side thinning. Interleaved against the full-detail path rather than
+    // run in two blocks: this machine's timings drift within a run, and the whole
+    // point of the number is the ratio between the two.
+    println!("\n=== night-side thinning (F_NIGHT_LOD) ===");
+    println!("{:<14} {:>5}  {:>9}  {:>9}  {:>7}", "type", "size", "full", "thinned", "speedup");
+    for &t in &["terran", "ocean", "gaia", "swamp", "toxic", "storm_shroud"] {
+        for &size in &[64u32, 256] {
+            let n = if size <= 64 { 200 } else { 30 };
+            let (mut full, mut thin) = (0.0, 0.0);
+            for _ in 0..3 {
+                full += feat_bench(size, idx(t), F_ALL, n);
+                thin += feat_bench(size, idx(t), F_ALL | F_NIGHT_LOD, n);
+            }
+            println!(
+                "{:<14} {:>5}  {:>6.3} ms  {:>6.3} ms  {:>6.2}x",
+                t, size, full / 3e6, thin / 3e6, full / thin
+            );
+        }
     }
 }
