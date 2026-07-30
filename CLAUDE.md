@@ -14,18 +14,18 @@ driving a browser demo.
 A Cargo workspace under `crates/`, in two layers.
 
 **Library crates** hold shared machinery. They carry **no third-party
-dependencies** (except `render-io`, which is the one that owns `image`):
+dependencies** (except `render-io`, which owns `image`/`gif`/`rayon`):
 
 | crate | what |
 |---|---|
-| `noise-core` | 3D value-noise, fBm, domain warp, Worley, colour/ramp math. Bottom of everything. |
+| `noise-core` | 3D value-noise, fBm, domain warp, Worley, colour/ramp math. Bottom of everything. The lattice kernels are four-lane (`lanes.rs`); see the SIMD gotcha below. |
 | `dither-core` | Bayer ordered dither + level quantization. |
 | `scene-core` | `Camera`, seeded `Rng`, `Tile` + `blit` alpha compositor. |
 | `background-core` | **The** backdrop — dithered ground, optional seeded nebula (baked + cached), parallax star layers. |
 | `planet-core` | **The** planet renderer — 26-type table, sphere shader, weather, rings, moons. |
 | `sun-core` | The compact star tile (granulation + corona). |
 | `wasm-abi` | `alloc`/`dealloc` + opaque-handle macros for the C ABI. |
-| `render-io` | GIF/contact-sheet/poster helpers. The only crate that touches `image`. |
+| `render-io` | GIF/contact-sheet/poster helpers, and the parallel GIF encoder. The only crate that touches `image`. |
 
 They stack in one direction only — `noise-core` → `dither-core`/`scene-core` →
 `background-core`/`planet-core`/`sun-core`. See the import table in `README.md`.
@@ -115,10 +115,11 @@ for c in planet solar moon comet asteroid bird character; do
   cargo run -q --release -p "$c" --bin "$c"
 done
 cargo run -q --release -p star --bin sun     # note: the bin is `sun`, not `star`
+cargo run -q --release -p bird --bin alien   # `bird` has two bins; this one is easy to miss
 (cd out && sha256sum *) | sort > /tmp/after.sha256
 ```
 
-`out/` is gitignored and holds 94 files. Hash it **before** you touch anything,
+`out/` is gitignored and holds 74 files. Hash it **before** you touch anything,
 again after, and diff. A refactor that is supposed to be behaviour-preserving
 should come out byte-identical; if something changed, you must be able to name
 which crate and why.
@@ -128,10 +129,22 @@ with the JS:
 
 ```bash
 cargo build -p solar --target wasm32-unknown-unknown --release --no-default-features
+node -e 'const m=new WebAssembly.Module(require("fs").readFileSync(process.argv[1]));
+         console.log(WebAssembly.Module.exports(m).map(e=>e.kind+" "+e.name).sort().join("\n"))' \
+     crates/solar/web/solar.wasm
 ```
 
-Then compare the exported `func` names before/after. Changing them breaks a demo
-silently, because the JS calls them by name.
+Compare that list before/after. Changing it breaks a demo silently, because the
+JS calls the exports by name.
+
+Node also runs the modules directly, which is the only way to check the *wasm*
+render path — `out/` only covers native. Instantiate with `{}` (there are no
+imports), call `alloc`/`render`/`dealloc`, and hash the pixel bytes; that
+checksum is to the wasm build what the `out/` hashes are to the native one, and
+you need it whenever you touch `noise-core`.
+
+Run wasm builds **from the repo root** so `.cargo/config.toml` applies. It adds
+`-C target-feature=+simd128`, which is required, not optional — see below.
 
 `cargo test --workspace` runs the handful of roster tests. It is fast; run it.
 
@@ -160,6 +173,82 @@ silently, because the JS calls them by name.
 - **Benchmark with a control.** This machine's timings swing ±60% between runs.
   Build the baseline in a throwaway `git worktree` and interleave the two binaries
   in one loop, using an untouched pass (e.g. solar's background) as the control.
+  For wasm, build the baseline worktree's module too and alternate `node` runs —
+  and watch that the worktree build is what you think it is: cargo picks up
+  `.cargo/config.toml` from the *working directory*, so a scratch crate built
+  outside the repo silently loses `simd128` and will look like a regression.
+- **`simd128` is load-bearing, not a bonus.** `noise-core`'s kernels are written
+  four-lane. With the feature they beat the old scalar code; without it, the
+  portable array fallback is *slower* in wasm than what it replaced. Never build
+  a demo module with it off. Do not reach for `relaxed-simd` to go further: it
+  permits FMA, whose rounding would split wasm output from the native
+  generators'. `lanes.rs` documents the rules that keep the two backends
+  bit-identical — read it before adding an operation there.
+- **`render-io`'s `encode_gif` must stay byte-compatible with `image`.** It drives
+  the `gif` crate directly — quantizing frames across cores with rayon, writing
+  them serially — instead of using `image::codecs::gif::GifEncoder`, which is
+  what makes the generators ~3.4× faster. It reproduces `GifEncoder`'s steps
+  exactly (speed 1, `delay / 10`, `Background` disposal, empty global palette
+  from the first frame, `set_repeat` first). If you touch it, or bump `image`
+  or `gif`, re-run the `out/` hashes — every GIF in the repo depends on that
+  correspondence, and a drift is invisible by eye.
+- **Rendering order is parallel now; keep frames independent.** The generators
+  run frames through rayon and `collect()` back into order, so output is
+  deterministic — but only because every frame closure is a pure function of its
+  index. A closure that accumulates across frames would silently produce garbage.
+  The scene bins are the exception and stay serial: their `System`/`Belt`/`Scene`
+  holds `RefCell` caches and is not `Sync` on purpose.
+- **The sphere map is the sprite idea that works.** A screen-space sprite strip
+  has to be re-baked for every (spin, light) pair and scales as r³ — at r=80 that
+  is 503 frames and 51 MB, and it breaks even only after a full revolution
+  because building it means rendering one. Indexing by (longitude, y) instead
+  makes the bake invariant to both, so one map serves every frame. If a new layer
+  looks bakeable, check it for an `angle` term first: `Terrestrial`/`Cratered`
+  have none. `Emissive` splits instead — its rock field bakes, its flow stays
+  live. `Banded` needed its drift re-expressed as a longitude rotation before it
+  would bake at all, which is a look change and so has its own bit.
+- **An axis that cannot be a lookup offset can still be a lookup *table*.** The
+  cloud morph translates the noise domain in y and z — the field evolving — so no
+  single map holds it and no offset fakes it. Six maps across the cycle, indexed
+  by the morph value (it oscillates; do not index by time), recover 61% of what
+  freezing cost for 4% of the frame. Memory and bake go up by the phase count,
+  so the cache budget is sized for one zoomed planet's stack.
+- **`F_ALL` is not every `F_*` bit.** It is the five that leave the picture
+  alone. `F_NIGHT_LOD` was in it until `Lod` started feeding the aurora and the
+  great spot as well as the base field — capping octaves past the terminator
+  then moved pixels, and `out/` caught it. If a switch changes the image, it
+  lives outside `F_ALL` and the web demos opt in.
+- **A per-family optimization needs its gate checked one bit at a time.** The
+  baked map was built only when `F_BAKED_CLOUDS` was set, so `F_BAKED_SURFACE`
+  and `F_BAKED_BANDS` did nothing on their own — and the verification missed it
+  for a whole commit because it always tested them with the cloud bit already on.
+  Hash each bit against `F_ALL` alone, not against `F_ALL | <the other bits>`.
+- **`F_BAKED_*` are deliberately outside `F_ALL`.** Every other `F_*` bit is
+  either a feature the ablation panel switches off or an optimization that is
+  invisible; these change the picture (frozen weather, baked albedo, thinned night side) to
+  buy ~2x together on top of the shipped renderer.
+  Keeping them out of `F_ALL` is what lets `out/` stay byte-identical while the
+  web demos run with them. `System::frozen_clouds` / `MoonSystem::frozen_clouds` default to
+  `false` for the same reason — the JS turns them on at construction.
+- **A render-mode flag has to be in the tile memo key.** `solar` caches a
+  planet's last tile against its geometry; a flag that changes how the tile is
+  rendered but not where it lands will otherwise keep serving the old tile until
+  the planet happens to move a pixel. That made the demo's checkboxes look dead
+  on a slow world, and made an A/B measure the cache. `lod` and `frozen_clouds`
+  are both folded in now.
+- **Timing a scene means putting the body on screen and keeping the memo
+  missing.** Three different ways to get this wrong, all of which produce a
+  confident number: a camera parked where a planet started drifts off it within a
+  few frames and then you are timing the backdrop (`solar`'s bench printed 0.28 ms
+  for a scenario whose real cost is 40 ms); a camera that jumps far each frame
+  re-bakes the backdrop and buries the body under it; and a time step too small to
+  move the tile past its memo key means the shader never runs at all. Use
+  `ms_follow` in `solar`'s bench as the template.
+- **Vector code is not automatically faster inlined.** `value_noise` runs ~28×
+  per pixel and had to be `#[inline(never)]` *on the vector path only* to stop
+  its `v128` temporaries spilling in the pixel loop — inlined it was slower than
+  scalar. Measure whole frames, not just the kernel: this one reversed sign
+  between a microbenchmark and a real frame.
 - `cargo build --workspace` warns about a `bench` output-filename collision between
   `planet` and `solar`. Pre-existing; ignore it.
 - `scripts/make-artifact.sh <crate>` bundles a demo into one self-contained HTML

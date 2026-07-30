@@ -86,6 +86,37 @@ pub extern "C" fn render_params(
     crate::render_rgba_params(size, type_idx as usize, seed, angle, params, out);
 }
 
+/// Render with the feature switches exposed — the ablation panel's entry point.
+/// `features` is a mask of `planet_core`'s `F_*` bits; `feat_all()` is the
+/// normal picture. Switching one bit off and timing the difference is how the
+/// per-feature costs are measured.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn render_features(
+    ptr: *mut u8,
+    size: u32,
+    type_idx: u32,
+    seed: u32,
+    angle: f32,
+    params_ptr: *const f32,
+    palette: u32,
+    dither: f32,
+    moons: u32,
+    features: u32,
+) {
+    let out = unsafe { slice::from_raw_parts_mut(ptr, (size * size * 4) as usize) };
+    let params = unsafe { slice::from_raw_parts(params_ptr, crate::NUM_PARAMS) };
+    planet_core::render_rgba_features(
+        size, type_idx as usize, seed, angle, params, palette, dither, moons, features, out,
+    );
+}
+
+/// The all-features-on mask, so JS need not hard-code the bit count.
+#[no_mangle]
+pub extern "C" fn feat_all() -> u32 {
+    planet_core::F_ALL
+}
+
 /// Number of planet types (for the JS "random type" picker).
 #[no_mangle]
 pub extern "C" fn type_count() -> u32 {

@@ -11,4 +11,6 @@ edition = "2021"
 crate-type = ["rlib"]
 
 [dependencies]
+gif = "0.14"
 image = { version = "0.25", default-features = false, features = ["png", "gif"] }
+rayon = "1"

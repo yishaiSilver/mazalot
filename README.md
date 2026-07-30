@@ -23,14 +23,14 @@ a `--no-default-features` wasm build never sees `image`/`rand` and stays tiny.
 
 | Crate | What it is |
 |-------|------------|
-| `noise-core` | 3D value-noise + fBm + domain warp + Worley, and the color/ramp math. The bottom of everything. |
+| `noise-core` | 3D value-noise + fBm + domain warp + Worley, and the color/ramp math. The bottom of everything. The two lattice kernels hash four corners per instruction on wasm `simd128` — see [SIMD noise](#simd-noise). |
 | `dither-core` | Bayer ordered dithering and level quantization — the pixel-art output stage. |
 | `scene-core` | The scene-compositor kit: draggable `Camera`, seeded `Rng`, and the `Tile` + `blit` alpha compositor. |
 | `background-core` | Everything a scene paints *before* its bodies: the dithered navy ground, an optional seeded **nebula** (baked at low res into a world-indexed sprite that a pan scrolls rather than rebuilds), and **parallax star layers**. |
 | `planet-core` | **The** planet renderer — the only one in the workspace. The 26-type table, sphere shading, weather, rings, moons. One shader, two framings: a *hero* square frame (`render_rgba`) and a *scene sprite tile* (`render_tile`). `planet`, `solar` and `moon` are all framings of it. |
 | `sun-core` | The compact star tile (granulation + corona) used by `solar` and `comet`. |
 | `wasm-abi` | The raw C-ABI glue: `alloc`/`dealloc` and opaque-handle macros. Exports no symbols itself. |
-| `render-io` | The only crate that touches `image`: GIF/contact-sheet/poster helpers for the native bins. |
+| `render-io` | The only crate that touches `image`: GIF/contact-sheet/poster helpers for the native bins, plus the parallel GIF encoder that makes them fast — see [Parallel generation](#parallel-generation). |
 
 **Demo crates:**
 
@@ -52,21 +52,21 @@ always behind the `native` feature, so the wasm build never sees it.
 
 | library crate      | lines | planet | star | solar | moon | comet | asteroid |
 |--------------------|------:|:------:|:----:|:-----:|:----:|:-----:|:--------:|
-| `noise-core`       |   146 |   ○    |  ●   |   ●   |  ●   |   ●   |    ●     |
+| `noise-core`       |   618 |   ○    |  ●   |   ●   |  ●   |   ●   |    ●     |
 | `dither-core`      |    31 |   ○    |  ●   |   ○   |  ●   |   ●   |    ●     |
 | `scene-core`       |   130 |   ○    |  ·   |   ●   |  ●   |   ●   |    ●     |
 | `background-core`  |   365 |   ·    |  ·   |   ●   |  ●   |   ●   |    ●     |
 | `planet-core`      |   815 |   ●    |  ·   |   ●   |  ●   |   ·   |    ·     |
 | `sun-core`         |   124 |   ·    |  ·   |   ●   |  ·   |   ●   |    ·     |
 | `wasm-abi`         |    87 |   ●    |  ●   |   ●   |  ●   |   ●   |    ●     |
-| `render-io`        |   188 |   ●    |  ●   |   ●   |  ●   |   ●   |    ●     |
+| `render-io`        |   240 |   ●    |  ●   |   ●   |  ●   |   ●   |    ●     |
 | **`lib.rs`**       |       | **18** | 567  |  767  | 503  |  557  |   490    |
 | **`wasm.rs`**      |       |   93   |  58  |  166  |  76  |   79  |    71    |
 
 The library layer is 8 crates / 1,886 lines and stacks in one direction only:
 
 ```
-                          render-io ──── image (the only third-party dep)
+                          render-io ──── image, gif, rayon (the only third-party deps)
                           wasm-abi  ──── (nothing)
 
 noise-core ──┬── dither-core ──┬── background-core ── solar, moon, comet, asteroid
@@ -100,6 +100,7 @@ stretching, and a full 360° spin loops seamlessly.
 
 ### Animated weather (loop-safe)
 - **Clouds** — domain-warped wispy fronts that drift and billow; cast soft shadows.
+  (The web demos freeze the billowing by default — see *Frozen weather*.)
 - **Gas-giant bands** — counter-rotating zonal jets + domain warp (fluid, not a sine wobble).
 - **Great spot** — a drifting spiral cyclone with a calm eye.
 - **Lightning** — small, irregular, randomized-color flashes on storm worlds.
@@ -288,7 +289,8 @@ cd bird-web && python3 -m http.server 8000  # open http://localhost:8000/
 ```
 (All require the wasm target: `rustup target add wasm32-unknown-unknown`. The
 `--no-default-features` flag drops the native-only `image`/`rand` deps so the
-wasm build stays tiny.)
+wasm build stays tiny. `simd128` comes from `.cargo/config.toml` — run these from
+the repo root so cargo picks it up; see [SIMD noise](#simd-noise).)
 
 ### Web controls
 Type · Seed · Resolution · Spin, then live sliders for every parameter
@@ -458,6 +460,231 @@ it sets a *radius*: cost goes as its square, so halving the slider quarters the
 shader work. At the same zoom, cap 32 is 5.8 ms, cap 64 is 17.8 ms and cap 160 is
 95 ms. The shipped default of 160 buys full six-octave detail on a screen-filling
 world and costs accordingly; drop it if you want the frame back.
+
+### Feature cost lab
+
+The `planet` demo carries an ablation panel: a tick-box per shader feature, and a
+button that switches each one off in turn and times the difference. It measures
+on *your* machine, so the numbers below are a reference point rather than a
+claim about your hardware.
+
+Most features are reachable through the existing per-type sliders — `clouds`,
+`specular`, `spot`, `aurora`, `lightning`, `storm_cells` and `caps` are all gated
+on `> 0.0`, so zeroing one switches it off. The `F_*` mask in `planet-core`
+covers what a parameter cannot reach: part of a layer rather than a whole one
+(the cloud self-shadow), framing furniture (atmosphere rim, dark limb, starfield)
+and the two optimizations. `render_rgba_features(.., F_ALL, ..)` is byte-identical
+to `render_rgba_styled`, so nothing about the normal path changes.
+
+Measured here, `terran` at 64² (full frame 1.449 ms):
+
+| feature | cost | share |
+|---|---:|---:|
+| **cloud layer** (all of it) | 0.801 ms | **55%** |
+| ├ cloud colour (`fbm_warp`) | ~0.53 ms | 37% |
+| ├ **cloud self-shadow** | 0.176 ms | **12%** |
+| └ storm-cell swirl | 0.093 ms | 6% |
+| **aurora** | 0.172 ms | **12%** |
+| **specular + shimmer** | 0.133 ms | **9%** |
+| atmosphere rim · lightning · ice caps · great spot · moons | ≤0.03 ms each | ≤2% |
+| ordered dither · dark limb · starfield | ~0 | ~0% |
+
+The cloud deck is the whole game on a terrestrial world — everything else put
+together is about a quarter of the frame. Two things stand out as poor value:
+**aurora costs 12% for a thin polar band**, and **specular is 19% of a `lava`
+frame** for a glint whose intensity is 0.05. By archetype: `gas_giant` is great
+spot 16%, `lava` is specular 19% and nothing else, `barren` has no feature above
+5% because it is all Worley, which has no switch.
+
+For comparison the same panel reports what the optimizations are worth in this
+framing: cheap warp saves 19% on `terran`, 31% on `gas_giant`, 51% on
+`storm_shroud`; night-side thinning saves 4% on `terran`, 11% on `ocean`.
+
+### Frozen weather
+
+The cost table above says a cloudy world *is* its cloud deck. Per pixel the deck
+is 14 `value_noise` evaluations — a 4-octave domain warp for the tops (3 inner
+displacement fields + 1 outer) plus a plain 4-octave field for the self-shadow.
+All 14 collapse into two table reads the moment the deck stops **evolving**.
+
+The deck already turns at 2× the surface, which is the parallax that makes
+weather read as its own layer. What costs per-frame work is not the rotation but
+the billowing (a periodic morph) and the churning storm cells — both driven by
+`angle`. Freeze those and the density becomes a fixed function of a direction on
+the sphere, so it can be baked once into an equirectangular map in
+(longitude, y) and sampled for every frame after.
+
+`y` rather than latitude is deliberate: a sphere point is
+`(r·cos θ, y, r·sin θ)` with `r = √(1−y²)`, so a map row is exactly a circle of
+constant `y` and the vertical axis costs no transcendental at lookup time. It is
+also equal-area, so texels carry uniform detail instead of piling up at the
+poles. The map is `u8` — it feeds an 0.18-wide `smoothstep`, so one quantum
+moves the result by 2.2% of that ramp against a dither step of 0.045. Width is
+`4·rad` rounded up to a power of two and capped at 1024, which puts about one
+texel on one pixel and lets the adaptive detail cap nudge the radius without
+re-baking.
+
+Two kinds of planet get one, and the second is the bigger win:
+
+| | what is frozen | native | wasm |
+|---|---|---:|---:|
+| **deck** over a solid surface (`clouds > 0`) | the tops + the shadow field | 1.85–1.96× | 1.6–1.7× |
+| **shroud** that *is* the surface (`Base::Cloudy`) | the whole band/turbulence mix factor, so the lookup lands one `mix` from the pixel | 2.6× | 1.76–1.85× |
+
+The shrouded worlds do better because their entire surface algorithm collapses
+into the plane — the baked value is the finished mix factor, not an input to
+more math. wasm gains less than native across the board: its noise kernels are
+four-lane SIMD while the table read is scalar byte loads, so the thing being
+replaced was relatively cheaper there to begin with.
+
+In the scene, following a cloudy planet that fills a 1000×640 view:
+**59.3 → 29.9 ms, 17 → 33 fps (1.98×)**.
+
+The bake costs about five frames and then pays for the rest of the animation —
+that ratio holds at every size, because the map scales with the render. It is
+kept in a small per-thread LRU (8 slots / 12 MB); a scene draws every planet on
+the way to drawing one, so a one-deep cache would evict on every body and
+re-bake on the next, turning the optimization into a pessimization.
+
+What it costs to look at: on `terran`, 17.7% of pixels move by a mean of
+6.8/255. That number is not blur — the map is built at the same octave count the
+live path would have used, so the deck is exactly as detailed. It is a
+*different* sky: frozen at one phase, with storm cells wound to a fixed state
+(`STORM_STATIC`) rather than churning. Worlds with thinner decks move less
+(`tundra` 8.9%, `desert` 5.6%).
+
+#### The same trick on the surface
+
+Once the map exists, the question is what else is a pure function of a direction
+on the sphere. The answer is most of the shader: `Base::Terrestrial` and
+`Base::Cratered` contain no `angle` term at all — 15 of the 26 types. So
+`F_BAKED_SURFACE` bakes their albedo into the same map, RGB interleaved.
+
+The two that stay live are the ones that genuinely advect: a gas giant's zonal
+jets drift by `angle · 0.16 · sin(lat · bands / 2)` and a lava world's glow is
+carried by a flow field. Freezing those would stop the bands sliding past each
+other, which is the whole look, so they keep paying.
+
+wasm, 160px tile, cumulative:
+
+| type | live | + frozen deck | + baked surface | total |
+|---|---:|---:|---:|---:|
+| `terran` | 91 fps | 155 fps | **215 fps** | 2.36× |
+| `ocean` | 95 fps | 167 fps | **222 fps** | 2.33× |
+| `barren` | 206 fps | 205 fps | **472 fps** | 2.29× |
+| `moon` | 206 fps | 207 fps | **464 fps** | 2.25× |
+| `iron` | 178 fps | 178 fps | **247 fps** | 1.39× |
+| `gas_giant` / `lava` | — | — | — | 1.00× |
+
+The cratered worlds double because Worley searches 27 cells per pixel and there
+is nothing else in their frame; `iron` gains least of the terrestrials because
+it has no cloud deck to have frozen first. In the scene, following a cloudy
+planet that fills a 1000×640 view: **52.2 → 18.5 ms, 19 → 54 fps (2.82×)**.
+
+It costs far less to look at than the frozen deck does — 1.3–5.6% of pixels move
+by a mean of 0.15–1.11/255, against the deck's 17.7% and 6.8. Nothing is
+*frozen* here that was moving; the only error is the `u8` texel and the bilinear
+filter. That filter is the one thing to watch: `ramp` is a hard step function, so
+every coastline is a colour discontinuity, and blending across one produces a
+shade that is not in the palette. At the width this bakes — about one texel per
+pixel — the filter is near identity and the difference stays on coastline pixels.
+Past the 1024-texel cap it will start to soften them, exactly where you are most
+zoomed in.
+
+#### The two families that advect
+
+That leaves the gas giants and the lava worlds, whose fields genuinely move.
+Neither needed to be frozen — they needed to be *decomposed*, and the split is
+different in each.
+
+`Base::Emissive` separates cleanly. Its 6-octave rock field `n` is static and
+bakes; the 3-octave `flow` that lights it advects in three dimensions — the
+field *evolving*, not moving — so it stays live at full rate. Six of nine
+octaves go and the glow still flows: **1.39–1.50×**, with nothing lost.
+
+`Base::Banded` is a coordinate change rather than an overlay. Its drift,
+`angle · 0.16 · sin(lat · bands / 2)`, is added to the sample's **x**, which
+slides the field through the sphere and so cannot be a lookup offset. Re-express
+the same rate as a rotation in *longitude* and the sample stays on the sphere:
+animating the bands becomes one subtraction from the texture coordinate. The
+bake is exact under that model, because `band` is a function of the warp and of
+`y`, and a longitude shift leaves `y` alone. Two planes, since the band and
+fine-detail fields drift at different rates (1.0 and 1.4). **1.86–2.03×**.
+
+`F_BAKED_BANDS` is its own switch because it changes what the motion *is*: the
+bands counter-rotate instead of shearing past each other. Measured, the two
+models differ by about as much as one frame of the animation differs from the
+next — 8.9% of pixels at mean 1.07/255 between models, against 9.1% between
+consecutive frames of the old one — and the new model animates at the same rate
+(9.0% frame to frame). So it reads as the same planet a moment later, not as a
+different planet. Whether it is *better* is a look question; the code comment
+has always described the intent as "adjacent latitude bands drift in opposite
+directions", which is what the rotation model actually does.
+
+Every type in the table is now covered by one of the three switches, and each
+works on its own:
+
+| switch | types |
+|---|---|
+| `F_BAKED_CLOUDS` | 12 — every world with a deck, plus the two shrouded ones |
+| `F_BAKED_SURFACE` | 20 — Terrestrial, Cratered, Emissive |
+| `F_BAKED_BANDS` | 4 — the gas giants |
+
+#### Putting the billowing back
+
+Freezing the deck cost two things: the storm swirl and the billowing morph. The
+morph is the one that mattered — it is what made weather form and dissipate
+rather than slide — and it is also the one nothing so far could express, because
+it translates the noise domain in y *and* z. That is the field evolving, not
+moving, and no lookup offset represents it.
+
+But a *stack* of maps does. `F_MORPH_LUT` bakes the deck at six points across
+the morph cycle and interpolates between the two that bracket the current value.
+The table is indexed by the morph value rather than by time, since it oscillates
+rather than advancing, so the lookup walks back and forth across six planes
+instead of running off the end of an ever-growing one.
+
+Adjacent phases are well correlated at the coarse octaves and independent at the
+fine ones, which is exactly what makes the interpolation read as a dissolve —
+cloud forming and dissipating — instead of a slide. Measured against the live
+deck, over a full spin:
+
+| | mean delta from live |
+|---|---:|
+| frozen | 7.56/255 |
+| **+ morph LUT** | **2.98/255** |
+
+**It recovers 61% of what freezing gave up, for 4% of the frame** (`terran`
+2.24× → 2.16×). The cost is memory and bake time, both 6×: at full width the
+deck is 6 MB for one planet, and the first frame at a new zoom pays six bakes
+instead of one.
+
+The storm swirl stays frozen. It runs on its own cycle, independent of the
+morph, so restoring it too would need the product of the two axes rather than
+the sum — 36 planes, not 12.
+
+Because they change the picture rather than the pixel budget, none of these
+switches is in `F_ALL` — which is `F_CLOUD_SHADOW | F_ATMO | F_RIM |
+F_STARFIELD | F_CHEAP_WARP` and nothing else. That is what keeps `out/`
+byte-identical while the web demos run with the lot.
+
+Measured against the shipped renderer (which already sizes octaves to the pixel
+grid and clips tiles to the viewport), a 160px tile in wasm:
+
+| type | shipped | + every switch | |
+|---|---:|---:|---:|
+| `barren` | 200 fps | **459 fps** | 2.30× |
+| `ocean` | 103 fps | **231 fps** | 2.26× |
+| `gas_giant` | 112 fps | **220 fps** | 1.97× |
+| `terran` | 101 fps | **210 fps** | 2.08× |
+| `toxic` | 154 fps | **310 fps** | 2.01× |
+| `lava` | 214 fps | **282 fps** | 1.32× | The native generators keep the live shader and `out/` is byte-identical; the
+three web demos turn all three on at construction, behind one `Frozen weather`
+checkbox each, alongside night-side thinning. The planet lab exposes them
+separately (`Night-side thinning`, `Frozen cloud deck`, `Baked surface`,
+`Baked bands`, `billow (morph LUT)`) so each can be A/B'd on its own — the last
+is nested under the deck, which it needs.
+
 
 ## Adding a planet type
 

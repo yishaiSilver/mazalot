@@ -243,6 +243,17 @@ pub struct System {
     // Eccentricity multiplier (scales every planet's generated `e`; 0 = force
     // perfect circles, 1 = as generated, higher = exaggerate the ellipses).
     pub ecc: f32,
+    // Freeze each planet's weather into a baked map instead of evaluating it per
+    // pixel per frame — ~2x on a cloudy world, ~2.6x on a shrouded one, at the
+    // cost of the deck's billowing and its churning storm cells. The deck still
+    // rotates over the surface. See `planet_core::F_BAKED_CLOUDS`.
+    //
+    // OFF by default, and deliberately: this is the one switch here that changes
+    // the picture rather than the pixel budget, so the native generators keep the
+    // animated deck and `out/` stays byte-identical. The web demo turns it on at
+    // construction — it runs continuously and is shader-bound, which is the case
+    // the trade was made for.
+    pub frozen_clouds: bool,
     // Cached backdrop (background + orbit paths) + the key it was rendered for,
     // reused by `render_system_cached` while the camera/view is unchanged.
     bg_cache: Vec<u8>,
@@ -355,7 +366,7 @@ impl System {
             seed, sun_kind, sun_radius, planets,
             spacing: 1.0, planet_size: 1.0, sun_size: 1.0, planet_pixel: 1.0, sun_pixel: 1.0,
             planet_detail: 160.0, sun_detail: 110.0, star_density: 0.5, star_parallax: 1.0,
-            orbit_width: 1.0, ecc: 1.0,
+            orbit_width: 1.0, ecc: 1.0, frozen_clouds: false,
             bg_cache: Vec::new(), bg_key: None,
             neb: RefCell::new(BackdropCache::default()),
             sun_tile: RefCell::new(SunCache::default()),
@@ -401,6 +412,14 @@ impl System {
     /// planet's generated eccentricity, higher exaggerates the ellipses.
     pub fn set_eccentricity(&mut self, scale: f32) {
         self.ecc = scale.clamp(0.0, 2.5);
+    }
+
+    /// Freeze the weather. `true` bakes each planet's cloud deck once and reads
+    /// it back per pixel; `false` (the default) evaluates it live, which is what
+    /// the native generators do and the picture to A/B against. The web demo
+    /// switches it on at construction.
+    pub fn set_frozen_clouds(&mut self, on: bool) {
+        self.frozen_clouds = on;
     }
 
     /// The outermost extent (world units) with the current view multipliers —
@@ -636,6 +655,14 @@ pub fn render_system_cached(sys: &mut System, w: u32, h: u32, cam: &Camera, bgx:
     draw_bodies(sys, w, h, cam, t_orbit, t_spin, t_sun, out);
 }
 
+/// World position of planet `i` at time `t` — the same query `planet_pos` makes
+/// over the C ABI, for callers on the Rust side (benchmarks, the native bins).
+pub fn planet_pos_of(sys: &System, i: usize, t: f32) -> (f32, f32) {
+    let p = &sys.planets[i];
+    let (x, y, _) = p.at(t, sys.spacing, sys.ecc);
+    (x, y)
+}
+
 /// Paint the backdrop: starfield + nebula, then the dashed orbit paths. Depends
 /// only on the camera + view params, never on animation time.
 fn draw_bg_orbits(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: f32, out: &mut [u8]) {
@@ -738,8 +765,20 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
             if clip[2] == clip[0] {
                 continue;
             }
+            // Freezing the weather is a per-scene switch, so the mask is built
+            // here rather than baked into `render_tile`'s default.
+            let feat = planet_core::F_ALL
+                | if sys.frozen_clouds {
+                    planet_core::F_NIGHT_LOD
+                        | planet_core::F_BAKED_CLOUDS
+                        | planet_core::F_BAKED_SURFACE
+                        | planet_core::F_BAKED_BANDS
+                        | planet_core::F_MORPH_LUT
+                } else {
+                    0
+                };
             let mut tile = sys.body_tile.borrow_mut();
-            planet_core::render_tile_into(&mut tile, p.ptype, p.seed, spin_a, light, rad_render, clip);
+            planet_core::render_tile_into(&mut tile, p.ptype, p.seed, spin_a, light, rad_render, clip, feat);
             blit(out, w, h, &tile, sx, sy, scale);
         }
     }
