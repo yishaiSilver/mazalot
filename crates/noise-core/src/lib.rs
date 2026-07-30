@@ -14,6 +14,12 @@
 mod lanes;
 use lanes::{F32x4, U32x4};
 
+/// The GLSL ES 3.00 transliteration of everything below, plus the `#version`
+/// line and the precision qualifiers. Every fragment shader in the workspace is
+/// this concatenated with `dither_core::GL_PRELUDE` and its own body, so the
+/// lattice kernels have one definition per language rather than one per shader.
+pub const GL_PRELUDE: &str = include_str!("noise.glsl");
+
 // ---------------------------------------------------------------------------
 // Noise: 3D value-noise fBm + 3D Worley (cellular) for craters.
 // ---------------------------------------------------------------------------

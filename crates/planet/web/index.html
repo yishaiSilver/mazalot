@@ -57,6 +57,8 @@
   .crt.on { opacity: 1; }
   .chk { justify-content: flex-start !important; gap: 8px; cursor: pointer; color: #cfd4e6 !important; }
   .chk input { accent-color: #8fb7ff; }
+  .note { font-size: 11px; line-height: 1.45; color: #6b7290; margin-top: 6px; }
+  .ctl.off, .feats label.off { opacity: .38; pointer-events: none; }
 
   /* Feature cost lab */
   .lab { margin-top: 14px; }
@@ -102,7 +104,14 @@
       <div class="rowflex"><input type="number" id="seed" min="0" value="1" /><button class="mini" id="rndseed" title="random seed">🎲</button></div>
     </div>
     <div class="ctl"><label>Resolution <b id="resV">64</b></label><input type="range" id="res" min="40" max="240" step="8" value="64" /></div>
-    <div class="ctl"><label>Render workers <b id="poolV">—</b></label><input type="range" id="pool" min="0" max="16" step="1" value="8" /></div>
+    <div class="ctl"><label>Renderer</label>
+      <select id="renderer">
+        <option value="wasm">WebAssembly (CPU)</option>
+        <option value="gl">WebGL2 (GPU)</option>
+      </select>
+      <div class="note" id="glnote"></div>
+    </div>
+    <div class="ctl" id="poolctl"><label>Render workers <b id="poolV">—</b></label><input type="range" id="pool" min="0" max="16" step="1" value="8" /></div>
     <div class="ctl"><label>Spin speed <b id="spnV">0.012</b></label><input type="range" id="spn" min="0" max="0.05" step="0.002" value="0.012" /></div>
 
     <div class="grp">Look</div>
@@ -185,10 +194,13 @@ const FEATURES = [
   { key: "dither",   label: "Ordered dither",     style: "dither" },
   { key: "night",    label: "Night-side thinning", add: 16, opt: true },
   { key: "warp",     label: "Cheap warp inner",    bit: 32, opt: true },
-  { key: "frozen",   label: "Frozen cloud deck",   add: 64, opt: true },
-  { key: "baksurf",  label: "Baked surface",       add: 128, opt: true },
-  { key: "bakband",  label: "Baked bands",         add: 256, opt: true },
-  { key: "morphlut", label: "└ billow (morph LUT)",  add: 512 },
+  // `cpu` marks the sphere-map bakes, which exist to make the CPU afford the
+  // weather. The GL path evaluates the fBm live, so it neither reads these bits
+  // nor wants the ~7.5 MB of maps they build — the checkboxes grey out there.
+  { key: "frozen",   label: "Frozen cloud deck",   add: 64, opt: true, cpu: true },
+  { key: "baksurf",  label: "Baked surface",       add: 128, opt: true, cpu: true },
+  { key: "bakband",  label: "Baked bands",         add: 256, opt: true, cpu: true },
+  { key: "morphlut", label: "└ billow (morph LUT)",  add: 512, cpu: true },
 ];
 const on = new Set(FEATURES.map(f => f.key));   // everything on to begin with
 let FEAT_ALL = 63;
@@ -319,6 +331,124 @@ async function renderPooled(a) {
   }
   for (const r of await Promise.all(jobs)) imgData.data.set(r.bytes, r.y0 * NATIVE * 4);
 }
+// --- WebGL2 renderer --------------------------------------------------------
+// The same shader, on the GPU. `planet-core` hands over the whole per-frame
+// setup — the type row, the seeded offsets, the moons, the `Lod` octave budget —
+// as one float array, so the type table is transported rather than duplicated;
+// only the shading is re-written, in `crates/planet-core/src/shader.glsl`, which
+// travels inside the wasm module so it cannot go stale against it.
+//
+// It runs the LIVE shader: no F_BAKED_*. Those bakes buy ~2x on a CPU at the
+// cost of frozen weather and, in a worker pool, a copy of the sphere maps per
+// instance. A GPU would rather just evaluate the noise — `hash3` and
+// `value_noise` are u32 integer math, so they port exactly.
+const VERT_SRC = `#version 300 es
+void main() {
+  // One oversized triangle — no buffers, no VAO state, three vertices.
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const glc = document.createElement("canvas");
+let gl = null, glProg = null, glLoc = null, glU = null, glUPtr = 0, glULen = 0;
+let gpu = null;                      // adapter description, once a context exists
+let renderer = "wasm";
+
+function compile(type, src, what) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    throw new Error(`${what} failed to compile:\n${gl.getShaderInfoLog(s)}`);
+  }
+  return s;
+}
+
+// Returns null (with the reason on `glnote`) when WebGL2 is unavailable, which
+// is a normal outcome — the demo stays on the wasm path.
+/// What the WebGL2 context is actually running on.
+///
+/// `gl.RENDERER` is masked to something generic ("WebKit WebGL") by every modern
+/// browser, so the real name needs `WEBGL_debug_renderer_info` — which Firefox
+/// withholds under `privacy.resistFingerprinting` and some Safari versions do
+/// not ship. Hence the fallback chain and the "hidden" wording rather than a
+/// promise.
+///
+/// The `soft` flag is the fact worth surfacing: SwiftShader, llvmpipe and
+/// friends are CPU rasterizers, so a browser that has quietly fallen back to one
+/// is running this path with none of its advantages, and a slow frame there says
+/// nothing about the shaders.
+function describeGPU(gl) {
+  const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+  const get = p => { try { return gl.getParameter(p); } catch { return null; } };
+  const name = (dbg && get(dbg.UNMASKED_RENDERER_WEBGL)) || get(gl.RENDERER) || "unknown";
+  const vendor = (dbg && get(dbg.UNMASKED_VENDOR_WEBGL)) || get(gl.VENDOR) || "";
+  return {
+    name: String(name),
+    vendor: String(vendor),
+    soft: /swiftshader|llvmpipe|softpipe|software|basic render|microsoft basic/i.test(`${name} ${vendor}`),
+    masked: !dbg,
+  };
+}
+
+function glInit() {
+  if (gl) return gl;
+  // `preserveDrawingBuffer` so the stage can `drawImage` this canvas after the
+  // draw returns; `desynchronized` because nothing reads back mid-frame.
+  gl = glc.getContext("webgl2", {
+    alpha: false, antialias: false, depth: false, stencil: false,
+    premultipliedAlpha: false, preserveDrawingBuffer: true, desynchronized: true,
+  });
+  if (!gl) { gl = null; return null; }
+  // A complete fragment shader is the two preludes (noise, then dither) from
+  // `noise-core`/`dither-core`, followed by the planet body.
+  const srcOf = i => new TextDecoder().decode(
+    new Uint8Array(wasm.memory.buffer, wasm.gl_src_ptr(i), wasm.gl_src_len(i)));
+  let src = "";
+  for (let i = 0; i < wasm.gl_src_count(); i++) src += srcOf(i);
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT_SRC, "vertex shader"));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, src, "planet shader"));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    throw new Error(`link failed:\n${gl.getProgramInfoLog(prog)}`);
+  }
+  glProg = prog;
+  glLoc = {
+    U: gl.getUniformLocation(prog, "U"),
+    seed: gl.getUniformLocation(prog, "u_seed"),
+    feat: gl.getUniformLocation(prog, "u_feat"),
+    size: gl.getUniformLocation(prog, "u_size"),
+    vh: gl.getUniformLocation(prog, "u_vh"),
+    palette: gl.getUniformLocation(prog, "u_palette"),
+  };
+  gpu = describeGPU(gl);
+  glULen = wasm.gl_uniforms_len();
+  glUPtr = wasm.alloc(glULen * 4);
+  glU = new Float32Array(glULen);
+  return gl;
+}
+
+/// One GPU frame. `finish()` before returning, so the caller's clock measures
+/// the draw rather than the time it took to queue it.
+function renderGL(a, ang) {
+  if (glc.width !== NATIVE) { glc.width = glc.height = NATIVE; }
+  wasm.gl_uniforms(glUPtr, NATIVE, typeIdx, seed, ang, paramsPtr,
+                   a.palette, a.dither, a.moons, a.feat);
+  // Re-read the view each time: an `alloc` that grew the wasm heap detaches it.
+  glU.set(new Float32Array(wasm.memory.buffer, glUPtr, glULen));
+  gl.viewport(0, 0, NATIVE, NATIVE);
+  gl.useProgram(glProg);
+  gl.uniform1fv(glLoc.U, glU);
+  gl.uniform1ui(glLoc.seed, seed >>> 0);
+  gl.uniform1ui(glLoc.feat, a.feat >>> 0);
+  gl.uniform1i(glLoc.size, NATIVE);
+  gl.uniform1i(glLoc.vh, NATIVE);          // hero framing: viewport == tile
+  gl.uniform1i(glLoc.palette, a.palette);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.finish();
+}
+
 let NATIVE = 64, typeIdx = 0, seed = 1, angle = 0, spin = 0.012;
 const sliders = {}; // pi -> { input, val }
 
@@ -399,7 +529,9 @@ async function frame() {
   const t0 = performance.now();
   let painted = true;
   try {
-    if (pool.size > 0) {
+    if (renderer === "gl") {
+      renderGL(a, angle);
+    } else if (pool.size > 0) {
       await renderPooled(a);
     } else {
       wasm.render_features(bufPtr, NATIVE, typeIdx, seed, angle, paramsPtr, a.palette, a.dither, a.moons, a.feat);
@@ -419,9 +551,11 @@ async function frame() {
   }
   if (!painted) return;
   emaMs += (performance.now() - t0 - emaMs) * 0.08;
-  octx.putImageData(imgData, 0, 0);
+  // Both paths end with the same upscale onto the stage, so the timer above is
+  // the shading and nothing else.
+  if (renderer !== "gl") octx.putImageData(imgData, 0, 0);
   sctx.clearRect(0, 0, stage.width, stage.height);
-  sctx.drawImage(off, 0, 0, stage.width, stage.height);
+  sctx.drawImage(renderer === "gl" ? glc : off, 0, 0, stage.width, stage.height);
   $("labMs").textContent = emaMs.toFixed(3);
   $("labFps").textContent = emaMs > 0 ? (1000 / emaMs).toFixed(0) : "–";
 }
@@ -443,7 +577,29 @@ function buildFeats() {
     lab.title = f.opt ? "an optimization — unticking it makes the frame slower"
                       : "a feature — unticking it makes the frame cheaper";
     host.appendChild(lab);
+    f.el = lab;
   }
+}
+
+// Grey out what the selected renderer does not have: the sphere-map bakes are a
+// CPU optimization, and the worker pool splits a CPU frame into bands.
+function syncRendererUI() {
+  const isGL = renderer === "gl";
+  for (const f of FEATURES) if (f.cpu) f.el.classList.toggle("off", isGL);
+  $("poolctl").classList.toggle("off", isGL);
+  if (!isGL) { $("glnote").textContent = ""; return; }
+  const live = "Live shader on the GPU — no sphere-map bakes, so the weather is unfrozen and nothing is cached per worker.";
+  // The adapter name comes from a graphics driver, so it never reaches innerHTML
+  // unescaped. A software rasterizer is the one fact worth shouting about: the
+  // page is drawing on the CPU after all, and a slow frame says nothing about
+  // the shaders.
+  const esc = t => String(t).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const label = gpu.masked ? `${gpu.name} (name hidden)` : gpu.name;
+  $("glnote").innerHTML = gpu.soft
+    ? `<span style="color:#f4b74a">⚠ software rasterizer — ${esc(gpu.name)}.</span> ` +
+      `This browser has no GPU acceleration, so these timings measure the CPU.`
+    : `${esc(live)}<br><span style="color:#8790ad">GPU ${esc(label)}</span>`;
+  $("glnote").title = `${gpu.vendor} — ${gpu.name}`;
 }
 
 // Time one configuration: warm up, then take the best of a few runs, which is
@@ -451,13 +607,16 @@ function buildFeats() {
 // mid-measurement.
 function timeConfig(set, iters) {
   const a = applyFeatures(set);
-  for (let i = 0; i < 8; i++)
-    wasm.render_features(bufPtr, NATIVE, typeIdx, seed, i * 0.1, paramsPtr, a.palette, a.dither, a.moons, a.feat);
+  // Whichever renderer is selected — otherwise switching to WebGL2 would leave
+  // the cost table quietly measuring the CPU.
+  const one = ang => renderer === "gl"
+    ? renderGL(a, ang)
+    : wasm.render_features(bufPtr, NATIVE, typeIdx, seed, ang, paramsPtr, a.palette, a.dither, a.moons, a.feat);
+  for (let i = 0; i < 8; i++) one(i * 0.1);
   let best = Infinity;
   for (let r = 0; r < 3; r++) {
     const t0 = performance.now();
-    for (let i = 0; i < iters; i++)
-      wasm.render_features(bufPtr, NATIVE, typeIdx, seed, i * 0.013, paramsPtr, a.palette, a.dither, a.moons, a.feat);
+    for (let i = 0; i < iters; i++) one(i * 0.013);
     best = Math.min(best, (performance.now() - t0) / iters);
   }
   return best;
@@ -472,9 +631,12 @@ async function measure() {
   const all = new Set(FEATURES.map(f => f.key));
   const full = timeConfig(all, iters);
   const rows = [];
-  for (let i = 0; i < FEATURES.length; i++) {
-    const f = FEATURES[i];
-    btn.textContent = `measuring… ${i + 1}/${FEATURES.length}`;
+  // Under WebGL2 the sphere-map bakes are not in the shader at all, so pricing
+  // them would print a column of zeroes and imply they were free.
+  const list = FEATURES.filter(f => !(renderer === "gl" && f.cpu));
+  for (let i = 0; i < list.length; i++) {
+    const f = list[i];
+    btn.textContent = `measuring… ${i + 1}/${list.length}`;
     await new Promise(r => requestAnimationFrame(r));
     const without = new Set(all); without.delete(f.key);
     // A feature's cost is what vanishes when it goes. An optimization's value is
@@ -545,6 +707,24 @@ async function main() {
   });
   await queueResize(poolWant);
   $("poolV").textContent = poolLabel();
+
+  // WebGL2 is opt-in: probe it on selection rather than at load, so a machine
+  // without it never pays for a failed context.
+  $("renderer").addEventListener("change", () => {
+    const want = $("renderer").value;
+    if (want === "gl") {
+      try {
+        if (!glInit()) throw new Error("this browser has no WebGL2 context");
+      } catch (e) {
+        $("renderer").value = "wasm";
+        $("glnote").textContent = String(e.message || e);
+        return;
+      }
+    }
+    renderer = want;
+    syncRendererUI();
+  });
+  syncRendererUI();
 
   requestAnimationFrame(tick);
 }

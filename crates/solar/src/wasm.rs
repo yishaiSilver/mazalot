@@ -204,3 +204,146 @@ pub extern "C" fn render_bodies_band(
     let cam = Camera { x: cam_x, y: cam_y, zoom };
     crate::render_bodies_band(sys, w, h, &cam, t_orbit, t_spin, t_sun, y0, y1, out);
 }
+
+// --- WebGL2 path -----------------------------------------------------------
+//
+// The GPU draws the scene in three passes — one fullscreen backdrop, the orbit
+// dots as points, then one quad per body — so what crosses the ABI is a draw
+// list, not pixels. `gl_src_*` hands over the GLSL that goes with it, inside the
+// module rather than as sibling files, so a shader cannot go stale against the
+// wasm it was built with and the single-file artifact keeps working.
+
+/// The GLSL sources, addressed by [`gl_src_ptr`]. A complete fragment shader is
+/// the two preludes followed by one body, so the JS concatenates
+/// `[0, 1, k]` for `k` in `2..=4`.
+const GL_SRC: &[&str] = &[
+    noise_core::GL_PRELUDE,          // 0 — #version, precision, the noise kernels
+    dither_core::GL_PRELUDE,         // 1 — Bayer + quantization
+    background_core::GL_SHADER,      // 2 — the backdrop
+    sun_core::GL_SHADER,             // 3 — the star
+    planet_core::GL_SHADER,          // 4 — a planet, in its tile framing
+];
+
+/// Number of entries [`gl_src_ptr`] addresses.
+#[no_mangle]
+pub extern "C" fn gl_src_count() -> u32 {
+    GL_SRC.len() as u32
+}
+
+/// Pointer to GLSL source `i` in wasm memory, with [`gl_src_len`] bytes of UTF-8
+/// after it. Out of range yields the empty string.
+#[no_mangle]
+pub extern "C" fn gl_src_ptr(i: u32) -> *const u8 {
+    GL_SRC.get(i as usize).map_or(core::ptr::null(), |s| s.as_ptr())
+}
+
+/// Length of GLSL source `i` in bytes.
+#[no_mangle]
+pub extern "C" fn gl_src_len(i: u32) -> u32 {
+    GL_SRC.get(i as usize).map_or(0, |s| s.len() as u32)
+}
+
+/// Floats per body record in the [`gl_bodies`] draw list.
+#[no_mangle]
+pub extern "C" fn gl_body_stride() -> u32 {
+    crate::GL_BODY_STRIDE as u32
+}
+
+/// Floats of header in front of each body record's uniform block.
+#[no_mangle]
+pub extern "C" fn gl_body_header() -> u32 {
+    crate::GL_BODY_HEADER as u32
+}
+
+/// Most bodies a draw list can hold — how big the caller's record buffer must be,
+/// in units of [`gl_body_stride`].
+#[no_mangle]
+pub extern "C" fn gl_max_bodies() -> u32 {
+    crate::GL_MAX_BODIES as u32
+}
+
+/// Number of floats [`gl_backdrop`] writes.
+#[no_mangle]
+pub extern "C" fn gl_backdrop_len() -> u32 {
+    background_core::GL_UNIFORMS_LEN as u32
+}
+
+/// Fill `out` with the backdrop shader's uniforms — ground and nebula. The stars
+/// are a separate pass; see [`gl_star_points`].
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gl_backdrop(
+    sys: *const System, out: *mut f32,
+    cam_x: f32, cam_y: f32, zoom: f32, bgx: f32, bgy: f32,
+) {
+    let sys = unsafe { &*sys };
+    let dst = unsafe { slice::from_raw_parts_mut(out, background_core::GL_UNIFORMS_LEN) };
+    crate::gl_backdrop(sys, &Camera { x: cam_x, y: cam_y, zoom }, bgx, bgy, dst)
+}
+
+/// Floats per point sprite, shared by the orbit dots and the stars:
+/// `(x, y, r, g, b)`, the colour already scaled so an additive blend adds
+/// exactly what the CPU adds.
+#[no_mangle]
+pub extern "C" fn gl_point_stride() -> u32 {
+    background_core::GL_POINT_STRIDE as u32
+}
+
+/// Write the dashed orbit paths as point sprites into `out` (`cap` points of
+/// capacity); returns how many were written.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gl_orbit_points(
+    sys: *const System, out: *mut f32, cap: u32,
+    w: u32, h: u32, cam_x: f32, cam_y: f32, zoom: f32,
+) -> u32 {
+    let sys = unsafe { &*sys };
+    let dst = unsafe { slice::from_raw_parts_mut(out, cap as usize * background_core::GL_POINT_STRIDE) };
+    crate::gl_orbit_points(sys, w, h, &Camera { x: cam_x, y: cam_y, zoom }, dst) as u32
+}
+
+/// Write the visible stars as point sprites into `out` (`cap` points of
+/// capacity); returns how many were written. Same layout as the orbit dots, so
+/// one vertex buffer serves both.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gl_star_points(
+    sys: *const System, out: *mut f32, cap: u32,
+    w: u32, h: u32, cam_x: f32, cam_y: f32, zoom: f32, bgx: f32, bgy: f32,
+) -> u32 {
+    let sys = unsafe { &*sys };
+    let dst = unsafe { slice::from_raw_parts_mut(out, cap as usize * background_core::GL_POINT_STRIDE) };
+    crate::gl_star_points(sys, w, h, &Camera { x: cam_x, y: cam_y, zoom }, bgx, bgy, dst) as u32
+}
+
+/// Write the back-to-front body draw list into `out`
+/// (`gl_max_bodies() * gl_body_stride()` floats of capacity); returns the count.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn gl_bodies(
+    sys: *const System, out: *mut f32,
+    w: u32, h: u32, cam_x: f32, cam_y: f32, zoom: f32,
+    t_orbit: f32, t_spin: f32, t_sun: f32,
+) -> u32 {
+    let sys = unsafe { &*sys };
+    let dst = unsafe { slice::from_raw_parts_mut(out, crate::GL_MAX_BODIES * crate::GL_BODY_STRIDE) };
+    let cam = Camera { x: cam_x, y: cam_y, zoom };
+    crate::gl_bodies(sys, w, h, &cam, t_orbit, t_spin, t_sun, dst) as u32
+}
+
+/// The dashed orbit-path dot size in px, so the GPU point sprite matches the
+/// square stamp `paint_orbit` writes.
+#[no_mangle]
+pub extern "C" fn gl_orbit_width(sys: *const System) -> f32 {
+    let sys = unsafe { &*sys };
+    // `paint_orbit` stamps a square of half-extent `round((width - 1) / 2)`.
+    (((sys.orbit_width - 1.0) * 0.5).round()) * 2.0 + 1.0
+}
+
+/// The feature mask the GPU path renders with — `F_ALL`, i.e. the live shader.
+/// The `F_BAKED_*` bits buy CPU time at the cost of frozen weather, and the GPU
+/// evaluates the noise directly, so it has nothing to switch on.
+#[no_mangle]
+pub extern "C" fn gl_feat() -> u32 {
+    planet_core::F_ALL
+}

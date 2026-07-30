@@ -19,6 +19,15 @@
        "pixel size" slider reads as chunky pixel-art. */
     image-rendering: pixelated; image-rendering: crisp-edges; }
   #stage.drag { cursor: grabbing; }
+  /* The WebGL2 canvas is displayed directly, stacked over the 2D one. Copying it
+     across with drawImage would be a full-frame GPU->CPU->GPU round trip every
+     frame — the very plumbing the GPU path exists to delete, and it pinned the
+     demo to a fraction of its rate. `pointer-events: none` lets every drag,
+     pinch and tap keep landing on #stage underneath, so the interaction code
+     needs no idea which renderer is running. */
+  #glstage { position: fixed; inset: 0; width: 100%; height: 100%; display: none;
+    pointer-events: none; z-index: 1;
+    image-rendering: pixelated; image-rendering: crisp-edges; }
 
   .hud { position: fixed; pointer-events: none; z-index: 5;
     text-shadow: 0 1px 3px rgba(0,0,0,.9); }
@@ -34,13 +43,22 @@
   .hint b { color: #aeb4cd; font-weight: 600; }
 
   /* Perf readout — live frame/CPU signal. Click (or press P) to cycle detail. */
-  .perf { position: fixed; top: 64px; right: 20px; z-index: 6; pointer-events: auto;
+  /* Above the dock (z-index 6): the readout is a few narrow lines and the dock
+     is tall enough to reach up under them. Click it, or press P, to collapse. */
+  .perf { position: fixed; top: 64px; right: 20px; z-index: 7; pointer-events: auto;
     font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     color: #9aa0bb; background: rgba(14,15,24,.74); border: 1px solid rgba(255,255,255,.07);
     border-radius: 9px; padding: 6px 9px; backdrop-filter: blur(6px); cursor: pointer;
-    min-width: 140px; text-shadow: none; }
+    min-width: 140px; max-width: min(300px, 40vw); text-shadow: none; }
+  /* A driver's adapter string can be 80 characters of parenthesised detail, and
+     an unwrapped one drags the whole panel across the viewport. Clip it to one
+     line — the full text is on the element's `title`. */
+  .perf .clip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .perf b { color: #eef1f8; font-weight: 600; font-variant-numeric: tabular-nums; }
   .perf .lbl { color: #6b7290; }
+  /* A software rasterizer means the page is drawing on the CPU after all, which
+     is the one GPU fact worth shouting about. */
+  .perf .warn { color: #f4b74a; }
   .perf .bar { height: 4px; border-radius: 3px; margin-top: 6px; background: rgba(255,255,255,.10); overflow: hidden; }
   .perf .bar i { display: block; height: 100%; width: 0; background: #57d38c; transition: width .15s linear, background .3s; }
   .perf.min .detail { display: none; }
@@ -70,6 +88,7 @@
   .grp { font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: #565d78;
     margin: 15px 0 8px; border-top: 1px solid rgba(255,255,255,.07); padding-top: 11px; }
   .ctl { margin: 0 0 10px; }
+  .ctl.dim { opacity: .38; pointer-events: none; }
   .ctl label { display: flex; justify-content: space-between; font-size: 12px; color: #9aa0bb; margin-bottom: 4px; }
   .ctl label b { color: #eef1f8; font-variant-numeric: tabular-nums; font-weight: 600; }
   input[type=number] { width: 100%; box-sizing: border-box; padding: 8px 9px; font: inherit; font-size: 13px;
@@ -103,6 +122,7 @@
 </head>
 <body>
 <canvas id="stage"></canvas>
+<canvas id="glstage"></canvas>
 
 <div class="hud topleft">
   <h1>Procedural Solar System</h1>
@@ -120,10 +140,13 @@
   <div><b id="pfFps">–</b> fps <span class="lbl">·</span> <b id="pfRender">–</b> ms <span class="lbl">render</span></div>
   <div class="detail">
     <div class="lbl" id="pfFrame">frame – ms</div>
-    <div class="lbl" id="pfLoad">CPU – % of 60 fps</div>
+    <div class="lbl clip" id="pfLoad">CPU – % of 60 fps</div>
     <div class="lbl" id="pfRes">– × –</div>
     <div id="pfBg" class="lbl">bg –</div>
     <div id="pfAuto" class="lbl">detail –</div>
+    <div id="pfGpu" class="lbl clip"></div>
+    <div id="pfDraw" class="lbl clip"></div>
+    <div id="pfGpuMs" class="lbl clip"></div>
     <div class="bar"><i id="pfBar"></i></div>
   </div>
 </div>
@@ -159,8 +182,15 @@
     <div class="ctl"><label for="auto">Hold 60 fps automatically <b id="autoV">on</b></label>
       <input type="checkbox" id="auto" checked style="width:auto;accent-color:#f4b74a;cursor:pointer" /></div>
     <div class="ctl"><label>Sun detail cap <b id="sdetV">110</b></label><input type="range" id="sdet" min="16" max="176" step="8" value="110" /></div>
-    <div class="ctl"><label>Render workers <b id="poolV">—</b></label><input type="range" id="pool" min="0" max="16" step="1" value="0" /></div>
-    <div class="ctl"><label for="froz">Frozen weather <b id="frozV">on</b></label>
+    <div class="ctl" id="rendctl"><label>Renderer</label>
+      <select id="renderer" style="width:100%;box-sizing:border-box;padding:6px 8px;font:inherit;font-size:12px;color:#eef1f8;background:#0e0f18;border:1px solid rgba(255,255,255,.12);border-radius:6px">
+        <option value="wasm">WebAssembly (CPU)</option>
+        <option value="gl">WebGL2 (GPU)</option>
+      </select>
+      <div id="glnote" style="font-size:11px;line-height:1.45;color:#6b7290;margin-top:5px"></div>
+    </div>
+    <div class="ctl" id="poolctl"><label>Render workers <b id="poolV">—</b></label><input type="range" id="pool" min="0" max="16" step="1" value="0" /></div>
+    <div class="ctl" id="frozctl"><label for="froz">Frozen weather <b id="frozV">on</b></label>
       <input type="checkbox" id="froz" checked style="width:auto;accent-color:#f4b74a;cursor:pointer" /></div>
 
     <div class="grp">Background</div>
@@ -183,6 +213,9 @@ const PLANET_NAMES = ["desert","barren","moon","iron","obsidian","lava","molten 
 const SUN_NAMES = ["yellow dwarf","orange dwarf","red giant","white star","blue giant"];
 
 const $ = id => document.getElementById(id);
+// The adapter name comes from a graphics driver, so it goes through this before
+// it ever reaches innerHTML.
+const esc = t => String(t).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const canvas = $("stage");
 const ctx = canvas.getContext("2d", { alpha: false });
 ctx.imageSmoothingEnabled = false;
@@ -295,6 +328,337 @@ async function renderPooled(w, h, cam, zoomArg, bgPanX, bgPanY, tOrbit, tSpin, t
   }
   for (const r of await Promise.all(jobs)) imgData.data.set(new Uint8Array(r.rows), r.y0 * w * 4);
 }
+// --- WebGL2 scene renderer --------------------------------------------------
+// The same scene, drawn by the rasterizer instead of by a compositor. Three
+// passes: one fullscreen triangle for the backdrop, the dashed orbit paths as
+// point sprites, then one quad per body back-to-front with alpha blending —
+// which is painter's algorithm, i.e. exactly what `blit` was doing by hand.
+//
+// Rust still owns the scene. `gl_bodies` hands over a draw list whose every
+// number comes from the same expressions `draw_bodies_band` uses (`Planet::at`,
+// `to_screen`, `dest_rect`, the detail caps, the sunward light), and each record
+// carries that shader's uniform block; the GLSL travels inside solar.wasm. So
+// the archetype tables, the orbital mechanics and the octave budgets are
+// transported, not duplicated.
+//
+// What disappears here is everything the CPU path had to cache. No backdrop
+// sprite, no star-tile memo, no quantized boil clock, no `visible_tile_rect` —
+// and, crucially, no per-frame pixel plumbing: nothing is read back, so the
+// ~32 MB/frame of copies that the worker pool could never divide is simply gone.
+const VS_FULL = `#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+// A body's quad, straight from the destination rect the compositor computed.
+const VS_QUAD = `#version 300 es
+uniform vec4 u_rect;   // x0, y0, w, h in screen px, top-down
+uniform vec2 u_view;
+void main() {
+  vec2 c = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));
+  vec2 p = u_rect.xy + c * u_rect.zw;
+  gl_Position = vec4(p.x / u_view.x * 2.0 - 1.0, 1.0 - p.y / u_view.y * 2.0, 0.0, 1.0);
+}`;
+
+// One dot — an orbit sample or a background star. Both come up from Rust already
+// in screen px with their colour, so Kepler's equation stays in
+// `Planet::plane_point` and the star walk stays in `visit_stars`; neither is
+// restated here, and one buffer holds both.
+//
+// The stars are points rather than a fragment-shader gather on purpose: gathering
+// means every pixel testing nine cells per layer, which measured as HALF the GPU
+// frame against roughly one hash per fifty pixels here.
+const VS_POINT = `#version 300 es
+layout(location = 0) in vec2 a_pos;   // pinned: the VAO enables attributes 0 and 1
+layout(location = 1) in vec3 a_col;
+uniform vec2 u_view;
+uniform float u_size;
+out vec3 v_col;
+void main() {
+  v_col = a_col;
+  gl_PointSize = u_size;
+  gl_Position = vec4(a_pos.x / u_view.x * 2.0 - 1.0, 1.0 - a_pos.y / u_view.y * 2.0, 0.0, 1.0);
+}`;
+
+// Additive, matching `paint_orbit` and `paint_stars`. Both clamp in the Rust —
+// orbit dots at (90, 96, 120), stars at white — where a blend saturates at 1.0
+// instead. That differs only where dots overlap on an already-bright pixel, and
+// the navy ground is nowhere near either cap.
+const FS_POINT = `#version 300 es
+precision highp float;
+in vec3 v_col;
+out vec4 fragColor;
+void main() { fragColor = vec4(v_col, 1.0); }`;
+
+const glc = $("glstage");
+let gl = null, renderer = "wasm";
+let progBg, progStar, progPlanet, progOrbit, ptVBO, ptVAO;
+let glBgPtr, glPtPtr, glBodyPtr, bgLen, bodyStride, bodyHeader, maxBodies;
+let orbCap, starCap, ptStride, glFeat;
+let gpu = null;                      // adapter description, once a context exists
+let drawn = { bodies: 0, orbit: 0, stars: 0 };
+
+// --- GPU timing -------------------------------------------------------------
+// There is no WebGL API for GPU *utilization* or VRAM — browsers do not expose
+// either. What there is, where the browser allows it, is
+// `EXT_disjoint_timer_query_webgl2`: elapsed GPU nanoseconds around a set of
+// draws. That plus the vsync slot is a real utilization figure, and it is the
+// one number the CPU-side timer cannot give, because the draw calls return long
+// before the GPU has finished them.
+//
+// Chrome exposes it; Firefox removed it and Safari never shipped it, so treat
+// its absence as normal rather than an error.
+//
+// Results are read a few frames late, on purpose: asking for one the frame it
+// was issued stalls the CPU until the GPU drains, which is the very thing this
+// path exists to avoid. A ring of query objects keeps that pipelined.
+let tqExt = null, tqFree = [], tqBusy = [], emaGpu = 0, gpuSeen = false;
+let tqDrops = 0, tqPolls = 0;
+const TQ_MAX = 4;
+
+/// Is the GPU timer telling the truth?
+///
+/// A frame cannot spend more GPU time than the wall clock between frames, give
+/// or take a little pipelining — so a reading far past the observed interval is
+/// the driver's timer misbehaving, not a slow GPU. SwiftShader here reports
+/// ~750 ms against 50 ms frames, which is how this check came to exist.
+///
+/// It matters for more than the display: auto-detail paces off this number, and
+/// an inflated one would slam the detail cap to the floor and stay there.
+function gpuTimeTrustworthy() {
+  if (!gpuSeen) return false;
+  const iv = 1000 / Math.max(emaFps, 1);
+  return emaGpu <= iv * 1.5 + 2.0;
+}
+
+function tqBegin() {
+  if (!tqExt || tqBusy.length >= TQ_MAX) return null;
+  const q = tqFree.pop() || gl.createQuery();
+  gl.beginQuery(tqExt.TIME_ELAPSED_EXT, q);
+  return q;
+}
+
+function tqEnd(q) {
+  if (!q) return;
+  gl.endQuery(tqExt.TIME_ELAPSED_EXT);
+  tqBusy.push(q);
+}
+
+function tqPoll() {
+  if (!tqExt || !tqBusy.length) return;
+  const q = tqBusy[0];
+  if (!gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE)) return;
+  tqBusy.shift();
+  tqPolls++;
+  // A "disjoint" means the GPU was interrupted mid-query — a clock change, a
+  // context switch, a mode set. The elapsed time is then meaningless, so drop
+  // it rather than average garbage in. A driver that reports disjoint on EVERY
+  // query (some software rasterizers do) never yields a number, so the count is
+  // kept and the HUD says so rather than showing "waiting" for ever.
+  if (gl.getParameter(tqExt.GPU_DISJOINT_EXT)) {
+    tqDrops++;
+  } else {
+    const ms = gl.getQueryParameter(q, gl.QUERY_RESULT) / 1e6;
+    emaGpu = gpuSeen ? emaGpu + (ms - emaGpu) * 0.1 : ms;
+    gpuSeen = true;
+  }
+  tqFree.push(q);
+}
+
+function glCompile(type, src, what) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    throw new Error(`${what}: ${gl.getShaderInfoLog(sh)}`);
+  }
+  return sh;
+}
+
+function glLink(vs, fs, what, unis) {
+  const p = gl.createProgram();
+  gl.attachShader(p, glCompile(gl.VERTEX_SHADER, vs, `${what} vertex`));
+  gl.attachShader(p, glCompile(gl.FRAGMENT_SHADER, fs, `${what} fragment`));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(`${what} link: ${gl.getProgramInfoLog(p)}`);
+  p.loc = {};
+  for (const u of unis) p.loc[u] = gl.getUniformLocation(p, u);
+  return p;
+}
+
+/// Read GLSL source `i` out of wasm memory. A complete fragment shader is the
+/// two preludes (noise + dither, index 0 and 1) followed by one body.
+function glSrc(i) {
+  return new TextDecoder().decode(
+    new Uint8Array(wasm.memory.buffer, wasm.gl_src_ptr(i), wasm.gl_src_len(i)));
+}
+
+/// What the WebGL2 context is actually running on.
+///
+/// `gl.RENDERER` is masked to something generic ("WebKit WebGL") by every modern
+/// browser, so the real name needs `WEBGL_debug_renderer_info` — which Firefox
+/// withholds under `privacy.resistFingerprinting` and some Safari versions do
+/// not ship. Hence the fallback chain and the "hidden" wording rather than a
+/// promise.
+///
+/// The `soft` flag is the fact worth surfacing: SwiftShader, llvmpipe and
+/// friends are CPU rasterizers, so a browser that has quietly fallen back to one
+/// is running this path with none of its advantages, and a slow frame there says
+/// nothing about the shaders.
+function describeGPU(gl) {
+  const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+  const get = p => { try { return gl.getParameter(p); } catch { return null; } };
+  const name = (dbg && get(dbg.UNMASKED_RENDERER_WEBGL)) || get(gl.RENDERER) || "unknown";
+  const vendor = (dbg && get(dbg.UNMASKED_VENDOR_WEBGL)) || get(gl.VENDOR) || "";
+  return {
+    name: String(name),
+    vendor: String(vendor),
+    soft: /swiftshader|llvmpipe|softpipe|software|basic render|microsoft basic/i.test(`${name} ${vendor}`),
+    masked: !dbg,
+  };
+}
+
+function glInit() {
+  if (gl) return gl;
+  gl = glc.getContext("webgl2", {
+    alpha: false, antialias: false, depth: false, stencil: false,
+    premultipliedAlpha: false, preserveDrawingBuffer: true, desynchronized: true,
+  });
+  if (!gl) return null;
+  const pre = glSrc(0) + glSrc(1);
+  progBg = glLink(VS_FULL, pre + glSrc(2), "backdrop", ["B", "u_vh"]);
+  progStar = glLink(VS_QUAD, pre + glSrc(3), "star", ["S", "u_size", "u_vh", "u_rect", "u_view"]);
+  progPlanet = glLink(VS_QUAD, pre + glSrc(4), "planet",
+    ["U", "u_seed", "u_feat", "u_size", "u_vh", "u_palette", "u_rect", "u_view"]);
+  progOrbit = glLink(VS_POINT, FS_POINT, "orbit", ["u_view", "u_size"]);
+
+  bgLen = wasm.gl_backdrop_len();
+  bodyStride = wasm.gl_body_stride();
+  bodyHeader = wasm.gl_body_header();
+  maxBodies = wasm.gl_max_bodies();
+  ptStride = wasm.gl_point_stride();
+  // Orbits: the planet cap x `paint_orbit`'s steps. Stars: generous enough for a
+  // big viewport at high density — `gl_star_points` truncates rather than
+  // overruns, and reports the count back. Both live in one buffer, back to back.
+  orbCap = 16 * 220;
+  starCap = 24000;
+  glBgPtr = wasm.alloc(bgLen * 4);
+  glPtPtr = wasm.alloc((orbCap + starCap) * ptStride * 4);
+  glBodyPtr = wasm.alloc(maxBodies * bodyStride * 4);
+
+  glFeat = wasm.gl_feat();
+  gpu = describeGPU(gl);
+  tqExt = gl.getExtension("EXT_disjoint_timer_query_webgl2");
+  ptVAO = gl.createVertexArray();
+  ptVBO = gl.createBuffer();
+  gl.bindVertexArray(ptVAO);
+  gl.bindBuffer(gl.ARRAY_BUFFER, ptVBO);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, ptStride * 4, 0);
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, ptStride * 4, 8);
+  gl.bindVertexArray(null);
+  return gl;
+}
+
+/// One GPU frame. `finish()` before returning, so the caller's clock measures
+/// the draw rather than the time it took to queue it.
+function renderGLScene(w, h, cam, zoomArg, bgPanX, bgPanY, tOrbit, tSpin, tSun) {
+  // The drawing buffer is the RENDER resolution; CSS stretches it to the display
+  // as crisp square pixels, which is what the 2D path was using drawImage for.
+  if (glc.width !== w || glc.height !== h) { glc.width = w; glc.height = h; }
+  const tq = tqBegin();
+  gl.viewport(0, 0, w, h);
+  gl.disable(gl.BLEND);
+
+  // 1 — backdrop. This is the pass the worker pool never reached: full-frame,
+  // serial on the CPU, and re-painted every frame whenever the camera follows a
+  // body. Here it is one triangle.
+  wasm.gl_backdrop(sys, glBgPtr, cam.x, cam.y, zoomArg, bgPanX, bgPanY);
+  gl.useProgram(progBg);
+  gl.uniform1fv(progBg.loc.B, new Float32Array(wasm.memory.buffer, glBgPtr, bgLen));
+  gl.uniform1i(progBg.loc.u_vh, h);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  // 2 — the dashed orbit paths and the parallax stars, as point sprites over an
+  // additive blend. Both come from Rust in one buffer, back to back, and differ
+  // only in point size, so it is one upload and two draw calls.
+  const nOrb = wasm.gl_orbit_points(sys, glPtPtr, orbCap, w, h, cam.x, cam.y, zoomArg);
+  const starPtr = glPtPtr + nOrb * ptStride * 4;
+  const nStar = wasm.gl_star_points(sys, starPtr, starCap, w, h, cam.x, cam.y, zoomArg, bgPanX, bgPanY);
+  if (nOrb + nStar > 0) {
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.bindVertexArray(ptVAO);
+    gl.bindBuffer(gl.ARRAY_BUFFER, ptVBO);
+    gl.bufferData(gl.ARRAY_BUFFER,
+      new Float32Array(wasm.memory.buffer, glPtPtr, (nOrb + nStar) * ptStride), gl.DYNAMIC_DRAW);
+    gl.useProgram(progOrbit);
+    gl.uniform2f(progOrbit.loc.u_view, w, h);
+    if (nOrb > 0) {
+      gl.uniform1f(progOrbit.loc.u_size, wasm.gl_orbit_width(sys));
+      gl.drawArrays(gl.POINTS, 0, nOrb);
+    }
+    if (nStar > 0) {
+      gl.uniform1f(progOrbit.loc.u_size, 1.0);   // a star is one pixel
+      gl.drawArrays(gl.POINTS, nOrb, nStar);
+    }
+    gl.bindVertexArray(null);
+  }
+
+  // 3 — the bodies, back to front. Alpha over is the painter's algorithm `blit`
+  // implemented by hand, so the depth sort reads the same.
+  const n = wasm.gl_bodies(sys, glBodyPtr, w, h, cam.x, cam.y, zoomArg, tOrbit, tSpin, tSun);
+  if (n > 0) {
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    const recs = new Float32Array(wasm.memory.buffer, glBodyPtr, n * bodyStride);
+    for (let i = 0; i < n; i++) {
+      const r = i * bodyStride;
+      const isStar = recs[r] === 0;
+      const p = isStar ? progStar : progPlanet;
+      const uni = recs.subarray(r + bodyHeader, r + bodyStride);
+      gl.useProgram(p);
+      gl.uniform4f(p.loc.u_rect, recs[r + 1], recs[r + 2], recs[r + 3], recs[r + 3]);
+      gl.uniform2f(p.loc.u_view, w, h);
+      gl.uniform1i(p.loc.u_size, recs[r + 4] | 0);
+      gl.uniform1i(p.loc.u_vh, h);
+      if (isStar) {
+        gl.uniform1fv(p.loc.S, uni.subarray(0, 32));
+      } else {
+        gl.uniform1fv(p.loc.U, uni);
+        // `u_seed` only feeds the hero framing's starfield, which a tile never
+        // reaches — the body's own seed is already folded into `U`.
+        gl.uniform1ui(p.loc.u_seed, 0);
+        gl.uniform1ui(p.loc.u_feat, glFeat);
+        gl.uniform1i(p.loc.u_palette, 0);
+      }
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+  }
+  drawn = { bodies: n, orbit: nOrb, stars: nStar };
+  tqEnd(tq);
+  tqPoll();   // reads a query from a few frames ago, so it never stalls
+  // Deliberately no `finish()`. It would make the render timer below honest at
+  // the cost of stalling the CPU on the GPU every frame, and the whole point of
+  // this path is that the two run independently. The timer therefore reports
+  // submission cost; the fps counter is what measures the GPU.
+}
+
+/// Grey out what the GPU path does not have: the worker pool splits a CPU frame
+/// into bands, and the sphere-map bakes are a CPU optimization the live shader
+/// does not read.
+function syncRendererUI() {
+  const isGL = renderer === "gl";
+  glc.style.display = isGL ? "block" : "none";
+  $("poolctl").classList.toggle("dim", isGL);
+  $("frozctl").classList.toggle("dim", isGL);
+  $("glnote").textContent = isGL
+    ? "Whole scene on the GPU — no backdrop cache, no tile blits, and no copy back: this canvas IS the render target."
+    : "";
+}
+
 // Two INDEPENDENT quantities:
 //   • cam.zoom = MAGNIFICATION — display (CSS) px per world unit; wheel / pinch /
 //     fit change it. Bigger = a closer camera: things look larger AND resolve
@@ -458,7 +822,9 @@ async function frame(now) {
 
   // Time the actual WASM procedural render — the CPU cost the profiling targets.
   const r0 = performance.now();
-  if (pool.workers.length > 0) {
+  if (renderer === "gl") {
+    renderGLScene(w, h, cam, zoomArg, bgPanX, bgPanY, tOrbit, tSpin, tSun);
+  } else if (pool.workers.length > 0) {
     if (inFlight) { requestAnimationFrame(frame); return; }
     inFlight = true;
     try {
@@ -482,9 +848,15 @@ async function frame(now) {
     imgData.data.set(new Uint8Array(wasm.memory.buffer, bufPtr, w * h * 4));
   }
   const renderMs = performance.now() - r0;
-  octx.putImageData(imgData, 0, 0);
-  // Crisp upscale of the small render buffer to the full display (no smoothing).
-  ctx.drawImage(off, 0, 0, w, h, 0, 0, canvas.width, canvas.height);
+  // Both paths end with the same crisp upscale onto the display canvas, so the
+  // timer above is the render and nothing else. The GPU path has nothing to put
+  // back: it drew straight into `glc`.
+  if (renderer === "gl") {
+    // Already on screen — the GL canvas IS the display surface. Nothing to copy.
+  } else {
+    octx.putImageData(imgData, 0, 0);
+    ctx.drawImage(off, 0, 0, w, h, 0, 0, canvas.width, canvas.height);
+  }
 
   // HUD: what's under the crosshair (viewport centre)?
   const near = follow >= 0 ? follow : wasm.nearest_center(sys, w, h, cam.x, cam.y, zoomArg, tOrbit);
@@ -510,10 +882,66 @@ function updatePerf(now, renderMs, frameMs) {
   $("pfFps").textContent = emaFps.toFixed(0);
   $("pfRender").textContent = emaRender.toFixed(1);
   $("pfFrame").textContent = `frame ${emaFrame.toFixed(1)} ms`;
-  $("pfLoad").textContent = `CPU ${load.toFixed(0)}% of 60 fps`;
   $("pfRes").textContent = `${curW}×${curH} · ${(px / 1000).toFixed(0)}k px`;
-  $("pfBg").textContent = bgRedrewInWindow ? "backdrop redraw" : "backdrop cached ✓";
-  if (autoDetail && emaRender > 0.01) {
+  // Two of these read differently on the GPU. `render` there is SUBMISSION cost
+  // — the draw finishes after the call returns — so reporting it as a share of a
+  // CPU frame budget would flatter it; and there is no backdrop cache to hit,
+  // because the fullscreen triangle replaced it.
+  const isGL = renderer === "gl";
+  const gpuTrust = isGL && gpuTimeTrustworthy();
+  $("pfLoad").textContent = isGL
+    ? `submit ${emaRender.toFixed(1)} ms (GPU runs async)`
+    : `CPU ${load.toFixed(0)}% of 60 fps`;
+  $("pfBg").textContent = isGL
+    ? "backdrop: no cache needed"
+    : (bgRedrewInWindow ? "backdrop redraw" : "backdrop cached ✓");
+  if (isGL && gpu) {
+    // The masked case is common and benign (Firefox with resistFingerprinting,
+    // some Safari builds) — say "hidden" rather than pretending to know.
+    const label = gpu.masked ? `${gpu.name} (name hidden)` : gpu.name;
+    $("pfGpu").innerHTML = gpu.soft
+      ? `<span class="warn">⚠ software rasterizer — ${esc(gpu.name)}</span>`
+      : `GPU ${esc(label)}`;
+    $("pfGpu").title = `${gpu.vendor} — ${gpu.name}`;
+    $("pfDraw").textContent =
+      `draw ${drawn.bodies} bodies · ${drawn.stars} stars · ${drawn.orbit} orbit`;
+    // The real number, where the browser allows it: not how long the calls took
+    // to issue, but how long the GPU spent on them.
+    $("pfGpuMs").textContent = !tqExt
+      ? "gpu time: not exposed by this browser"
+      : gpuTimeTrustworthy()
+        ? `gpu ${emaGpu.toFixed(2)} ms · ${(emaGpu / FRAME_BUDGET * 100).toFixed(0)}% of a 60 fps slot`
+        : gpuSeen
+          ? `gpu timer implausible (${emaGpu.toFixed(0)} ms vs a ${(1000 / Math.max(emaFps, 1)).toFixed(0)} ms frame)`
+          : tqDrops > 8
+            ? `gpu time: driver reports every query disjoint (${tqDrops} dropped)`
+            : `gpu time: waiting…`;
+  } else {
+    $("pfGpu").textContent = "";
+    $("pfDraw").textContent = "";
+    $("pfGpuMs").textContent = "";
+  }
+  if (autoDetail && isGL) {
+    // Never off the render timer here: submission cost says nothing about how
+    // long the GPU took. With a timer query there is a real measurement to aim
+    // at, and the same square-law step the CPU path uses applies; without one,
+    // fall back to the FRAME INTERVAL with a dead band around the vsync slot, so
+    // it does not sawtooth while comfortably hitting 60.
+    const was = effDetail;
+    if (gpuTrust && emaGpu > 0.01) {
+      const ratio = AUTO_BUDGET / emaGpu;
+      if (ratio < 0.9 || ratio > 1.35) {
+        const target = effDetail * (1 + 0.7 * (Math.sqrt(ratio) - 1));
+        effDetail = Math.max(AUTO_FLOOR, Math.min(vPdetail, Math.round(target / 8) * 8));
+      }
+    } else {
+      const iv = 1000 / Math.max(emaFps, 1);
+      if (iv > 19.0) effDetail = Math.max(AUTO_FLOOR, Math.round(effDetail * 0.85 / 8) * 8);
+      else if (iv < 17.2) effDetail = Math.min(vPdetail, effDetail + 8);
+    }
+    if (effDetail !== was) applyView();
+    $("pfAuto").textContent = `detail ${effDetail}${effDetail < vPdetail ? " (auto)" : ""}`;
+  } else if (autoDetail && emaRender > 0.01) {
     const was = effDetail;
     // A tile costs ~r^2, so the cap that hits the budget is the current one
     // scaled by sqrt(budget / measured) — one step instead of a slow walk.
@@ -690,6 +1118,27 @@ $("pool").addEventListener("change", async () => {
   $("poolV").textContent = poolLabel();
 });
 
+// WebGL2 is opt-in: probed on selection, not at load, so a machine without it
+// never pays for a failed context. Switching to it drops the worker pool, which
+// exists only to divide the CPU frame.
+$("renderer").addEventListener("change", async () => {
+  const want = $("renderer").value;
+  if (want === "gl") {
+    try {
+      if (!glInit()) throw new Error("this browser has no WebGL2 context");
+    } catch (e) {
+      $("renderer").value = "wasm";
+      $("glnote").textContent = String(e.message || e);
+      return;
+    }
+    await queueResize(0);
+    $("pool").value = "0";
+    $("poolV").textContent = poolLabel();
+  }
+  renderer = want;
+  syncRendererUI();
+});
+
 $("froz").addEventListener("change", () => {
   const on = $("froz").checked;
   $("frozV").textContent = on ? "on" : "off";
@@ -733,6 +1182,7 @@ async function main() {
   $("pool").value = String(poolWant);
   $("poolV").textContent = poolLabel();
 
+  syncRendererUI();
   requestAnimationFrame(frame);
 }
 main().catch(e => { $("err").style.display = "grid"; $("err").textContent = "failed to load solar.wasm — " + e; console.error(e); });

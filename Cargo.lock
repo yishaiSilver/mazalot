@@ -396,6 +396,7 @@ name = "solar"
 version = "0.1.0"
 dependencies = [
  "background-core",
+ "dither-core",
  "noise-core",
  "planet-core",
  "render-io",

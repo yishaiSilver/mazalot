@@ -6,6 +6,9 @@
 
 use noise_core::{clamp01, Rgb};
 
+/// The GLSL half of this crate. Concatenated after `noise_core::GL_PRELUDE`.
+pub const GL_PRELUDE: &str = include_str!("dither.glsl");
+
 // 8x8 ordered (Bayer) matrix, values 0..63.
 pub const BAYER: [u8; 64] = [
     0, 32, 8, 40, 2, 34, 10, 42, 48, 16, 56, 24, 50, 18, 58, 26, 12, 44, 4, 36, 14, 46,

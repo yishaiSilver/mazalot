@@ -463,11 +463,14 @@ world and costs accordingly; drop it if you want the frame back.
 
 ### Is the browser using your cores?
 
-It isn't. The demos render every frame in one wasm instance on the main thread,
-so they use exactly one core however many the machine has — and that, not the
-instruction set, is the largest gap left to native. On the measurements here
-wasm runs within roughly 1.3x of native single-threaded; the generators then fan
-frames across every core with rayon and the browser does not.
+A wasm *instance* is one thread, so a single instance uses exactly one core
+however many the machine has — and that, not the instruction set, is the largest
+gap left to native. On the measurements here wasm runs within roughly 1.3x of
+native single-threaded; the generators then fan frames across every core with
+rayon. The `planet` and `solar` demos now fan a frame across a **worker pool**
+instead, which closes most of it; see the numbers below and the caveat in
+[WebGL2](#webgl2-the-same-shader-on-the-gpu) about what the pool does *not*
+reach.
 
 Two things get called multithreading on the web, and only one of them is gated:
 
@@ -720,6 +723,175 @@ separately (`Night-side thinning`, `Frozen cloud deck`, `Baked surface`,
 `Baked bands`, `billow (morph LUT)`) so each can be A/B'd on its own — the last
 is nested under the deck, which it needs.
 
+
+### WebGL2: the same shader on the GPU
+
+Everything above divides the frame. The worker pool splits a scene's *bodies*
+across cores, but the backdrop is full-screen serial work that scales with the
+window and the pool never touches it — and a camera following a planet
+invalidates the backdrop cache every frame, so it really is repainted. That is
+an Amdahl term, and no number of workers removes it. Moving the whole frame to
+the GPU does.
+
+The port is far cheaper than it sounds, for a reason worth stating plainly:
+
+> **`hash3` and `value_noise` are `u32` integer math.** Wrapping multiplies,
+> xors, shifts — no transcendentals, nothing a driver is free to round its own
+> way. They transliterate into GLSL ES 3.00 *exactly*, so the lattice under the
+> GPU picture is bit-identical to the lattice under the CPU one. Worley and the
+> fBm stack fall out of that for free.
+
+So there is no "port `noise-core` to the GPU" problem. What is actually rewritten
+is ~200 lines of ramps, mixes and smoothsteps, in
+`crates/planet-core/src/shader.glsl`. Everything else stays in Rust:
+`gl_uniforms()` computes the `PType` row with the slider overrides applied, the
+seed offsets, the vortex centres, this frame's moons, the key light, the colour
+ramp, the palette and the whole `Lod` octave budget, and ships them as one flat
+float array. **The type table is transported, not duplicated** — adding a planet
+type is still one row, and the GPU picks it up.
+
+The shader source lives inside `planet.wasm` (`gl_shader_ptr`/`gl_shader_len`),
+so it cannot go stale against the module it was built with and the single-file
+artifact keeps working.
+
+It runs the **live** shader — no `F_BAKED_*`. Those bakes exist to make a CPU
+afford the weather; they cost frozen storms, and in a worker pool they cost a
+private ~7.5 MB copy of the sphere maps *per instance* (60 MB at 8 workers),
+because workers cannot share memory without COOP/COEP. A GPU would rather
+evaluate the noise. So the GPU path is both faster and less frozen.
+
+**Verification.** `out/` is the regression test for the native path;
+`scripts/verify-gl.mjs` is its equivalent here. It renders both paths in headless
+Chromium and diffs them per pixel. All 26 types, 4 angles × 2 seeds, 128px:
+
+| | |
+|---|---|
+| types bit-identical to the wasm renderer | **15 of 26** |
+| worst per-type pixel disagreement | **0.09%** (`ocean`) |
+| pixels differing by more than one quantization level | **0.00%** |
+
+`--demo solar` diffs whole scenes the same way, at three zooms (fit, mid, and
+zoomed onto a body), and also lands at **0.00%** past a level. Its raw
+disagreement rate is much higher — 17–30% of pixels — and that is the nebula
+rather than the bodies: at a zoom where the clouds have faded out, the backdrop
+is **byte-exact**. The GPU evaluates the cloud fBm per *pixel* (quantized to the
+same 8x8 lattice) where the CPU bakes it per *cell*, so the two round differently
+right at the density threshold. Nothing is wrong with the picture; the numbers
+just are not the same numbers. See below for the version of that which would also
+be faster.
+
+Every differing pixel differs by exactly one 22-level step (12/255). That is the
+signature of a value landing on the other side of a quantizer threshold, not of
+a shading bug: ANGLE is free to round `sin`, `exp`, `pow` and `sqrt` its own way,
+and a 1e-7 difference before `quant` becomes a whole level after it. The types
+that come out *exactly* equal are the ones whose shading is ramps and steps with
+no transcendental in the path — `barren`, `moon`, `lava`, `desert`, `chrome`.
+
+**The whole scene, not just a disc.** `solar` renders on the GPU in three passes
+— one fullscreen triangle for the backdrop, the dashed orbit paths as point
+sprites, then one quad per body back-to-front with alpha blending, which *is*
+the painter's algorithm `blit` was implementing by hand. Rust still owns the
+scene: `gl_bodies()` hands over a draw list whose every number comes from the
+same expressions `draw_bodies_band` uses (`Planet::at`, `to_screen`,
+`dest_rect`, the detail caps, the sunward light), and each record carries that
+shader's uniform block.
+
+Everything the CPU path had to cache is simply absent:
+
+| CPU | GPU |
+|---|---|
+| `BackdropCache` — a scrolling ground/nebula sprite, memmoved on a pan | one triangle; a camera that follows a body costs the same as a still one |
+| `SunCache` + a quantized boil clock, so a costly tile bake can be reused | no bake, so `t_sun` passes straight through and the convection stops stepping |
+| `visible_tile_rect`, hand-arranging which tile pixels get shaded | the rasterizer clips the quad |
+| ~32 MB/frame of copies: band slices, worker transfers, `putImageData` | nothing is read back |
+
+The per-body pixelation knobs still work, and exactly: the fragment shader maps
+its destination pixel back through the *same* expression `blit` uses, so a body
+is blocky in the places `planet_pixel` and the detail cap make it blocky, with no
+second render target.
+
+**The HUD says what it is running on.** Under WebGL2 the perf readout adds the
+adapter name, the draw counts, and — where the browser allows it — the real GPU
+time per frame:
+
+```
+36 fps · 1.1 ms render
+submit 1.1 ms (GPU runs async)
+backdrop: no cache needed
+GPU Apple M2 · gpu 2.31 ms · 14% of a 60 fps slot
+draw 5 bodies · 2410 stars · 436 orbit
+```
+
+Three things there are deliberate. `render` is relabelled **submit** because the
+draw calls return long before the GPU has finished them, so timing them and
+calling it CPU load would flatter the path. The GPU time comes from
+`EXT_disjoint_timer_query_webgl2`, read a few frames late so asking never stalls
+the pipeline — Chrome exposes it, Firefox removed it and Safari never shipped it,
+so its absence is normal and says so. And a **software rasterizer is called out
+in amber**: `gl.RENDERER` is masked to something generic by every modern browser,
+so the real name needs `WEBGL_debug_renderer_info`, and a browser that has
+quietly fallen back to SwiftShader or llvmpipe is running this path with none of
+its advantages — which is the single most useful thing the HUD can tell you when
+the GPU renderer is somehow *slower* than the CPU one.
+
+The timer is sanity-checked against the frame interval before it is believed: a
+frame cannot spend more GPU time than the wall clock between frames, so a reading
+far past that is the driver misbehaving. SwiftShader here reports ~750 ms against
+50 ms frames, which is how the check came to exist. It matters beyond the
+display, because auto-detail paces off that number and an inflated one would peg
+the detail cap to the floor.
+
+There is no WebGL API for GPU *utilization* or VRAM — browsers do not expose
+either, and none of the fingerprinting-adjacent tricks are worth it. GPU
+milliseconds against the vsync slot is the honest version of the same question.
+
+**What this repo cannot tell you: whether it is faster.** This container has no
+`/dev/dri`, so the only WebGL2 available is ANGLE over SwiftShader — a *software*
+rasterizer. It proves the shader is right and says nothing about GPU throughput;
+timing it would be timing the CPU. The demo's `Renderer` dropdown is there so you
+can run the A/B on hardware that has a GPU.
+
+```bash
+node scripts/verify-gl.mjs                       # planet, 9 types, 96px
+node scripts/verify-gl.mjs --demo all --types all
+node scripts/verify-gl.mjs --demo solar --size 240
+```
+
+### Scatter, don't gather
+
+The first version of the backdrop shader drew the stars in the fragment shader:
+each pixel asked which of the nine surrounding cells, in each of three parallax
+layers, might have placed a star on it. That is the only way a *fragment* can ask
+the question, and it is 27 hashes per pixel across the whole screen — against
+`paint_stars`, which walks the lit cells and plots one pixel each, roughly one
+hash per fifty pixels. **A thousand times the work for the same picture.**
+
+It was three quarters of the fragment cost. Under SwiftShader (a software
+rasterizer, so these are CPU numbers — but the ratio is fragment ALU either way),
+800x500, fit view:
+
+| | ms/frame | fps |
+|---|---:|---:|
+| stars gathered in the fragment shader | 216.6 | 4.6 |
+| **stars scattered as point sprites** | **50.0** | **20.0** |
+
+With the stars as points, switching the starfield off entirely now changes the
+frame by *nothing measurable* — which is the check that says the cost really
+moved rather than merely shrank.
+
+The fix reuses what the orbit paths already did: `visit_stars` is the one cell
+walk, `paint_stars` plots pixels from it, `gl_star_points` emits vertices from
+it, both into the same `(x, y, r, g, b)` buffer under an additive blend. The
+lesson generalizes past this repo — **when porting a scatter to a shader, look
+for the vertex path before you write the gather.**
+
+The nebula is the same shape of problem, still unfixed: `BackdropCache` bakes one
+fBm sample per 8x8 cell and scrolls the sprite, where the fragment shader
+recomputes that per-cell value at every pixel — 64x the noise evaluations. Far
+milder than the stars' 1000x, and not the bottleneck now. If it becomes one, the
+fix is again to port the sprite rather than thin the shader: bake the cell field
+into a low-res texture, scroll it, repaint only the exposed strip, and let
+hardware sampling do the rest. Same idea, one level down.
 
 ## Adding a planet type
 

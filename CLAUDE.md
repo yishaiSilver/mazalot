@@ -79,6 +79,63 @@ in step: a rect that under-reports by a pixel leaves an unshaded seam only
 visible at the zoom levels nobody screenshots, which is what `scene-core`'s
 million-read sweep is there to catch.
 
+**The GLSL ports are the sanctioned second shaders.** Four `.glsl` files
+re-implement pixel loops for WebGL2 — `noise-core/src/noise.glsl` (the prelude
+every one of them is concatenated after, carrying `#version` and the lattice
+kernels), plus `planet-core`'s, `background-core`'s and `sun-core`'s bodies.
+`dither-core/src/dither.glsl` rides along in the prelude. They earn the exception
+by keeping the duplication to the shading: each crate's `gl_uniforms()` computes
+its tables, seeded constants and octave budgets in Rust and ships them as one
+float array, so `TYPES`/`SUNS`/`STAR_LAYERS` are *transported*, not copied — a
+new planet type still means one row. Two consequences:
+
+- The `U_*` slot indices in the GLSL and the `GL_U_*` constants in Rust are a
+  wire format. `glsl_slot_indices_match_the_rust` parses the `#define`s and pins
+  them, because a slot off by one paints a planet with somebody else's colours
+  rather than failing.
+- `scripts/verify-gl.mjs` is to the GL path what `out/` is to the native one.
+  Run it after touching any shader (`--demo all`). Expect a residue and read the
+  right column: pixels differing by **more than one quantization level** are the
+  signal (0.00% today); pixels differing by exactly one are ANGLE rounding a
+  `sin` differently and landing across a `quant` threshold. `solar`'s raw differ
+  rate is 17–30% and that is *fine*: it is the nebula, which the GPU evaluates
+  per pixel where the CPU bakes per cell. At a zoom where the clouds fade the
+  backdrop is byte-exact, which is how you know.
+
+The GL path deliberately ignores `F_BAKED_*` and runs the live shader — the bakes
+buy CPU time at the price of frozen weather and ~7.5 MB of sphere maps per worker
+instance, and a GPU wants neither.
+
+**A GPU scene is a draw list, not pixels.** `solar::gl_bodies` emits one record
+per body — the destination rect from `dest_rect`, then that shader's uniform
+block — sorted back-to-front, and the JS draws a quad each with alpha blending.
+That *is* what `blit` was doing by hand. Two things to keep in step:
+
+- The fragment shader maps its destination pixel back through the **same
+  expression** `blit` uses (`int((dd + 0.5) / scale)`), which is what keeps
+  `planet_pixel`/`sun_pixel` and the detail caps meaningful with no second render
+  target. Change one, change both.
+- The GPU has no `BackdropCache`, no `SunCache` and no `visible_tile_rect` — all
+  three are caches for work a rasterizer does not mind repeating, and dropping
+  them is most of the win. Do not port them back without a measurement.
+
+**Scatter, don't gather.** `paint_stars` walks lit cells and plots one pixel
+each. The first backdrop shader inverted that — every pixel testing nine cells in
+each of three layers, 27 hashes per pixel against roughly one per fifty — and it
+was three quarters of the fragment cost (216.6 ms/frame, vs 50.0 with the stars
+as point sprites). `visit_stars` is now the one walk, feeding `paint_stars` and
+`gl_star_points` alike. Before writing a gather into any shader, check whether
+the vertex path will do. The nebula is the same shape of problem at 64x rather
+than 1000x, and is the next candidate if the backdrop ever bites.
+
+**The `gl` cargo feature is load-bearing, not tidiness.** Each core crate's
+`mod gl` is `#[cfg(any(feature = "gl", test))]`, and the demo crates switch it on
+only through
+`[target.'cfg(target_arch = "wasm32")'.dependencies]` (plus `[dev-dependencies]`,
+so `cargo test` still covers it — resolver 2 keeps those out of `cargo build`).
+The reason is the codegen gotcha below: the native generators must not compile
+this code at all, or `out/` moves.
+
 **One backdrop, likewise.** Every scene paints through `background-core`:
 `paint_backdrop` (ground + optional nebula) then `paint_stars`. A new scene crate
 supplies a `Backdrop` and a `Starfield` const and a closure that mixes its seed
@@ -146,7 +203,15 @@ you need it whenever you touch `noise-core`.
 Run wasm builds **from the repo root** so `.cargo/config.toml` applies. It adds
 `-C target-feature=+simd128`, which is required, not optional — see below.
 
-`cargo test --workspace` runs the handful of roster tests. It is fast; run it.
+If you touched the planet shader or `shader.glsl`, diff the GPU path too — it is
+a second implementation and nothing below the pixels checks it:
+
+```bash
+node scripts/verify-gl.mjs --types all      # needs the rebuilt planet.wasm
+```
+
+`cargo test --workspace` runs the roster tests and the GLSL wire-format checks.
+It is fast; run it.
 
 ## Gotchas
 
@@ -170,6 +235,17 @@ Run wasm builds **from the repo root** so `.cargo/config.toml` applies. It adds
   quantization thresholds. This is not a logic bug, but it *will* break
   byte-identity. Quantify the delta (max per-channel difference) before deciding
   it's fine.
+- **...and you do not have to *move* code to trigger it — adding some is enough.**
+  `gl_uniforms` computes no pixels; it just reads the type row and calls
+  `Lod::oct`, `moon_ring`, `seed_offsets`. Merely *existing* in `planet-core` as
+  another caller of those re-priced their inlining and moved `out/moon_*.png` by
+  up to 4/255 across 5% of its pixels — while `planet`, `solar`, `comet`,
+  `asteroid` and `star` all stayed byte-identical, which is what makes this so
+  easy to miss if you spot-check one crate. `mod gl` is therefore
+  `#[cfg(any(target_arch = "wasm32", test))]`: the native generators have no GPU,
+  so they do not carry it, and `out/` is byte-identical by construction. Note the
+  bisection that found it — reverting the *refactors* changed nothing; only
+  removing the new code did.
 - **Benchmark with a control.** This machine's timings swing ±60% between runs.
   Build the baseline in a throwaway `git worktree` and interleave the two binaries
   in one loop, using an untouched pass (e.g. solar's background) as the control.
@@ -258,6 +334,10 @@ Run wasm builds **from the repo root** so `.cargo/config.toml` applies. It adds
   what the cores are worth on a given host before anyone writes the pool —
   including whether its CSP allows the blob-URL workers a single-file build
   needs. 2.9x on 4 shared cores here.
+- **The GPU is only checkable, not measurable, in this sandbox.** There is no
+  `/dev/dri`, so headless Chromium's WebGL2 is ANGLE over SwiftShader — a CPU
+  rasterizer. `verify-gl.mjs` is a correctness harness and nothing else; a
+  timing taken through it is a timing of the CPU. Say so rather than quoting it.
 - `scripts/make-artifact.sh <crate>` bundles a demo into one self-contained HTML
   with the wasm inlined as base64. It rebuilds the wasm unless given `--no-build`.
 - The committed `crates/*/web/*.wasm` files go stale easily. If you change a
