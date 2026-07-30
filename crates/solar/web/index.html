@@ -230,7 +230,7 @@ let wasm, sys = 0, bufPtr = 0, bufLen = 0, posPtr = 0, imgData;
 // which is painter's algorithm, i.e. exactly what `blit` was doing by hand.
 //
 // Rust still owns the scene. `gl_bodies` hands over a draw list whose every
-// number comes from the same expressions `draw_bodies_band` uses (`Planet::at`,
+// number comes from the same expressions `draw_bodies` uses (`Planet::at`,
 // `to_screen`, `dest_rect`, the detail caps, the sunward light), and each record
 // carries that shader's uniform block; the GLSL travels inside solar.wasm. So
 // the archetype tables, the orbital mechanics and the octave budgets are
