@@ -174,3 +174,33 @@ pub extern "C" fn system_set_frozen_clouds(sys: *mut System, on: u32) {
     let sys = unsafe { &mut *sys };
     sys.set_frozen_clouds(on != 0);
 }
+
+/// The backdrop alone — no bodies. Pair with [`render_bodies_band`] to split a
+/// scene across a worker pool.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn render_backdrop(
+    sys: *mut System, buf: *mut u8, w: u32, h: u32,
+    cam_x: f32, cam_y: f32, zoom: f32, bgx: f32, bgy: f32,
+) {
+    let sys = unsafe { &mut *sys };
+    let out = unsafe { wasm_abi::out_rgba(buf, w, h) };
+    crate::render_backdrop(sys, w, h, &Camera { x: cam_x, y: cam_y, zoom }, bgx, bgy, out);
+}
+
+/// The bodies for rows `y0..y1`, drawn over a `w × (y1 - y0)` strip that already
+/// holds those rows of the backdrop. `w`/`h` are the FULL frame size — that is
+/// what places the camera; only the written window narrows.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn render_bodies_band(
+    sys: *mut System, buf: *mut u8, w: u32, h: u32,
+    cam_x: f32, cam_y: f32, zoom: f32,
+    t_orbit: f32, t_spin: f32, t_sun: f32, y0: u32, y1: u32,
+) {
+    let sys = unsafe { &*sys };
+    let hb = y1.min(h).saturating_sub(y0.min(h));
+    let out = unsafe { wasm_abi::out_rgba(buf, w, hb) };
+    let cam = Camera { x: cam_x, y: cam_y, zoom };
+    crate::render_bodies_band(sys, w, h, &cam, t_orbit, t_spin, t_sun, y0, y1, out);
+}

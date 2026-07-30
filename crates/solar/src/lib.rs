@@ -655,6 +655,52 @@ pub fn render_system_cached(sys: &mut System, w: u32, h: u32, cam: &Camera, bgx:
     draw_bodies(sys, w, h, cam, t_orbit, t_spin, t_sun, out);
 }
 
+/// The backdrop alone: ground, nebula, stars and the dashed orbit paths, with no
+/// bodies over it. Paired with [`render_bodies_band`] to split a scene across a
+/// worker pool — the backdrop is a small share of a zoomed-in frame, so it stays
+/// on one thread and only the bodies fan out.
+/// Uses the same cache [`render_system_cached`] does, and that is not optional:
+/// the backdrop is FULL-FRAME work that the worker split does not touch, so
+/// repainting it every frame makes turning the pool on a net loss. It did,
+/// until this took `&mut`.
+pub fn render_backdrop(sys: &mut System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: f32, out: &mut [u8]) {
+    let len = (w * h * 4) as usize;
+    assert!(out.len() >= len);
+    let key = bg_key(sys, w, h, cam, bgx, bgy);
+    if sys.bg_key == Some(key) && sys.bg_cache.len() == len {
+        out[..len].copy_from_slice(&sys.bg_cache);
+        return;
+    }
+    draw_bg_orbits(sys, w, h, cam, bgx, bgy, out);
+    sys.bg_cache.clear();
+    sys.bg_cache.extend_from_slice(&out[..len]);
+    sys.bg_key = Some(key);
+}
+
+/// The bodies alone, for rows `y0..y1`, drawn OVER whatever is already in `out`.
+///
+/// `out` is a `w × (y1 - y0)` strip — normally those rows copied out of a
+/// [`render_backdrop`] frame. `w`/`h` stay the FULL frame size, because that is
+/// what places the camera; only the window being written narrows. Concatenating
+/// the strips reproduces [`render_system`] exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn render_bodies_band(
+    sys: &System,
+    w: u32,
+    h: u32,
+    cam: &Camera,
+    t_orbit: f32,
+    t_spin: f32,
+    t_sun: f32,
+    y0: u32,
+    y1: u32,
+    out: &mut [u8],
+) {
+    let (y0, y1) = (y0.min(h), y1.min(h));
+    assert!(out.len() >= (w * y1.saturating_sub(y0) * 4) as usize);
+    draw_bodies_band(sys, w, h, cam, t_orbit, t_spin, t_sun, y0, y1, out);
+}
+
 /// World position of planet `i` at time `t` — the same query `planet_pos` makes
 /// over the C ABI, for callers on the Rust side (benchmarks, the native bins).
 pub fn planet_pos_of(sys: &System, i: usize, t: f32) -> (f32, f32) {
@@ -675,6 +721,35 @@ fn draw_bg_orbits(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: f32
 /// Draw the sun + planets over whatever is already in `out`, depth-sorted.
 #[allow(clippy::too_many_arguments)]
 fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin: f32, t_sun: f32, out: &mut [u8]) {
+    draw_bodies_band(sys, w, h, cam, t_orbit, t_spin, t_sun, 0, h, out)
+}
+
+/// [`draw_bodies`] restricted to rows `y0..y1`, writing into a `w × (y1 - y0)`
+/// buffer — the entry point a worker pool uses to split a scene.
+///
+/// The trick that makes this cheap: `visible_tile_rect` and `blit` already clip
+/// to a viewport, so a band is just a SHORTER viewport with screen-y shifted by
+/// `y0`. Every body's position still comes from the full-height camera, so
+/// nothing about the scene moves; only the window onto it narrows. That means
+/// the off-band part of a tile is never shaded, which is where the work goes.
+#[allow(clippy::too_many_arguments)]
+fn draw_bodies_band(
+    sys: &System,
+    w: u32,
+    h: u32,
+    cam: &Camera,
+    t_orbit: f32,
+    t_spin: f32,
+    t_sun: f32,
+    y0: u32,
+    y1: u32,
+    out: &mut [u8],
+) {
+    let hb = y1.saturating_sub(y0);
+    if hb == 0 {
+        return;
+    }
+    let band = y0 as f32;
     // Build a draw list of (depth, is_sun, planet_index) in the System's reused
     // scratch (no per-frame alloc). The sun sits at depth 0; planets sort around
     // it by their orbital depth.
@@ -713,7 +788,7 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
             // An empty rect is the visibility test; a partial one is shading
             // skipped where the star spills off the viewport.
             let tsize = sun_core::star_tile_size(rad_render, CORONA_REACH);
-            let clip = visible_tile_rect(tsize, w, h, suncx, suncy, scale);
+            let clip = visible_tile_rect(tsize, w, hb, suncx, suncy - band, scale);
             if clip[2] == clip[0] {
                 continue;
             }
@@ -734,7 +809,7 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
                 render_sun_tile(&mut sc.tile, sun, sys.seed, tq, rad_render, clip);
                 sc.key = Some(key);
             }
-            blit(out, w, h, &sc.tile, suncx, suncy, scale);
+            blit(out, w, hb, &sc.tile, suncx, suncy - band, scale);
         } else {
             let p = &sys.planets[which as usize];
             let (wx, wy, _depth) = p.at(t_orbit, sys.spacing, sys.ecc);
@@ -761,7 +836,7 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
             let scale = rad_px / rad_render;
             // As for the star: the compositor decides what is worth shading.
             let tsize = planet_core::tile_size(p.ptype, rad_render);
-            let clip = visible_tile_rect(tsize, w, h, sx, sy, scale);
+            let clip = visible_tile_rect(tsize, w, hb, sx, sy - band, scale);
             if clip[2] == clip[0] {
                 continue;
             }
@@ -779,7 +854,7 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
                 };
             let mut tile = sys.body_tile.borrow_mut();
             planet_core::render_tile_into(&mut tile, p.ptype, p.seed, spin_a, light, rad_render, clip, feat);
-            blit(out, w, h, &tile, sx, sy, scale);
+            blit(out, w, hb, &tile, sx, sy - band, scale);
         }
     }
 }
@@ -847,6 +922,47 @@ mod tests {
     fn every_orbital_band_has_worlds() {
         for band in 0..=2u8 {
             assert!(ROSTER.iter().any(|a| a.band == band), "orbital band {band} is empty");
+        }
+    }
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::*;
+
+    /// Splitting a scene across workers is only sound if backdrop-plus-banded-
+    /// bodies is bit-identical to the whole frame. Uneven bands on purpose: a
+    /// real pool hands out a remainder.
+    #[test]
+    fn banded_bodies_match_whole_scene() {
+        const W: u32 = 220;
+        const H: u32 = 140;
+        let n = (W * H * 4) as usize;
+        for seed in [7u32, 21] {
+            let mut sys = System::generate(seed);
+            // Zoomed onto a body — the case the split exists for — and a fit view.
+            let (bx, by) = planet_world_pos(&sys, sys.planets.len() / 2, 0.13);
+            for cam in [Camera { x: bx, y: by, zoom: 9.0 }, Camera { x: 0.0, y: 0.0, zoom: 0.7 }] {
+                let mut whole = vec![0u8; n];
+                render_system(&sys, W, H, &cam, 3.0, 0.0, 0.13, 0.17, 0.09, &mut whole);
+
+                for bands in [2u32, 3, 5] {
+                    let mut out = vec![0u8; n];
+                    render_backdrop(&mut sys, W, H, &cam, 3.0, 0.0, &mut out);
+                    let step = H.div_ceil(bands);
+                    for b in 0..bands {
+                        let (y0, y1) = (b * step, ((b + 1) * step).min(H));
+                        if y0 >= y1 {
+                            continue;
+                        }
+                        let r = (y0 * W * 4) as usize..(y1 * W * 4) as usize;
+                        let mut strip = out[r.clone()].to_vec();
+                        render_bodies_band(&sys, W, H, &cam, 0.13, 0.17, 0.09, y0, y1, &mut strip);
+                        out[r].copy_from_slice(&strip);
+                    }
+                    assert_eq!(out, whole, "seed {seed}, zoom {}, {bands} bands", cam.zoom);
+                }
+            }
         }
     }
 }
