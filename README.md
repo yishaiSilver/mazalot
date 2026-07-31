@@ -665,8 +665,10 @@ milliseconds against the vsync slot is the honest version of the same question.
 **What this repo cannot tell you: whether it is faster.** This container has no
 `/dev/dri`, so the only WebGL2 available is ANGLE over SwiftShader — a *software*
 rasterizer. It proves the shader is right and says nothing about GPU throughput;
-timing it would be timing the CPU. The demo's `Renderer` dropdown is there so you
-can run the A/B on hardware that has a GPU.
+timing it would be timing the CPU. Both demos **default to the GPU** and fall back
+to the CPU renderer (with the reason in the note under the dropdown) when WebGL2
+is missing, so the `Renderer` dropdown is there to run the A/B by hand on hardware
+that has one.
 
 ```bash
 node scripts/verify-gl.mjs                       # planet, 9 types, 96px

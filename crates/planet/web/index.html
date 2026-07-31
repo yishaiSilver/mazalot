@@ -106,8 +106,8 @@
     <div class="ctl"><label>Resolution <b id="resV">64</b></label><input type="range" id="res" min="40" max="240" step="8" value="64" /></div>
     <div class="ctl"><label>Renderer</label>
       <select id="renderer">
-        <option value="wasm">WebAssembly (CPU)</option>
         <option value="gl">WebGL2 (GPU)</option>
+        <option value="wasm">WebAssembly (CPU)</option>
       </select>
       <div class="note" id="glnote"></div>
     </div>
@@ -345,7 +345,9 @@ void main() {
 const glc = document.createElement("canvas");
 let gl = null, glProg = null, glLoc = null, glU = null, glUPtr = 0, glULen = 0;
 let gpu = null;                      // adapter description, once a context exists
-let renderer = "wasm";
+// GPU by default — it is the faster path and the one the shaders are written
+// for. `selectRenderer` demotes this to "wasm" at load if WebGL2 is missing.
+let renderer = "gl";
 
 function compile(type, src, what) {
   const s = gl.createShader(type);
@@ -692,30 +694,42 @@ async function main() {
     $("poolV").textContent = n === 0 ? "off (main thread)" : `${n}…`;
   });
   $("pool").addEventListener("change", async () => {
-    await queueResize(parseInt($("pool").value));
-    poolWant = pool.size;
-    $("poolV").textContent = poolLabel();
+    // Records the wanted size even under the GPU, so switching back to the CPU
+    // brings up the pool the slider is showing rather than none.
+    poolWant = parseInt($("pool").value);
+    await syncPool();
+    if (renderer !== "gl") poolWant = pool.size;
   });
-  await queueResize(poolWant);
-  $("poolV").textContent = poolLabel();
 
-  // WebGL2 is opt-in: probe it on selection rather than at load, so a machine
-  // without it never pays for a failed context.
-  $("renderer").addEventListener("change", () => {
-    const want = $("renderer").value;
+  // One probe for both the load-time default and the dropdown. Falling back is
+  // silent-but-explained: a machine with no WebGL2 lands on the CPU path with
+  // the reason in the note, rather than on a blank canvas.
+  async function selectRenderer(want) {
     if (want === "gl") {
       try {
         if (!glInit()) throw new Error("this browser has no WebGL2 context");
       } catch (e) {
+        renderer = "wasm";
         $("renderer").value = "wasm";
-        $("glnote").textContent = String(e.message || e);
+        await syncPool();
+        syncRendererUI();
+        $("glnote").textContent = `${e.message || e} — using the CPU renderer.`;
         return;
       }
     }
     renderer = want;
+    $("renderer").value = want;
+    await syncPool();
     syncRendererUI();
-  });
-  syncRendererUI();
+  }
+  // The pool only feeds the CPU path, so it is not built while the GPU has the
+  // frame — N idle workers is N wasm instances' worth of memory for nothing.
+  async function syncPool() {
+    await queueResize(renderer === "gl" ? 0 : poolWant);
+    $("poolV").textContent = poolLabel();
+  }
+  $("renderer").addEventListener("change", () => selectRenderer($("renderer").value));
+  await selectRenderer("gl");
 
   requestAnimationFrame(tick);
 }

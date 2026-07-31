@@ -339,6 +339,11 @@ It is fast; run it.
   `blendFunc(ONE, ONE)` saturates at 255 instead. 62–1025 px/frame hit that
   ceiling at seeds 7/21 — real, ~0.04% of pixels, under `verify-gl`'s rate gate.
   Unfixed. Reproduce by counting pixels at exactly `(90, 96, 120)`.
+- **Headless virtual time starves workers.** `chromium --headless
+  --virtual-time-budget` fast-forwards the main thread's timers but not worker
+  threads, so the pooled CPU path never completes a frame and reads as a blank
+  canvas. Set the pool to 0 before concluding anything about the CPU renderer
+  that way. The GPU path and the unpooled CPU path both measure fine.
 - `scripts/make-artifact.sh <crate>` bundles a demo into one self-contained HTML
   with the wasm inlined as base64. It rebuilds the wasm unless given `--no-build`.
 - The committed `crates/*/web/*.wasm` files go stale easily. If you change a

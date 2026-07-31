@@ -184,8 +184,8 @@
     <div class="ctl"><label>Sun detail cap <b id="sdetV">110</b></label><input type="range" id="sdet" min="16" max="176" step="8" value="110" /></div>
     <div class="ctl" id="rendctl"><label>Renderer</label>
       <select id="renderer" style="width:100%;box-sizing:border-box;padding:6px 8px;font:inherit;font-size:12px;color:#eef1f8;background:#0e0f18;border:1px solid rgba(255,255,255,.12);border-radius:6px">
-        <option value="wasm">WebAssembly (CPU)</option>
         <option value="gl">WebGL2 (GPU)</option>
+        <option value="wasm">WebAssembly (CPU)</option>
       </select>
       <div id="glnote" style="font-size:11px;line-height:1.45;color:#6b7290;margin-top:5px"></div>
     </div>
@@ -287,7 +287,9 @@ out vec4 fragColor;
 void main() { fragColor = vec4(v_col, 1.0); }`;
 
 const glc = $("glstage");
-let gl = null, renderer = "wasm";
+// GPU by default — it is the faster path and the one the shaders are written
+// for. `selectRenderer` demotes this to "wasm" at load if WebGL2 is missing.
+let gl = null, renderer = "gl";
 let progBg, progStar, progPlanet, progOrbit, ptVBO, ptVAO;
 let glBgPtr, glPtPtr, glBodyPtr, bgLen, bodyStride, bodyHeader, maxBodies;
 let orbCap, starCap, ptStride, glFeat;
@@ -977,22 +979,26 @@ $("ecc").addEventListener("input", () => {
   if (sys) wasm.system_set_eccentricity(sys, vEcc);
 });
 
-// WebGL2 is opt-in: probed on selection, not at load, so a machine without it
-// never pays for a failed context.
-$("renderer").addEventListener("change", async () => {
-  const want = $("renderer").value;
+// One probe for both the load-time default and the dropdown. Falling back is
+// silent-but-explained: a machine with no WebGL2 lands on the CPU path with the
+// reason in the note, rather than on a blank canvas.
+function selectRenderer(want) {
   if (want === "gl") {
     try {
       if (!glInit()) throw new Error("this browser has no WebGL2 context");
     } catch (e) {
+      renderer = "wasm";
       $("renderer").value = "wasm";
-      $("glnote").textContent = String(e.message || e);
+      syncRendererUI();
+      $("glnote").textContent = `${e.message || e} — using the CPU renderer.`;
       return;
     }
   }
   renderer = want;
+  $("renderer").value = want;
   syncRendererUI();
-});
+}
+$("renderer").addEventListener("change", () => selectRenderer($("renderer").value));
 
 // Past the terminator `shade` bottoms out at the ambient floor and ~3 of the 22
 // output levels are reachable, so the fine octaves and the whole cloud deck are
@@ -1034,7 +1040,7 @@ async function main() {
   bufPtr = wasm.alloc(bufLen);
   setupCanvas();
   generate(7);
-  syncRendererUI();
+  selectRenderer("gl");
   requestAnimationFrame(frame);
 }
 main().catch(e => { $("err").style.display = "grid"; $("err").textContent = "failed to load solar.wasm — " + e; console.error(e); });
