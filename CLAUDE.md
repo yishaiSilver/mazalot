@@ -92,7 +92,10 @@ new planet type still means one row. Two consequences:
 - The `U_*` slot indices in the GLSL and the `GL_U_*` constants in Rust are a
   wire format. `glsl_slot_indices_match_the_rust` parses the `#define`s and pins
   them, because a slot off by one paints a planet with somebody else's colours
-  rather than failing.
+  rather than failing. **It pins 16 of the 66 `#define`s.** The `O_*` octave
+  slots are unpinned and are equally a wire format — `gl_octaves` writes them
+  positionally — so renumbering one hands the aurora the crater's octave count,
+  silently. Same for `S_BLOTCH_OCT`/`S_CORONA_OCT`. Pin a slot when you add one.
 - `scripts/verify-gl.mjs` is to the GL path what `out/` is to the native one.
   Run it after touching any shader (`--demo all`). Expect a residue and read the
   right column: pixels differing by **more than one quantization level** are the
@@ -101,6 +104,11 @@ new planet type still means one row. Two consequences:
   rate is 17–30% and that is *fine*: it is the nebula, which the GPU evaluates
   per pixel where the CPU bakes it once per 8×8 cell and scrolls the sprite. At a
   zoom where the clouds fade the backdrop is byte-exact, which is how you know.
+- **It needs `npm i -g playwright`, and nothing runs it for you** — no CI, no
+  `package.json`. The 830 lines of GLSL are a second implementation whose only
+  check is this script, so skipping it means shipping unverified. Its pass gate
+  is also a *rate* (0.5%), so a handful of pixels can disagree by a lot and still
+  pass; it warns when that rate is non-zero, so read the warning.
 
 The GL path runs `F_ALL`, deliberately without `F_NIGHT_LOD`: that switch buys a
 CPU back octaves it cannot afford and moves pixels on the dark limb doing it, and
@@ -158,9 +166,10 @@ to `planet-core` types by name (`"gas_giant"`, `"terran"`), resolved via
 `planet_core::type_index`. A typo silently falls back to type 0 — the tests in
 those two crates exist to catch exactly that. Keep them passing.
 
-**Web name arrays are hand-synced.** `PLANET_NAMES` in `crates/solar/web/index.html`
-and `PARENT_NAMES` in `crates/moon/web/index.html` are index-aligned with the Rust
-rosters; the C ABI can't return strings. Reorder a roster, edit the HTML.
+**Web name arrays are hand-synced, in four places.** The C ABI can't return
+strings, so `solar`'s roster is mirrored in `web/index.html`, `web/verify.mjs`
+**and** `scripts/verify-gl.mjs`, and `moon`'s `PARENT_NAMES` in its HTML. Nothing
+checks the lengths agree. Reorder a roster, `grep` for the array by name.
 
 ## Verifying a change
 
@@ -325,6 +334,11 @@ It is fast; run it.
   `/dev/dri`, so headless Chromium's WebGL2 is ANGLE over SwiftShader — a CPU
   rasterizer. `verify-gl.mjs` is a correctness harness and nothing else; a
   timing taken through it is a timing of the CPU. Say so rather than quoting it.
+- **KNOWN DIVERGENCE: the orbit dots.** `paint_orbit` adds to a *ceiling*
+  (26→90, 30→96, 40→120), so a dot crossing a bright star DARKENS it; the GPU's
+  `blendFunc(ONE, ONE)` saturates at 255 instead. 62–1025 px/frame hit that
+  ceiling at seeds 7/21 — real, ~0.04% of pixels, under `verify-gl`'s rate gate.
+  Unfixed. Reproduce by counting pixels at exactly `(90, 96, 120)`.
 - `scripts/make-artifact.sh <crate>` bundles a demo into one self-contained HTML
   with the wasm inlined as base64. It rebuilds the wasm unless given `--no-build`.
 - The committed `crates/*/web/*.wasm` files go stale easily. If you change a
