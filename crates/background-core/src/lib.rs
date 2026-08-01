@@ -119,6 +119,27 @@ pub fn paint_stars<F>(out: &mut [u8], w: u32, h: u32, sky: &Starfield, bgx: f32,
 where
     F: Fn(i32, i32, i32) -> f32,
 {
+    visit_stars(sky, w, h, bgx, bgy, hash, |px, py, s, col| {
+        let idx = ((py as u32 * w + px as u32) * 4) as usize;
+        out[idx] = (clamp01(out[idx] as f32 / 255.0 + s * col[0]) * 255.0) as u8;
+        out[idx + 1] = (clamp01(out[idx + 1] as f32 / 255.0 + s * col[1]) * 255.0) as u8;
+        out[idx + 2] = (clamp01(out[idx + 2] as f32 / 255.0 + s * col[2]) * 255.0) as u8;
+    });
+}
+
+/// Walk the lit cells of every layer and hand each visible star to `emit` as
+/// `(px, py, brightness, colour)` — screen px, already clipped to the viewport.
+///
+/// The scatter is the whole reason a starfield is cheap: cost tracks stars on
+/// screen, not viewport area. [`paint_stars`] plots them into a buffer; the GPU
+/// path emits point sprites from the same walk. It must stay ONE walk — a
+/// gather (each pixel asking which cells could have lit it) has to test nine
+/// cells per layer per pixel, which measured as half the GPU frame.
+pub fn visit_stars<F, E>(sky: &Starfield, w: u32, h: u32, bgx: f32, bgy: f32, hash: F, mut emit: E)
+where
+    F: Fn(i32, i32, i32) -> f32,
+    E: FnMut(i32, i32, f32, Rgb),
+{
     let d = sky.density.max(0.0);
     let (wi, hi) = (w as i32, h as i32);
 
@@ -152,11 +173,7 @@ where
                 // How far this cell cleared the threshold sets its brightness.
                 let t = (hh - thr) / (1.0 - thr);
                 let s = layer.brightness * (layer.faint + (1.0 - layer.faint) * t) * amt;
-                let col = ramp(sky.tints, (hh * 313.0).fract());
-                let idx = ((py as u32 * w + px as u32) * 4) as usize;
-                out[idx] = (clamp01(out[idx] as f32 / 255.0 + s * col[0]) * 255.0) as u8;
-                out[idx + 1] = (clamp01(out[idx + 1] as f32 / 255.0 + s * col[1]) * 255.0) as u8;
-                out[idx + 2] = (clamp01(out[idx + 2] as f32 / 255.0 + s * col[2]) * 255.0) as u8;
+                emit(px, py, s, ramp(sky.tints, (hh * 313.0).fract()));
             }
         }
     }
@@ -342,17 +359,7 @@ fn ensure_nebula(neb: &Nebula, cache: &RefCell<BackdropCache>, si: i32, nw: u32,
 /// rebuilt. Every visited slot is written, empty ones included: a scrolled field
 /// bakes over whatever the previous position left behind.
 fn bake_cells(neb: &Nebula, field: &mut [[f32; 3]], si: i32, nw: u32, org: [i32; 2], rect: [u32; 4]) {
-    let n = neb.tints.len();
-    let ta = neb.tints[(hash3(si, 1, 9) * n as f32) as usize % n];
-    let tb = neb.tints[(hash3(si, 2, 9) * n as f32) as usize % n];
-    // The noise is 3D, but a nebula only ever samples one x/y plane of it — so
-    // WHERE that plane sits is what makes one seed's clouds a different shape
-    // rather than the same clouds slid sideways. Held constant across a bake so
-    // a scrolled-in strip lands on the same plane as the field it joins.
-    // 64 spans many lattice cells at this frequency, so two seeds land on
-    // uncorrelated slices rather than neighbouring ones.
-    let za = 4.2 + hash3(si, 7, 3) * 64.0;
-    let zb = 1.5 + hash3(si, 8, 3) * 64.0;
+    let (ta, tb, za, zb) = nebula_seed(neb, si);
     let cell = neb.cell as i32;
     let f = 1.0 / 240.0;
     let [x0, y0, x1, y1] = rect;
@@ -371,6 +378,35 @@ fn bake_cells(neb: &Nebula, field: &mut [[f32; 3]], si: i32, nw: u32, org: [i32;
             };
         }
     }
+}
+
+/// The four constants a seed picks for its clouds: two tints, and the two noise
+/// planes the 3D fBm is sampled on.
+///
+/// The planes are the reason this is a function rather than two lines at the
+/// bake: the field is 3D but a nebula only ever reads one x/y slice of it, so
+/// WHERE that slice sits is what makes one seed's clouds a different *shape*
+/// rather than the same clouds slid sideways. 64 spans many lattice cells at
+/// this frequency, so two seeds land on uncorrelated slices. Shared with the GL
+/// path, which would otherwise be a second place to get this subtly wrong.
+fn nebula_seed(neb: &Nebula, si: i32) -> (Rgb, Rgb, f32, f32) {
+    let n = neb.tints.len();
+    (
+        neb.tints[(hash3(si, 1, 9) * n as f32) as usize % n],
+        neb.tints[(hash3(si, 2, 9) * n as f32) as usize % n],
+        4.2 + hash3(si, 7, 3) * 64.0,
+        1.5 + hash3(si, 8, 3) * 64.0,
+    )
+}
+
+/// Where the clouds have drifted to for this pan, in whole px, snapped to
+/// `quant`. Shared with the GL path.
+fn cloud_scroll(neb: &Nebula, si: i32, bgx: f32, bgy: f32, pan_scale: f32) -> (i32, i32) {
+    let np = neb.scroll * pan_scale; // clouds drift slowest on screen
+    let q = |v: f32, salt: i32| -> i32 {
+        (((v * np + hash3(si, salt, 2) * 500.0) / neb.quant).round() * neb.quant).round() as i32
+    };
+    (q(bgx, 5), q(bgy, 6))
 }
 
 /// Paint the ground and its clouds into the px rect `[x0, y0, x1, y1)` of an
@@ -469,13 +505,8 @@ pub fn paint_backdrop(
     let show = cfg.nebula.is_some() && neb_amt > 0.02;
     let (nw, nh, org, sub, phase, sx, sy) = match cfg.nebula {
         Some(neb) if show => {
-            let np = neb.scroll * pan_scale; // clouds drift slowest on screen
             let cell = neb.cell as i32;
-            // Where the clouds have drifted to, in whole px, snapped to `quant`.
-            let q = |v: f32, salt: i32| -> i32 {
-                (((v * np + hash3(si, salt, 2) * 500.0) / neb.quant).round() * neb.quant).round() as i32
-            };
-            let (sx, sy) = (q(bgx, 5), q(bgy, 6));
+            let (sx, sy) = cloud_scroll(&neb, si, bgx, bgy, pan_scale);
             // Split the drift. The sprite is baked on the absolute cell lattice,
             // so it scrolls by whole cells; the sub-cell remainder is applied
             // when the field is READ, which needs one spare column and row.
@@ -554,21 +585,31 @@ pub fn paint_backdrop(
 
 // ---------------------------------------------------------------------------
 
+/// The backdrop's GLSL and the uniforms that drive it.
+///
+/// **Browser-only, and gated so that it is** — see the same note on
+/// `planet_core`'s `mod gl`. Another caller of the seeded helpers in this crate's
+/// LTO unit is enough to re-price their inlining and move `out/`.
+#[cfg(any(feature = "gl", test))]
+mod gl;
+#[cfg(any(feature = "gl", test))]
+pub use gl::{gl_star_points, gl_uniforms, GL_POINT_STRIDE, GL_SHADER, GL_SOURCES, GL_UNIFORMS_LEN};
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const TINTS: &[Rgb] = &[[0.30, 0.22, 0.48], [0.18, 0.30, 0.46], [0.42, 0.24, 0.30]];
+    pub(crate) const TINTS: &[Rgb] = &[[0.30, 0.22, 0.48], [0.18, 0.30, 0.46], [0.42, 0.24, 0.30]];
 
     /// solar's backdrop, near enough — the only one in the workspace with clouds.
-    const CLOUDY: Backdrop = Backdrop {
+    pub(crate) const CLOUDY: Backdrop = Backdrop {
         base: [0.031, 0.027, 0.068],
         dither: 0.0,
         nebula: Some(Nebula { tints: TINTS, cell: 8, quant: 2.0, scroll: 0.09, strength: 0.34, dither: 0.015 }),
     };
 
     /// A scene with a ground dither and no clouds — the other four crates.
-    const PLAIN: Backdrop = Backdrop { base: [0.02, 0.02, 0.05], dither: 0.02, nebula: None };
+    pub(crate) const PLAIN: Backdrop = Backdrop { base: [0.02, 0.02, 0.05], dither: 0.02, nebula: None };
 
     /// The uncached path is the reference: it bakes and composites the whole
     /// frame from scratch. Every fast path — memcpy, scroll-and-patch, re-bake —

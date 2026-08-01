@@ -13,3 +13,12 @@ crate-type = ["rlib"]
 noise-core = { path = "../noise-core" }
 dither-core = { path = "../dither-core" }
 scene-core = { path = "../scene-core" }
+
+[features]
+# The WebGL2 uniform block + GLSL. OFF by default, and that is load-bearing:
+# compiling it changes nothing about what the CPU renderer computes, but merely
+# adding another caller of the seeded helpers to this crate's LTO unit re-prices
+# their inlining and moves `out/` by a few /255 (see CLAUDE.md). The native
+# generators have no GPU, so they do not carry it; the wasm builds turn it on
+# through a target-specific dependency.
+gl = []

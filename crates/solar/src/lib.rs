@@ -243,6 +243,14 @@ pub struct System {
     // Eccentricity multiplier (scales every planet's generated `e`; 0 = force
     // perfect circles, 1 = as generated, higher = exaggerate the ellipses).
     pub ecc: f32,
+    // Thin each planet's shader past the terminator — see
+    // `planet_core::F_NIGHT_LOD`.
+    //
+    // OFF by default, and deliberately: this is the one switch here that MOVES
+    // PIXELS rather than only the pixel budget, so the native generators shade
+    // the night side at full detail and `out/` stays byte-identical. The web demo
+    // turns it on at construction.
+    pub night_lod: bool,
     // Cached backdrop (background + orbit paths) + the key it was rendered for,
     // reused by `render_system_cached` while the camera/view is unchanged.
     bg_cache: Vec<u8>,
@@ -355,7 +363,7 @@ impl System {
             seed, sun_kind, sun_radius, planets,
             spacing: 1.0, planet_size: 1.0, sun_size: 1.0, planet_pixel: 1.0, sun_pixel: 1.0,
             planet_detail: 160.0, sun_detail: 110.0, star_density: 0.5, star_parallax: 1.0,
-            orbit_width: 1.0, ecc: 1.0,
+            orbit_width: 1.0, ecc: 1.0, night_lod: false,
             bg_cache: Vec::new(), bg_key: None,
             neb: RefCell::new(BackdropCache::default()),
             sun_tile: RefCell::new(SunCache::default()),
@@ -401,6 +409,14 @@ impl System {
     /// planet's generated eccentricity, higher exaggerates the ellipses.
     pub fn set_eccentricity(&mut self, scale: f32) {
         self.ecc = scale.clamp(0.0, 2.5);
+    }
+
+    /// Thin the planet shader past the terminator. `true` caps the octaves and
+    /// skips the cloud deck on the night side; `false` (the default) shades it at
+    /// full detail, which is what the native generators do and the picture to
+    /// A/B against. The web demo switches it on at construction.
+    pub fn set_night_lod(&mut self, on: bool) {
+        self.night_lod = on;
     }
 
     /// The outermost extent (world units) with the current view multipliers —
@@ -541,16 +557,19 @@ fn paint_background(
         pan_scale: parallax,
         far_fade: far_amt,
     };
-    // Salt the star hash with the seed, so each system gets its own constellations.
-    // Mixed into the hash's third axis rather than added to the cell coordinates:
-    // offsetting the grid would give every system the SAME sky panned sideways,
-    // which is the trap the nebula's plane offset used to fall into. The 977
-    // stride clears the three layer salts, so one system's near layer can never
-    // come out as the next system's far one.
-    let sky_salt = (seed as i32).wrapping_mul(977);
+    // Salt the star hash with the seed, so each system gets its own
+    // constellations. See `gl::sky_salt` for why it is mixed into the hash's
+    // third axis rather than added to the cell coordinates.
+    let salt0 = seeded_sky_salt(seed);
     paint_stars(out, w, h, &sky, bgx, bgy, move |cx, cy, salt| {
-        hash3(cx, cy, sky_salt.wrapping_add(17 + salt))
+        hash3(cx, cy, salt0.wrapping_add(17 + salt))
     });
+}
+
+/// The star-grid salt for a system. One definition, shared with the GPU path
+/// (`gl::sky_salt` re-exports it) — two would mean two skies.
+fn seeded_sky_salt(seed: u32) -> i32 {
+    (seed as i32).wrapping_mul(977)
 }
 
 /// Dot in a planet's orbit path as a faint dashed ellipse around the sun.
@@ -636,6 +655,14 @@ pub fn render_system_cached(sys: &mut System, w: u32, h: u32, cam: &Camera, bgx:
     draw_bodies(sys, w, h, cam, t_orbit, t_spin, t_sun, out);
 }
 
+/// World position of planet `i` at time `t` — the same query `planet_pos` makes
+/// over the C ABI, for callers on the Rust side (benchmarks, the native bins).
+pub fn planet_pos_of(sys: &System, i: usize, t: f32) -> (f32, f32) {
+    let p = &sys.planets[i];
+    let (x, y, _) = p.at(t, sys.spacing, sys.ecc);
+    (x, y)
+}
+
 /// Paint the backdrop: starfield + nebula, then the dashed orbit paths. Depends
 /// only on the camera + view params, never on animation time.
 fn draw_bg_orbits(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: f32, out: &mut [u8]) {
@@ -647,7 +674,19 @@ fn draw_bg_orbits(sys: &System, w: u32, h: u32, cam: &Camera, bgx: f32, bgy: f32
 
 /// Draw the sun + planets over whatever is already in `out`, depth-sorted.
 #[allow(clippy::too_many_arguments)]
-fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin: f32, t_sun: f32, out: &mut [u8]) {
+
+/// Draw the sun + planets over whatever is already in `out`, depth-sorted.
+#[allow(clippy::too_many_arguments)]
+fn draw_bodies(
+    sys: &System,
+    w: u32,
+    h: u32,
+    cam: &Camera,
+    t_orbit: f32,
+    t_spin: f32,
+    t_sun: f32,
+    out: &mut [u8],
+) {
     // Build a draw list of (depth, is_sun, planet_index) in the System's reused
     // scratch (no per-frame alloc). The sun sits at depth 0; planets sort around
     // it by their orbital depth.
@@ -738,8 +777,12 @@ fn draw_bodies(sys: &System, w: u32, h: u32, cam: &Camera, t_orbit: f32, t_spin:
             if clip[2] == clip[0] {
                 continue;
             }
+            // Night-side thinning is a per-scene switch, so the mask is built
+            // here rather than baked into `render_tile`'s default.
+            let feat =
+                planet_core::F_ALL | if sys.night_lod { planet_core::F_NIGHT_LOD } else { 0 };
             let mut tile = sys.body_tile.borrow_mut();
-            planet_core::render_tile_into(&mut tile, p.ptype, p.seed, spin_a, light, rad_render, clip);
+            planet_core::render_tile_into(&mut tile, p.ptype, p.seed, spin_a, light, rad_render, clip, feat);
             blit(out, w, h, &tile, sx, sy, scale);
         }
     }
@@ -776,6 +819,20 @@ pub fn planet_nearest_center(sys: &System, w: u32, h: u32, cam: &Camera, t: f32)
     }
     best
 }
+
+/// The scene's WebGL2 frame packer.
+///
+/// **Browser-only, and gated so that it is** — see the same note on
+/// `planet_core`'s `mod gl`. Another caller of `Planet::at` / `to_screen` /
+/// `dest_rect` in this crate's LTO unit is enough to re-price their inlining and
+/// move `out/`.
+#[cfg(any(target_arch = "wasm32", test))]
+mod gl;
+#[cfg(any(target_arch = "wasm32", test))]
+pub use gl::{
+    gl_backdrop, gl_bodies, gl_orbit_points, gl_star_points, sky_salt, GL_BODY_HEADER,
+    GL_BODY_STRIDE, GL_KIND_PLANET, GL_KIND_STAR, GL_MAX_BODIES,
+};
 
 // Browser (wasm) C-ABI glue — excluded from native builds. See wasm.rs.
 #[cfg(target_arch = "wasm32")]

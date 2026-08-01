@@ -94,6 +94,25 @@ fn main() {
     let t_planet_lowcap = ms_still(&sys, &pcam, &mut buf);
     sys.set_view(1.0, 1.0, 1.0, 1.0, 1.0, 160.0, 110.0, 0.5, 1.0); // restore default
 
+    // Night-side thinning (`set_night_lod`) — the A/B that matters is a planet
+    // filling the view, where the surface and cloud shaders are most of the
+    // frame. Interleaved because this machine's timings drift within a run.
+    let cloudy = (0..sys.planets.len())
+        .find(|&i| planet_core::param(sys.planets[i].ptype, 4) > 0.3)
+        .unwrap_or(probe);
+    let (cx, cy) = planet_world_pos(&sys, cloudy, 0.0);
+    let ccam = Camera { x: cx, y: cy, zoom: fz * 22.0 };
+    let (mut t_thin, mut t_live) = (0.0, 0.0);
+    for _ in 0..2 {
+        sys.set_night_lod(true);
+        t_thin += ms_still(&sys, &ccam, &mut buf);
+        sys.set_night_lod(false);
+        t_live += ms_still(&sys, &ccam, &mut buf);
+    }
+    sys.set_night_lod(false);
+    t_thin /= 2.0;
+    t_live /= 2.0;
+
     let bodies = (t_full - t_bg).max(0.0);
     let stars = (t_bg - t_bg_nostars).max(0.0);
     let nebula = (t_bg_nostars - t_base).max(0.0);
@@ -118,6 +137,8 @@ fn main() {
     println!("  zoomed onto the sun               {:7.2} ms   ({:.0} fps)", t_sun, 1000.0 / t_sun);
     println!("  zoomed onto a planet (cap 160)    {:7.2} ms   ({:.0} fps)", t_planet, 1000.0 / t_planet);
     println!("  zoomed onto a planet (cap 56)     {:7.2} ms   ({:.0} fps)  <- low detail cap", t_planet_lowcap, 1000.0 / t_planet_lowcap);
+    println!("  zoomed cloudy planet, full night  {:7.2} ms   ({:.0} fps)", t_live, 1000.0 / t_live);
+    println!("  zoomed cloudy planet, thin night  {:7.2} ms   ({:.0} fps)  <- {:.2}x, set_night_lod", t_thin, 1000.0 / t_thin, t_live / t_thin);
     println!("\n── fit breakdown (panning) ──────────────────");
     println!("  background total                  {:7.2} ms   {:5.1}%", t_bg, 100.0 * t_bg / t_full);
     println!("    ├ base fill + orbit paths       {:7.2} ms   {:5.1}%", t_base, 100.0 * t_base / t_full);

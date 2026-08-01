@@ -22,6 +22,9 @@ crate-type = ["rlib", "cdylib"]
 # Shared, dependency-free primitive rlibs. Plain (non-optional) deps so they're
 # present in the wasm build too — the pure render path stays tiny.
 noise-core = { path = "../noise-core" }
+# Only for its GLSL prelude, which the GPU path concatenates in front of every
+# fragment shader. Pure data, so it costs the native build nothing.
+dither-core = { path = "../dither-core" }
 scene-core = { path = "../scene-core" }
 # The shared deep-space backdrop (ground + nebula + parallax stars).
 background-core = { path = "../background-core" }
@@ -36,6 +39,22 @@ wasm-abi = { path = "../wasm-abi" }
 # Native image-crate orchestration (GIF/PNG). Optional: only the native bin pulls
 # it, so the wasm build (`--no-default-features`) stays tiny.
 render-io = { path = "../render-io", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The GPU path is a browser feature: switch on each core crate's `gl`
+# module for the wasm build only, so the native generators keep the exact
+# float codegen `out/` is pinned against.
+planet-core = { path = "../planet-core", features = ["gl"] }
+background-core = { path = "../background-core", features = ["gl"] }
+sun-core = { path = "../sun-core", features = ["gl"] }
+
+[dev-dependencies]
+# ...and for `cargo test`, which runs natively but must still cover the
+# frame packer. Resolver 2 keeps dev-dependency features out of
+# `cargo build`, so this cannot reach the generators.
+planet-core = { path = "../planet-core", features = ["gl"] }
+background-core = { path = "../background-core", features = ["gl"] }
+sun-core = { path = "../sun-core", features = ["gl"] }
 
 [features]
 default = ["native"]

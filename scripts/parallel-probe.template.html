@@ -1,0 +1,227 @@
+<title>mazalot — parallel capability probe</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 28px; background: #05050b; color: #d7dae6;
+    font: 14px/1.6 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  h1 { font-size: 13px; letter-spacing: .16em; text-transform: uppercase; color: #8790ad; margin: 0 0 4px; }
+  h2 { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: #565d78;
+    margin: 26px 0 8px; border-top: 1px solid rgba(255,255,255,.08); padding-top: 12px; }
+  .lede { color: #7b83a2; max-width: 62ch; margin: 0 0 6px; }
+  table { border-collapse: collapse; width: 100%; max-width: 760px; font-variant-numeric: tabular-nums; }
+  td, th { text-align: left; padding: 5px 10px 5px 0; vertical-align: top; }
+  th { color: #565d78; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .1em; }
+  td.k { color: #9aa0bb; width: 30ch; }
+  b { color: #eef1f8; }
+  .yes { color: #57d38c; } .no { color: #ff8f8f; } .meh { color: #f4b74a; }
+  .note { color: #6b7290; font-size: 12px; max-width: 62ch; }
+  button { padding: 9px 16px; font: inherit; font-size: 13px; color: #06060c; font-weight: 700;
+    border: 0; border-radius: 8px; cursor: pointer; background: linear-gradient(180deg, #ffe8b0, #f4b74a); }
+  button:disabled { opacity: .5; cursor: default; }
+  .bar { height: 6px; border-radius: 3px; background: rgba(255,255,255,.10); overflow: hidden; max-width: 320px; }
+  .bar i { display: block; height: 100%; background: #57d38c; }
+  code { color: #aeb4cd; }
+</style>
+
+<h1>Parallel capability probe</h1>
+<p class="lede">Answers one question on the host you deploy to: <b>can this page use more than
+one core, and how much would it buy?</b> Everything below runs the real
+<code>planet.wasm</code> shader — no synthetic benchmark.</p>
+
+<h2>Environment</h2>
+<table id="env"><tbody></tbody></table>
+
+<h2>Throughput</h2>
+<p class="note">Each worker renders whole 256&times;256 planet frames — same work, independent.
+This measures the parallel <em>throughput</em> the machine really has. Splitting one frame into
+bands gets close to it, minus the dispatch cost, which is why both are reported.</p>
+<p class="note">The sweep matters more than the peak: dispatch cost grows with the pool while
+the work per worker shrinks, so the best pool size is usually <em>not</em>
+<code>hardwareConcurrency</code>. And a lone worker can be scheduled onto an efficiency core on
+a big.LITTLE CPU, which is why the main thread is timed separately — if the two baselines
+disagree, believe the faster one.</p>
+<p><button id="run">▶ sweep pool sizes</button></p>
+<table id="perf"><thead><tr><th>workers</th><th>ms/frame</th><th>speedup</th><th>dispatch</th><th>net</th></tr></thead><tbody></tbody></table>
+<p class="note" id="verdict"></p>
+
+<script type="module">
+const WASM_B64 = "__WASM_B64__";
+const bytes = Uint8Array.from(atob(WASM_B64), c => c.charCodeAt(0));
+
+const $ = id => document.getElementById(id);
+const mark = (ok, t) => `<b class="${ok === null ? 'meh' : ok ? 'yes' : 'no'}">${t}</b>`;
+const rows = (tbl, list) => {
+  $(tbl).querySelector('tbody').innerHTML =
+    list.map(([k, v, n]) => `<tr><td class="k">${k}</td><td>${v}${n ? `<div class="note">${n}</div>` : ''}</td></tr>`).join('');
+};
+
+// --- environment -----------------------------------------------------------
+// A worker built from a blob: URL is how a single self-contained file gets off
+// the main thread. Some Content-Security-Policies block it; that is the one
+// thing worth testing rather than assuming.
+async function blobWorkerWorks() {
+  try {
+    const url = URL.createObjectURL(new Blob(["onmessage=()=>postMessage(1)"], { type: "text/javascript" }));
+    const w = new Worker(url);
+    const ok = await new Promise(res => {
+      const t = setTimeout(() => res(false), 3000);
+      w.onmessage = () => { clearTimeout(t); res(true); };
+      w.onerror = () => { clearTimeout(t); res(false); };
+      w.postMessage(0);
+    });
+    w.terminate(); URL.revokeObjectURL(url);
+    return ok;
+  } catch { return false; }
+}
+// simd128 is not optional for this shader — without it the portable fallback is
+// slower in wasm than the scalar code it replaced.
+function simdOk() {
+  try {
+    return WebAssembly.validate(new Uint8Array([
+      0,97,115,109,1,0,0,0,1,4,1,96,0,0,3,2,1,0,10,9,1,7,0,65,0,253,15,26,11]));
+  } catch { return false; }
+}
+
+const cores = navigator.hardwareConcurrency || 0;
+const coi = self.crossOriginIsolated === true;
+const sab = typeof SharedArrayBuffer !== "undefined";
+const blobOk = await blobWorkerWorks();
+const simd = simdOk();
+
+rows('env', [
+  ["Logical cores", `<b>${cores || "unknown"}</b>`,
+    "navigator.hardwareConcurrency. On an SMT machine this is about twice the physical count, and "
+    + "hyperthread siblings share an execution unit — so full scaling on this shader looks like "
+    + `<b>~${cores ? (cores / 2).toFixed(0) : "N/2"}×</b>, not ${cores || "N"}×.`],
+  ["Blob-URL workers", mark(blobOk, blobOk ? "allowed" : "BLOCKED by CSP"),
+    blobOk ? "A single self-contained file can move work off the main thread."
+           : "This host's CSP forbids it. A separate worker .js file served same-origin still works."],
+  ["wasm simd128", mark(simd, simd ? "supported" : "missing"),
+    "The four-lane noise kernels depend on it."],
+  ["crossOriginIsolated", mark(coi ? true : null, coi ? "yes" : "no"),
+    coi ? "COOP/COEP are set, so shared-memory threads are available."
+        : "Expected on GitHub Pages — it cannot set response headers. Costs you SharedArrayBuffer, <em>not</em> workers."],
+  ["SharedArrayBuffer", mark(sab ? true : null, sab ? "available" : "unavailable"),
+    sab ? "A rayon-style shared-memory port would work here."
+        : "Only needed for shared-memory threading. Worker-per-region uses transferable buffers instead."],
+]);
+
+// --- throughput ------------------------------------------------------------
+const WORKER_SRC = `
+let w = null, buf = 0, pp = 0, NUM = 0, SZ = 0, feat = 0;
+onmessage = async (e) => {
+  const m = e.data;
+  if (m.cmd === "init") {
+    const mod = await WebAssembly.instantiate(m.bytes, {});
+    w = mod.instance.exports;
+    SZ = m.size; feat = m.feat;
+    NUM = w.num_params();
+    buf = w.alloc(SZ * SZ * 4);
+    pp = w.alloc(NUM * 4);
+    const pv = new Float32Array(w.memory.buffer, pp, NUM);
+    for (let i = 0; i < NUM; i++) pv[i] = w.param(m.type, i);
+    for (let k = 0; k < 4; k++) w.render_features(buf, SZ, m.type, 1, k * 0.1, pp, 0, 0.7, 0, feat);
+    postMessage({ ok: 1 });
+  } else if (m.cmd === "ping") {
+    postMessage({ pong: 1 });
+  } else if (m.cmd === "render") {
+    const t0 = performance.now();
+    for (let k = 0; k < m.n; k++) w.render_features(buf, SZ, m.type, 1, m.a0 + k * 0.01, pp, 0, 0.7, 0, feat);
+    postMessage({ ms: performance.now() - t0 });
+  }
+};`;
+
+const spawn = () => new Worker(URL.createObjectURL(new Blob([WORKER_SRC], { type: "text/javascript" })));
+const ask = (w, msg) => new Promise(res => { w.onmessage = e => res(e.data); w.postMessage(msg); });
+
+$('run').onclick = async () => {
+  const btn = $('run');
+  btn.disabled = true;
+  if (!blobOk) {
+    rows('perf', [["Cannot run", mark(false, "blob workers are blocked here"), "", "", ""]]);
+    $('verdict').textContent = "Serve the worker as its own same-origin .js file and this test applies unchanged.";
+    btn.disabled = false;
+    return;
+  }
+  const SZ = 256, TYPE = 0, FEAT = 47 | 16 | 64 | 128 | 256 | 512; // every switch on
+  const N = Math.max(1, cores || 4);
+  const FRAMES = 10;
+
+  // Baseline on the MAIN thread. A worker can land on an efficiency core; the
+  // main thread normally gets the better scheduling class, so timing both is
+  // the only way to tell a genuinely slow core from a badly placed one.
+  btn.textContent = "measuring main thread…";
+  await new Promise(r => setTimeout(r, 0));
+  const inst = (await WebAssembly.instantiate(bytes, {})).instance.exports;
+  const NUM = inst.num_params();
+  const mbuf = inst.alloc(SZ * SZ * 4), mpp = inst.alloc(NUM * 4);
+  {
+    const pv = new Float32Array(inst.memory.buffer, mpp, NUM);
+    for (let i = 0; i < NUM; i++) pv[i] = inst.param(TYPE, i);
+  }
+  for (let k = 0; k < 4; k++) inst.render_features(mbuf, SZ, TYPE, 1, k * 0.1, mpp, 0, 0.7, 0, FEAT);
+  const t0m = performance.now();
+  for (let k = 0; k < FRAMES; k++) inst.render_features(mbuf, SZ, TYPE, 1, 1 + k * 0.01, mpp, 0, 0.7, 0, FEAT);
+  const mainMs = (performance.now() - t0m) / FRAMES;
+  inst.dealloc(mpp, NUM * 4); inst.dealloc(mbuf, SZ * SZ * 4);
+
+  // One pool, reused for every sweep point — spawning is not what we measure.
+  btn.textContent = `spawning ${N} workers…`;
+  const pool = [];
+  for (let i = 0; i < N; i++) pool.push(spawn());
+  await Promise.all(pool.map(w => ask(w, { cmd: "init", bytes, size: SZ, type: TYPE, feat: FEAT })));
+
+  const sizes = [...new Set([1, 2, 4, 8, 12, 16, N].filter(s => s >= 1 && s <= N))].sort((a, b) => a - b);
+  const out = [], results = [];
+  for (const s of sizes) {
+    btn.textContent = `measuring ${s} worker${s > 1 ? "s" : ""}…`;
+    await new Promise(r => setTimeout(r, 30));
+    const sub = pool.slice(0, s);
+    let ping = 0;
+    for (let r = 0; r < 12; r++) {
+      const t = performance.now();
+      await Promise.all(sub.map(w => ask(w, { cmd: "ping" })));
+      ping += performance.now() - t;
+    }
+    ping /= 12;
+    const t = performance.now();
+    await Promise.all(sub.map((w, i) => ask(w, { cmd: "render", n: FRAMES, a0: 1 + i * 0.5 })));
+    const per = (performance.now() - t) / (FRAMES * s);
+    results.push({ s, per, ping, net: mainMs / (per + ping) });
+  }
+  pool.forEach(w => w.terminate());
+
+  const best = results.reduce((a, b) => (b.net > a.net ? b : a));
+  for (const r of results) {
+    const win = r === best ? ' style="color:#57d38c"' : '';
+    out.push([
+      `<b${win}>${r.s}</b>`,
+      r.per.toFixed(2),
+      `${(mainMs / r.per).toFixed(2)}×`,
+      `${r.ping.toFixed(2)} ms`,
+      `<b${win}>${r.net.toFixed(2)}×</b>`,
+    ]);
+  }
+  $('perf').querySelector('tbody').innerHTML =
+    out.map(c => `<tr>${c.map(x => `<td>${x}</td>`).join('')}</tr>`).join('') +
+    `<tr><td colspan="5" class="note" style="padding-top:10px">` +
+    `main thread <b>${mainMs.toFixed(2)} ms</b>/frame (<b>${(1000 / mainMs).toFixed(0)} fps</b>) · ` +
+    `1 worker <b>${results[0].per.toFixed(2)} ms</b></td></tr>`;
+
+  const gap = results[0].per / mainMs;
+  const placed = gap > 1.35
+    ? ` The lone worker was ${gap.toFixed(1)}× slower than the main thread, which on a big.LITTLE CPU
+       means it was parked on an efficiency core — speedups here are measured against the main
+       thread, so they are not inflated by that.`
+    : "";
+  $('verdict').innerHTML =
+    `<b>Best pool: ${best.s} worker${best.s > 1 ? "s" : ""} — ${best.net.toFixed(2)}× net.</b> ` +
+    (best.s < N
+      ? `Fewer than the ${N} logical cores, because dispatch (${best.ping.toFixed(2)} ms) grows with the pool
+         while the slice each worker gets shrinks.`
+      : `Scaling had not flattened by ${N}, so the pool size is bounded by the core count, not by dispatch.`) +
+    placed;
+
+  btn.textContent = "▶ sweep again";
+  btn.disabled = false;
+};
+</script>
