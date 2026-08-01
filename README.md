@@ -4,7 +4,7 @@
   <img src="docs/solar.gif" width="480" alt="A procedurally generated solar system: four worlds orbiting a blue-white star on dotted elliptical paths, against a parallax starfield.">
 </p>
 <p align="center">
-  <em>One seed, no art assets. Regenerate with <code>cargo run --release -p solar --bin solar</code>.</em>
+  <em>One seed, randomly generated. <a href="crates/solar/README.md">solar</a></em>
 </p>
 
 Procedural, seed-driven pixel-art sprite generators in Rust — **zero art assets**.
@@ -131,46 +131,32 @@ the wasm inlined as base64 — no server needed, hostable anywhere. See
 
 ## Rendering on the GPU
 
-Both `planet` and `solar` default to **WebGL2** and fall back to the wasm CPU
-renderer (with the reason shown) when it is missing. Four `.glsl` files are the
-sanctioned second implementation: `noise-core`'s prelude, plus `planet-core`'s,
-`background-core`'s and `sun-core`'s bodies.
+`planet` and `solar` default to **WebGL2**, falling back to the wasm CPU renderer
+when it is missing. Four `.glsl` files are the sanctioned second implementation:
+`noise-core`'s prelude, plus `planet-core`'s, `background-core`'s and `sun-core`'s
+bodies.
 
-The port is far cheaper than it sounds, for one reason:
+The port is cheap because the noise is **integer math** — `hash3` and `value_noise`
+are wrapping multiplies, xors and shifts, with nothing a driver may round its own
+way, so they transliterate into GLSL ES 3.00 exactly. Only the shading is
+rewritten. Tables stay in Rust: `gl_uniforms()` ships `TYPES`, `SUNS` and
+`STAR_LAYERS` as one flat float array, so a new planet type is still one row and
+the GPU picks it up.
 
-> **`hash3` and `value_noise` are `u32` integer math.** Wrapping multiplies, xors,
-> shifts — nothing a driver is free to round its own way. They transliterate into
-> GLSL ES 3.00 *exactly*, so the lattice under the GPU picture is bit-identical to
-> the lattice under the CPU one, and Worley and the fBm stack fall out for free.
+Going to the GPU was not about dividing the frame faster. The backdrop is
+full-screen serial work, and a camera following a planet invalidates its cache
+every frame — an Amdahl term no worker pool removes. Moving the whole frame deletes
+that term instead, and nothing is read back at all.
 
-So what is rewritten is the shading, not the maths. Each crate's `gl_uniforms()`
-computes its tables, seeded constants and octave budgets in Rust and ships them as
-one flat float array, so `TYPES`, `SUNS` and `STAR_LAYERS` are **transported, not
-duplicated** — a new planet type is still one row, and the GPU picks it up. A GPU
-scene is a **draw list, not pixels**: `solar::gl_bodies` emits one record per body,
-sorted back-to-front, and the JS draws a quad each with alpha blending, which is
-what `blit` was doing by hand.
-
-Going to the GPU was not about dividing the frame faster. A worker pool splits a
-scene's *bodies* across cores, but the backdrop is full-screen serial work that
-scales with the window, and a camera following a planet invalidates its cache every
-frame — an Amdahl term no number of workers removes. A pooled `solar` measured 1.13x
-at best and worse than nothing with an empty sky, because band traffic (~4.3 MB per
-frame at 900x600) cost more than the body shading it saved. Moving the whole frame
-deletes the serial term instead, and takes the pixel plumbing with it — nothing is
-read back at all.
-
-**Scatter, don't gather.** The first backdrop shader had every pixel test nine cells
-in each of three star layers — 27 hashes per pixel against roughly one per fifty —
-and it was three quarters of the fragment cost (216.6 ms/frame, vs 50.0 with the
-stars as point sprites). Before writing a gather into any shader, check whether the
-vertex path will do. Details in
-[background-core](crates/background-core/README.md#scatter-dont-gather).
+Two things carried over, both explained in the crate pages:
+[a scene is a draw list, not pixels](crates/solar/README.md#on-the-gpu), and
+[scatter, don't gather](crates/background-core/README.md#scatter-dont-gather) — the
+first backdrop shader tested 27 cells per pixel for its stars and cost 4× what
+point sprites do.
 
 **The GPU is checkable here, not measurable.** This container has no `/dev/dri`, so
 the only WebGL2 available is ANGLE over SwiftShader — a software rasterizer. It
-proves the shader is right and says nothing about GPU throughput; a timing taken
-through it is a timing of the CPU.
+proves the shader is right and says nothing about throughput.
 
 ## Verifying a change
 
